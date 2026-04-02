@@ -13,7 +13,8 @@ USAGE:
   mbr scan                          ingest new files, record removals
   mbr ls                            list tracked files with metadata
   mbr info <path|hash>              full detail for one file or blob
-  mbr remote add <name> <target>    add an rclone remote (e.g. backup:bucket/mbr)
+  mbr remote add <name> <target>    add an existing rclone target
+  mbr remote setup <name> <type>    configure an rclone remote interactively
   mbr remote rm <name>              remove a remote
   mbr remote ls                     list remotes
   mbr push <remote> [path|hash...]  push blobs (default: all not yet there)
@@ -45,6 +46,7 @@ fn run(args: &[&str]) -> Result<(), String> {
         ["ls"] => ls(&mut open()?),
         ["info", spec] => info(&mut open()?, spec),
         ["remote", "add", name, target] => remote_add(&mut open()?, name, target),
+        ["remote", "setup", name, backend] => remote_setup(&mut open()?, name, backend),
         ["remote", "rm", name] => remote_rm(&mut open()?, name),
         ["remote", "ls"] => remote_ls(&mut open()?),
         ["push", remote, specs @ ..] => push(&mut open()?, remote, specs),
@@ -191,6 +193,44 @@ fn remote_add(repo: &mut Repo, name: &str, target: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn remote_setup(repo: &mut Repo, name: &str, backend: &str) -> Result<(), String> {
+    if repo.db.remote(name)?.is_some() {
+        return Err(format!("remote '{name}' already exists"));
+    }
+    repo.configure_rclone()?;
+    if mbr::rclone::call("config/listremotes", serde_json::json!({}))?
+        .get("remotes")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|remotes| remotes.iter().any(|remote| remote.as_str() == Some(name)))
+    {
+        return Err(format!("rclone remote '{name}' already exists"));
+    }
+
+    println!("Configuring rclone remote '{name}' ({backend})");
+    mbr::rclone::setup_remote(name, backend)?;
+    let path = prompt("remote path within the backend", "mbr")?;
+    let target = format!("{name}:{path}");
+    repo.db.add_remote(name, &target)?;
+    println!("added remote {name} -> {target}");
+    Ok(())
+}
+
+fn prompt(label: &str, default: &str) -> Result<String, String> {
+    use std::io::Write;
+    print!("{label} [{default}]: ");
+    std::io::stdout().flush().map_err(|e| e.to_string())?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| e.to_string())?;
+    let answer = answer.trim_end();
+    Ok(if answer.is_empty() {
+        default.to_owned()
+    } else {
+        answer.to_owned()
+    })
+}
+
 fn remote_rm(repo: &mut Repo, name: &str) -> Result<(), String> {
     lookup_remote(repo, name)?;
     repo.db.remove_remote(name)?;
@@ -201,7 +241,7 @@ fn remote_rm(repo: &mut Repo, name: &str) -> Result<(), String> {
 fn remote_ls(repo: &mut Repo) -> Result<(), String> {
     let remotes = repo.db.list_remotes()?;
     if remotes.is_empty() {
-        println!("no remotes configured (use `mbr remote add <name> <rclone-target>`)");
+        println!("no remotes configured (use `mbr remote setup <name> <type>`)");
     }
     for r in remotes {
         let count = repo.db.blobs_on_remote(&r.name)?.len();

@@ -35,7 +35,8 @@ enum Msg {
     },
     /// A background task ended.
     Done,
-}
+    /// A remote configuration step returned from librclone.
+    Setup { name: String, result: Result<serde_json::Value, String> },}
 
 struct App {
     window: AppWindow,
@@ -102,6 +103,30 @@ fn main() -> Result<(), slint::PlatformError> {
             app.window.set_new_remote_name(SharedString::default());
             app.window.set_new_remote_target(SharedString::default());
             app.refresh();
+        });
+    }
+    {
+        let app = app.clone();
+        app.clone().window.on_start_remote_setup(move |name, backend| {
+            app.start_remote_setup(&name, &backend);
+        });
+    }
+    {
+        let app = app.clone();
+        app.clone().window.on_submit_remote_setup(move |name, backend, state, answer| {
+            app.submit_remote_setup(&name, &backend, &state, &answer);
+        });
+    }
+    {
+        let app = app.clone();
+        app.clone().window.on_cancel_remote_setup(move || {
+            app.window.set_setup_active(false);
+            app.window.set_setup_state(SharedString::default());
+            app.window.set_setup_question(SharedString::default());
+            app.window.set_setup_help(SharedString::default());
+            app.window.set_setup_answer(SharedString::default());
+            app.window.set_setup_default(SharedString::default());
+            app.window.set_setup_password(false);
         });
     }
     {
@@ -213,7 +238,7 @@ impl App {
     }
 
     fn push_blobs(&self, remote_name: &str, hashes: Vec<String>) {
-        let (remote, blobs) = {
+        let (remote, blobs, config_path) = {
             let mut repo = self.repo.borrow_mut();
             let Some(repo) = repo.as_mut() else { return };
             let remote = match repo.db.remote(remote_name) {
@@ -231,13 +256,24 @@ impl App {
                 .iter()
                 .map(|h| (h.clone(), repo.blob_path(h)))
                 .collect();
-            (remote, blobs)
+            let config_path = repo.rclone_config_path();
+            (remote, blobs, config_path)
         };
 
         self.begin_task();
         self.status(format!("Pushing {} blob(s) to {remote_name}…", blobs.len()));
         let tx = self.tx.clone();
         std::thread::spawn(move || {
+            if let Err(e) = mbr::rclone::set_config_path(&config_path) {
+                tx.send(Msg::Pushed {
+                    remote: remote.name.clone(),
+                    hash: String::new(),
+                    result: Err(e),
+                })
+                .ok();
+                tx.send(Msg::Done).ok();
+                return;
+            }
             for (hash, blob) in blobs {
                 let result = mbr::rclone::push_blob(&remote.target, &blob, &hash);
                 tx.send(Msg::Pushed {
@@ -252,7 +288,7 @@ impl App {
     }
 
     fn fetch_blob(&self, hash: &str) {
-        let (holders, blob) = {
+        let (holders, blob, config_path) = {
             let mut repo = self.repo.borrow_mut();
             let Some(repo) = repo.as_mut() else { return };
             let names = match repo.db.remotes_for_blob(hash) {
@@ -268,7 +304,7 @@ impl App {
                     holders.push(remote);
                 }
             }
-            (holders, repo.blob_path(hash))
+            (holders, repo.blob_path(hash), repo.rclone_config_path())
         };
         if holders.is_empty() {
             self.status("This blob is not recorded on any remote; nothing to fetch from");
@@ -280,32 +316,119 @@ impl App {
         let tx = self.tx.clone();
         let hash = hash.to_owned();
         std::thread::spawn(move || {
-            let result = repo::download_blob(&holders, &hash, &blob);
+            let result = mbr::rclone::set_config_path(&config_path)
+                .and_then(|()| repo::download_blob(&holders, &hash, &blob));
             tx.send(Msg::Fetched { hash, result }).ok();
             tx.send(Msg::Done).ok();
         });
     }
 
     fn check_remote(&self, name: &str) {
-        let remote = {
+        let (remote, config_path) = {
             let mut repo = self.repo.borrow_mut();
             let Some(repo) = repo.as_mut() else { return };
-            match repo.db.remote(name) {
+            let remote = match repo.db.remote(name) {
                 Ok(Some(remote)) => remote,
                 _ => return,
-            }
+            };
+            let config_path = repo.rclone_config_path();
+            (remote, config_path)
         };
 
         self.begin_task();
         self.status(format!("Checking remote '{name}'…"));
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let result = mbr::rclone::list_blobs(&remote.target);
+            let result = mbr::rclone::set_config_path(&config_path)
+                .and_then(|()| mbr::rclone::list_blobs(&remote.target));
             tx.send(Msg::Listed {
                 remote: remote.name,
                 result,
             })
             .ok();
+            tx.send(Msg::Done).ok();
+        });
+    }
+
+    fn start_remote_setup(&self, name: &str, backend: &str) {
+        let config_path = {
+            let mut repo = self.repo.borrow_mut();
+            let Some(repo) = repo.as_mut() else {
+                self.status("Cannot configure remote: no folder open");
+                return;
+            };
+            if repo.db.remote(name).ok().flatten().is_some() {
+                self.status(format!("Error: remote '{name}' already exists"));
+                return;
+            }
+            repo.rclone_config_path()
+        };
+        self.window.set_setup_active(true);
+        self.window.set_setup_state(SharedString::default());
+        self.window.set_setup_question(SharedString::default());
+        self.window
+            .set_setup_help(SharedString::from("Starting rclone configuration…"));
+        self.window.set_setup_answer(SharedString::default());
+        self.window.set_setup_default(SharedString::default());
+        self.window.set_setup_password(false);
+        self.begin_task();
+        let tx = self.tx.clone();
+        let name = name.to_owned();
+        let backend = backend.to_owned();
+        std::thread::spawn(move || {
+            let result = mbr::rclone::set_config_path(&config_path).and_then(|()| {
+                let remotes = mbr::rclone::call("config/listremotes", serde_json::json!({}))?;
+                if remotes
+                    .get("remotes")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(&name)))
+                {
+                    return Err(format!("rclone remote '{name}' already exists"));
+                }
+                mbr::rclone::call(
+                    "config/create",
+                    serde_json::json!({
+                        "name": name,
+                        "type": backend,
+                        "parameters": {},
+                        "opt": {"nonInteractive": true, "all": true},
+                    }),
+                )
+            });
+            tx.send(Msg::Setup { name, result }).ok();
+            tx.send(Msg::Done).ok();
+        });
+    }
+
+    fn submit_remote_setup(&self, name: &str, _backend: &str, state: &str, answer: &str) {
+        let config_path = {
+            let repo = self.repo.borrow();
+            let Some(repo) = repo.as_ref() else { return };
+            repo.rclone_config_path()
+        };
+        self.begin_task();
+        self.status("Continuing rclone configuration…");
+        let tx = self.tx.clone();
+        let name = name.to_owned();
+        let state = state.to_owned();
+        let answer = answer.to_owned();
+        std::thread::spawn(move || {
+            let result = mbr::rclone::set_config_path(&config_path).and_then(|()| {
+                mbr::rclone::call(
+                    "config/update",
+                    serde_json::json!({
+                        "name": name,
+                        "parameters": {},
+                        "opt": {
+                            "nonInteractive": true,
+                            "continue": true,
+                            "state": state,
+                            "result": answer,
+                        },
+                    }),
+                )
+            });
+            tx.send(Msg::Setup { name, result }).ok();
             tx.send(Msg::Done).ok();
         });
     }
@@ -350,6 +473,89 @@ impl App {
                     Ok(text)
                 }),
                 Err(e) => self.status(format!("Remote '{remote}' check failed: {e}")),
+            },
+            Msg::Setup { name, result } => match result {
+                Err(e) => {
+                    self.window.set_setup_help(SharedString::from(format!("Error: {e}")));
+                    self.window.set_setup_state(SharedString::default());
+                    self.status(format!("Remote setup failed: {e}"));
+                }
+                Ok(response) => {
+                    let state = response
+                        .get("State")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let error = response
+                        .get("Error")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    if state.is_empty() {
+                        if !error.is_empty() {
+                            self.window.set_setup_help(SharedString::from(error));
+                            self.status(format!("Remote setup failed: {error}"));
+                        } else {
+                            let target = format!("{name}:mbr");
+                            self.with_repo("save remote", |repo| {
+                                repo.db.add_remote(&name, &target)?;
+                                Ok(format!("Added remote {name} -> {target}"))
+                            });
+                            self.window.set_setup_active(false);
+                            self.window.set_setup_state(SharedString::default());
+                            self.window.set_setup_question(SharedString::default());
+                            self.window.set_setup_help(SharedString::default());
+                            self.window.set_setup_answer(SharedString::default());
+                            self.window.set_setup_default(SharedString::default());
+                            self.window.set_setup_password(false);
+                            self.window.set_new_remote_name(SharedString::default());
+                            self.refresh();
+                        }
+                    } else {
+                        let option = response.get("Option");
+                        let question = option
+                            .and_then(|v| v.get("Name"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("value");
+                        let mut help = option
+                            .and_then(|v| v.get("Help"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        if !error.is_empty() {
+                            help = format!("{error}\n{help}");
+                        }
+                        if let Some(examples) = option
+                            .and_then(|v| v.get("Examples"))
+                            .and_then(serde_json::Value::as_array)
+                        {
+                            for example in examples {
+                                let value = example
+                                    .get("Value")
+                                    .map(mbr::rclone::display_value_for_ui)
+                                    .unwrap_or_default();
+                                let example_help = example
+                                    .get("Help")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or_default();
+                                help.push_str(&format!("\n{value}: {example_help}"));
+                            }
+                        }
+                        let default = option
+                            .and_then(|v| v.get("Default"))
+                            .map(mbr::rclone::display_value_for_ui)
+                            .unwrap_or_default();
+                        let is_password = option
+                            .and_then(|v| v.get("IsPassword"))
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        self.window.set_setup_state(SharedString::from(state));
+                        self.window.set_setup_password(is_password);
+                        self.window.set_setup_question(SharedString::from(question));
+                        self.window.set_setup_help(SharedString::from(help));
+                        self.window.set_setup_default(SharedString::from(default));
+                        self.window.set_setup_answer(SharedString::default());
+                        self.status("Answer the rclone configuration question");
+                    }
+                }
             },
             Msg::Done => {
                 let left = self.tasks.get().saturating_sub(1);
