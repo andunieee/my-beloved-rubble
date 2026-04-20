@@ -36,7 +36,11 @@ enum Msg {
     /// A background task ended.
     Done,
     /// A remote configuration step returned from librclone.
-    Setup { name: String, result: Result<serde_json::Value, String> },}
+    Setup {
+        name: String,
+        result: Result<serde_json::Value, String>,
+    },
+}
 
 struct App {
     window: AppWindow,
@@ -107,15 +111,19 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let app = app.clone();
-        app.clone().window.on_start_remote_setup(move |name, backend| {
-            app.start_remote_setup(&name, &backend);
-        });
+        app.clone()
+            .window
+            .on_start_remote_setup(move |name, backend| {
+                app.start_remote_setup(&name, &backend);
+            });
     }
     {
         let app = app.clone();
-        app.clone().window.on_submit_remote_setup(move |name, backend, state, answer| {
-            app.submit_remote_setup(&name, &backend, &state, &answer);
-        });
+        app.clone()
+            .window
+            .on_submit_remote_setup(move |name, backend, state, answer| {
+                app.submit_remote_setup(&name, &backend, &state, &answer);
+            });
     }
     {
         let app = app.clone();
@@ -141,7 +149,9 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let app = app.clone();
-        app.clone().window.on_check_remote(move |name| app.check_remote(&name));
+        app.clone()
+            .window
+            .on_check_remote(move |name| app.check_remote(&name));
     }
     {
         let app = app.clone();
@@ -172,7 +182,9 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let app = app.clone();
-        app.clone().window.on_fetch_file(move |hash| app.fetch_blob(&hash));
+        app.clone()
+            .window
+            .on_fetch_file(move |hash| app.fetch_blob(&hash));
     }
 
     // ── reopen last folder ──
@@ -201,8 +213,12 @@ impl App {
         }
     }
 
-    /// Attach (initializing if needed), scan, and display a folder.
+    /// Attach `dir`, initializing it first if it is not an mbr folder.
     fn attach(&self, dir: PathBuf) {
+        if !Repo::is_initialized(&dir) && !confirm_init(&dir) {
+            self.status(format!("Did not attach {}", dir.display()));
+            return;
+        }
         match Repo::init(&dir) {
             Ok(repo) => {
                 *self.repo.borrow_mut() = Some(repo);
@@ -448,10 +464,9 @@ impl App {
                 Err(e) => self.status(format!("Push to {remote} failed: {e}")),
             },
             Msg::Fetched { hash, result } => match result {
-                Ok(remote) => self.status(format!(
-                    "Fetched {} from {remote}",
-                    util::short_hash(&hash)
-                )),
+                Ok(remote) => {
+                    self.status(format!("Fetched {} from {remote}", util::short_hash(&hash)))
+                }
                 Err(e) => self.status(format!("Fetch failed: {e}")),
             },
             Msg::Listed { remote, result } => match result {
@@ -476,7 +491,8 @@ impl App {
             },
             Msg::Setup { name, result } => match result {
                 Err(e) => {
-                    self.window.set_setup_help(SharedString::from(format!("Error: {e}")));
+                    self.window
+                        .set_setup_help(SharedString::from(format!("Error: {e}")));
                     self.window.set_setup_state(SharedString::default());
                     self.status(format!("Remote setup failed: {e}"));
                 }
@@ -612,15 +628,17 @@ impl App {
                         target: r.target.as_str().into(),
                         blobs: format!(
                             "{} blob(s)",
-                            repo.db.blobs_on_remote(&r.name).map(|b| b.len()).unwrap_or(0)
+                            repo.db
+                                .blobs_on_remote(&r.name)
+                                .map(|b| b.len())
+                                .unwrap_or(0)
                         )
                         .into(),
                     })
                     .collect();
                 self.window
                     .set_remote_names(ModelRc::new(VecModel::from(names)));
-                self.window
-                    .set_remotes(ModelRc::new(VecModel::from(rows)));
+                self.window.set_remotes(ModelRc::new(VecModel::from(rows)));
             }
             Err(e) => self.status(format!("Error listing remotes: {e}")),
         }
@@ -672,11 +690,7 @@ fn last_folder_file() -> Option<PathBuf> {
 }
 
 fn load_last_folder() -> Option<PathBuf> {
-    let path = PathBuf::from(
-        std::fs::read_to_string(last_folder_file()?)
-            .ok()?
-            .trim(),
-    );
+    let path = PathBuf::from(std::fs::read_to_string(last_folder_file()?).ok()?.trim());
     path.join(repo::DB_FILE).is_file().then_some(path)
 }
 
@@ -687,4 +701,18 @@ fn save_last_folder(dir: &std::path::Path) {
         }
         std::fs::write(file, dir.display().to_string()).ok();
     }
+}
+
+fn confirm_init(dir: &std::path::Path) -> bool {
+    use rfd::MessageButtons;
+    rfd::MessageDialog::new()
+        .set_title("Attach to mbr?")
+        .set_description(format!(
+            "{} is not an mbr folder.\n\nAttaching it will move its files into a hidden .mbr/blob store and replace them with symlinks.\n\nInitialize it?",
+            dir.display()
+        ))
+        .set_level(rfd::MessageLevel::Warning)
+        .set_buttons(MessageButtons::YesNo)
+        .show()
+        == rfd::MessageDialogResult::Yes
 }

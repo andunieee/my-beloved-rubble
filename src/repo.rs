@@ -78,7 +78,6 @@ pub struct RemoteCheck {
 enum Entry {
     File(PathBuf),
     /// A symlink into `.mbr/blobs`, carrying the hash it names.
-
     BlobLink(PathBuf, String),
 }
 
@@ -97,6 +96,11 @@ impl Repo {
         ensure_rclone_config(&root.join(RCLONE_CONFIG_FILE))?;
         let db = Db::open(&root.join(DB_FILE))?;
         Ok(Self { root, db })
+    }
+
+    /// Whether `root` already has the `.mbr` store and database.
+    pub fn is_initialized(root: &Path) -> bool {
+        root.join(BLOBS_DIR).is_dir() && root.join(DB_FILE).is_file()
     }
 
     /// Open an already-attached folder (or one being initialized).
@@ -225,8 +229,7 @@ impl Repo {
             blob.strip_prefix(&self.root)
                 .expect("blob path is under root"),
         );
-        symlink(&target, &abs)
-            .map_err(|e| format!("cannot symlink {}: {e}", abs.display()))?;
+        symlink(&target, &abs).map_err(|e| format!("cannot symlink {}: {e}", abs.display()))?;
         Ok(hash)
     }
 
@@ -380,7 +383,10 @@ impl Repo {
     pub fn fetch_blob(&mut self, hash: &str) -> Result<String, String> {
         self.configure_rclone()?;
         if self.blob_present(hash) {
-            return Err(format!("blob {} is already present", util::short_hash(hash)));
+            return Err(format!(
+                "blob {} is already present",
+                util::short_hash(hash)
+            ));
         }
         let holders = self.db.remotes_for_blob(hash)?;
         if holders.is_empty() {
@@ -416,12 +422,7 @@ impl Repo {
     ) -> Result<RemoteCheck, String> {
         let expected: HashSet<String> =
             self.db.blobs_on_remote(&remote.name)?.into_iter().collect();
-        let known: HashSet<String> = self
-            .db
-            .list_blobs()?
-            .into_iter()
-            .map(|b| b.hash)
-            .collect();
+        let known: HashSet<String> = self.db.list_blobs()?.into_iter().map(|b| b.hash).collect();
 
         let mut check = RemoteCheck::default();
         for hash in &expected {
@@ -548,8 +549,7 @@ fn ensure_rclone_config(path: &Path) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
-    std::fs::write(path, "")
-        .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+    std::fs::write(path, "").map_err(|e| format!("cannot create {}: {e}", path.display()))?;
     restrict_config_permissions(path)
 }
 
