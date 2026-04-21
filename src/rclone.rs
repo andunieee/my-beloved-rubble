@@ -7,18 +7,53 @@
 use crate::util::is_hash;
 use librclone::{initialize, rpc};
 use serde_json::{Value, json};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, Once, OnceLock};
+use std::time::Duration;
 
 static INITIALIZED: Once = Once::new();
 static RPC_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 fn lock() -> &'static Mutex<()> {
     RPC_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Where rclone writes its log. mbr redirects it here so the GUI can surface
+/// the OAuth URL instead of losing it to stderr.
+pub fn log_path() -> PathBuf {
+    LOG_PATH
+        .get_or_init(|| {
+            dirs::config_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("mbr")
+                .join("rclone.log")
+        })
+        .clone()
+}
+
 fn ensure_initialized() {
-    INITIALIZED.call_once(initialize);
+    INITIALIZED.call_once(|| {
+        // Must be set before rclone reads its log-file option at init time.
+        unsafe { std::env::set_var("RCLONE_LOG_FILE", log_path()) };
+        initialize();
+    });
+}
+
+/// The OAuth auth URL rclone most recently wrote to its log, if any.
+pub fn auth_url() -> Option<String> {
+    let text = std::fs::read_to_string(log_path()).ok()?;
+    text.lines().rev().find_map(extract_url)
+}
+
+fn extract_url(line: &str) -> Option<String> {
+    let pos = line.find("/auth?state=")?;
+    let start = line[..pos].rfind("http://")?;
+    let rest = &line[pos..];
+    let end = rest
+        .find(|c: char| c.is_whitespace())
+        .unwrap_or(rest.len());
+    Some(format!("{}{}", &line[start..pos], &rest[..end]))
 }
 
 /// Run one librclone RPC call while protecting rclone's process-global state.
@@ -175,6 +210,44 @@ pub fn cancel_setup(state: &str) -> Result<(), String> {
         }),
     )?;
     Ok(())
+}
+
+/// Like [`continue_setup`], but while rclone blocks doing OAuth (browser
+/// flow) it watches rclone's log for the auth URL and reports it through
+/// `on_url` — so the UI can show the link if the browser fails to open.
+pub fn continue_setup_watching(
+    name: &str,
+    state: &str,
+    answer: &str,
+    parameters: Value,
+    on_url: &mut dyn FnMut(String),
+) -> Result<SetupOutcome, String> {
+    let (tx, rx) = std::sync::mpsc::channel::<Result<SetupOutcome, String>>();
+    let name = name.to_owned();
+    let state = state.to_owned();
+    let answer = answer.to_owned();
+    std::thread::spawn(move || {
+        let result = continue_setup(&name, &state, &answer, parameters);
+        let _ = tx.send(result);
+    });
+
+    let mut reported: Option<String> = None;
+    loop {
+        match rx.recv_timeout(Duration::from_millis(300)) {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(url) = auth_url()
+                    && reported.as_deref() != Some(url.as_str())
+                {
+                    reported = Some(url.clone());
+                    on_url(url);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("rclone setup thread vanished".to_owned());
+            }
+        }
+    }
 }
 
 /// The remote `name` already exists in the selected config.

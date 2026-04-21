@@ -43,10 +43,10 @@ enum Msg {
         target: String,
         result: Result<mbr::rclone::SetupOutcome, String>,
     },
+    /// The OAuth auth URL rclone logged while the browser flow runs.
+    OAuthUrl(String),
     /// The user aborted an in-progress configuration.
-    Cancelled {
-        result: Result<(), String>,
-    },
+    Cancelled { result: Result<(), String> },
 }
 
 struct App {
@@ -441,8 +441,10 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
-        self.window.set_form_fields(ModelRc::new(VecModel::from(fields)));
-        self.window.set_form_values(ModelRc::new(VecModel::from(values)));
+        self.window
+            .set_form_fields(ModelRc::new(VecModel::from(fields)));
+        self.window
+            .set_form_values(ModelRc::new(VecModel::from(values)));
         self.window.set_setup_active(true);
     }
 
@@ -471,7 +473,12 @@ impl App {
                     }
                     mbr::rclone::begin_setup(&name, &backend_name, parameters)
                 });
-                tx.send(Msg::Setup { name, target, result }).ok();
+                tx.send(Msg::Setup {
+                    name,
+                    target,
+                    result,
+                })
+                .ok();
             })
         });
     }
@@ -496,10 +503,24 @@ impl App {
             let answer = answer.clone();
             let target = target.clone();
             Box::new(move || {
+                let mut on_url = |url| {
+                    let _ = tx.send(Msg::OAuthUrl(url));
+                };
                 let result = mbr::rclone::set_config_path(&config_path).and_then(|()| {
-                    mbr::rclone::continue_setup(&name, &state, &answer, parameters)
+                    mbr::rclone::continue_setup_watching(
+                        &name,
+                        &state,
+                        &answer,
+                        parameters,
+                        &mut on_url,
+                    )
                 });
-                tx.send(Msg::Setup { name, target, result }).ok();
+                tx.send(Msg::Setup {
+                    name,
+                    target,
+                    result,
+                })
+                .ok();
             })
         });
     }
@@ -552,6 +573,7 @@ impl App {
         self.window.set_setup_help(SharedString::default());
         self.window.set_setup_answer(SharedString::default());
         self.window.set_setup_default(SharedString::default());
+        self.window.set_setup_url(SharedString::default());
         self.window.set_setup_password(false);
         self.window.set_form_fields(ModelRc::default());
         self.window.set_form_values(ModelRc::default());
@@ -624,9 +646,16 @@ impl App {
                     self.window.set_setup_help(SharedString::from(q.help));
                     self.window.set_setup_default(SharedString::from(q.default));
                     self.window.set_setup_answer(SharedString::default());
+                    self.window.set_setup_url(SharedString::default());
                     self.status("rclone needs one more answer to finish this remote");
                 }
             },
+            Msg::OAuthUrl(url) => {
+                self.window.set_setup_url(SharedString::from(url.as_str()));
+                self.status(
+                    "Waiting for browser sign-in… (use the link below if no browser opened)",
+                );
+            }
             Msg::Cancelled { result } => {
                 if let Err(e) = result {
                     self.status(format!("Note: {e}"));
@@ -706,10 +735,7 @@ impl App {
 
 /// Build the rclone `parameters` object from the form answers: non-empty
 /// values keyed by config name, in the clear (rclone obscures secrets).
-fn form_parameters(
-    backend: &mbr::backends::Backend,
-    values: &[SharedString],
-) -> serde_json::Value {
+fn form_parameters(backend: &mbr::backends::Backend, values: &[SharedString]) -> serde_json::Value {
     let mut parameters = serde_json::Map::new();
     for (field, value) in backend.fields.iter().zip(values.iter()) {
         let value = value.trim();

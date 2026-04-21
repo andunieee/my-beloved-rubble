@@ -86,6 +86,7 @@ export component AppWindow inherits Window {
     in-out property <string> setup-help: "";
     in-out property <string> setup-answer: "";
     in-out property <string> setup-default: "";
+    in-out property <string> setup-url: "";
     in-out property <bool> setup-password: false;
 
     property <bool> has-selection: root.selected-index >= 0 && root.selected-index < root.files.length;
@@ -561,6 +562,12 @@ export component AppWindow inherits Window {
                                             wrap: word-wrap;
                                             color: Palette.foreground.transparentize(25%);
                                         }
+                                        if root.setup-url != "": Text {
+                                            text: root.setup-url;
+                                            font-size: 11px;
+                                            wrap: word-wrap;
+                                            color: Palette.accent-background;
+                                        }
                                         LineEdit {
                                             text: root.setup-answer;
                                             input-type: root.setup-password ? InputType.password : InputType.text;
@@ -576,7 +583,7 @@ export component AppWindow inherits Window {
                                                         root.new-remote-name,
                                                         root.setup-backend,
                                                         root.setup-state,
-                                                        root.setup-answer
+                                                        root.setup-answer == "" ? root.setup-default : root.setup-answer
                                                     );
                                                 }
                                             }
