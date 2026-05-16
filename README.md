@@ -44,9 +44,10 @@ folder owns its rclone configuration at `.mbr/rclone.conf`.
 
 ### Setting up a remote
 
-mbr hardcodes a short setup form for the backends it can prefill —
-local folders, SFTP, SMB, WebDAV, S3, B2, Azure Blob, GCS, Swift, and
-pCloud — derived from rclone's documentation and cross-checked against
+mbr hardcodes a short setup form for most rclone backends (local
+folders, SFTP, SMB, WebDAV, S3, B2, Azure, GCS, Drive, Dropbox, OneDrive,
+pCloud, and many more; see `mbr remote types`) — derived from rclone's
+documentation and cross-checked against
 the embedded rclone's own metadata at test time (`cargo test`), so a
 renamed option upstream fails the build instead of producing a form
 rclone silently ignores.
@@ -58,8 +59,10 @@ rclone in one shot (`config/create` with prefilled parameters); anything
 rclone still needs afterwards — typically a browser sign-in for OAuth
 backends — comes back as a single question the frontends relay.
 
-Backends with pure browser flows (Google Drive, Dropbox, OneDrive, …)
-have no form by design; `mbr remote add` still accepts any pre-existing
+For OAuth backends (Google Drive, Dropbox, OneDrive, …) the form is
+mostly optional client credentials; the sign-in itself happens in the
+browser, and the auth link is also printed (CLI) or shown inline (GUI) in
+case no browser opens. `mbr remote add` still accepts any pre-existing
 rclone target, e.g. one configured with the `rclone` executable itself.
 
 ## CLI

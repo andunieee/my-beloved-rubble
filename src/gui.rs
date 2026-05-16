@@ -460,8 +460,8 @@ impl App {
                 return;
             }
         }
-        let parameters = form_parameters(backend, values);
-        let target = backends::target_for(backend, &bucket_value(backend, values));
+        let parameters = backends::form_parameters(backend, values);
+        let target = backends::target_for(name, backend, &backends::target_spec(backend, values));
         let backend_name = backend_name.to_owned();
         self.run_setup_step(name, |tx, name, config_path| {
             let parameters = parameters.clone();
@@ -488,11 +488,11 @@ impl App {
         let values: Vec<SharedString> = self.window.get_form_values().iter().collect();
         let backend = backends::backend(backend_name);
         let parameters = match backend {
-            Some(b) => form_parameters(b, &values),
+            Some(b) => backends::form_parameters(b, &values),
             None => serde_json::json!({}),
         };
         let target = match backend {
-            Some(b) => backends::target_for(b, &bucket_value(b, &values)),
+            Some(b) => backends::target_for(name, b, &backends::target_spec(b, &values)),
             None => format!("{name}:{}", backends::DEFAULT_PATH),
         };
         let state = state.to_owned();
@@ -684,7 +684,6 @@ impl App {
         // Preserve selection by path across refreshes.
         let files = self.window.get_files();
         let selected_path = {
-            use slint::Model;
             let idx = self.window.get_selected_index();
             (idx >= 0)
                 .then(|| files.row_data(idx as usize))
@@ -733,49 +732,17 @@ impl App {
     }
 }
 
-/// Build the rclone `parameters` object from the form answers: non-empty
-/// values keyed by config name, in the clear (rclone obscures secrets).
-fn form_parameters(backend: &mbr::backends::Backend, values: &[SharedString]) -> serde_json::Value {
-    let mut parameters = serde_json::Map::new();
-    for (field, value) in backend.fields.iter().zip(values.iter()) {
-        let value = value.trim();
-        if !value.is_empty() {
-            parameters.insert(field.name.to_owned(), serde_json::Value::from(value));
-        }
-    }
-    serde_json::Value::Object(parameters)
-}
-
-/// The bucket/path answer used to build the mbr target: the first field
-/// flagged [`mbr::backends::Field::to_target`], else the mbr default.
-fn bucket_value(backend: &mbr::backends::Backend, values: &[SharedString]) -> String {
-    for (field, value) in backend.fields.iter().zip(values.iter()) {
-        if field.to_target {
-            return value.trim().to_owned();
-        }
-    }
-    String::new()
-}
-
 fn file_row(s: &repo::FileStatus) -> FileRow {
     let versions = s
         .previous_versions
         .iter()
         .map(|v| {
-            let stored = if v.present_locally && v.remotes.is_empty() {
-                "local only".to_owned()
-            } else if v.present_locally {
-                format!("local, {}", v.remotes.join(", "))
-            } else if v.remotes.is_empty() {
-                "NOT STORED ANYWHERE".to_owned()
-            } else {
-                v.remotes.join(", ")
-            };
             format!(
-                "{} · {} · removed {} · {stored}",
+                "{} · {} · removed {} · {}",
                 util::short_hash(&v.hash),
                 util::format_size(v.size),
                 util::format_time(v.removed_at),
+                v.stored_summary(),
             )
         })
         .collect::<Vec<_>>()

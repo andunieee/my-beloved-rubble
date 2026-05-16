@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use mbr::db::Remote;
 use mbr::repo::Repo;
 use mbr::util;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(
@@ -30,8 +30,7 @@ enum Command {
     Ls,
     /// full detail for one file or blob
     Info { spec: String },
-    /// add an existing rclone target
-    #[command(name = "remote")]
+    /// manage rclone remotes
     Remote {
         #[command(subcommand)]
         command: RemoteCommand,
@@ -45,6 +44,7 @@ enum Command {
     /// download blobs missing locally
     Fetch {
         /// paths or hashes to fetch
+        #[arg(required = true)]
         specs: Vec<String>,
     },
     /// verify remote is reachable and has our blobs
@@ -88,9 +88,8 @@ fn run(cli: Cli) -> Result<(), String> {
             RemoteCommand::Ls => remote_ls(&mut open()?),
         },
         Command::Push { remote, specs } => push(&mut open()?, &remote, &specs),
-        Command::Fetch { specs } if !specs.is_empty() => fetch(&mut open()?, &specs),
+        Command::Fetch { specs } => fetch(&mut open()?, &specs),
         Command::Check { remote } => check(&mut open()?, &remote),
-        Command::Fetch { .. } => Err("no specs given; usage: mbr fetch <path|hash>...".into()),
     }
 }
 
@@ -104,7 +103,7 @@ fn lookup_remote(repo: &mut Repo, name: &str) -> Result<Remote, String> {
         .ok_or_else(|| format!("no remote named '{name}' (see `mbr remote ls`)"))
 }
 
-fn init(dir: &PathBuf) -> Result<(), String> {
+fn init(dir: &Path) -> Result<(), String> {
     let mut repo = Repo::init(dir)?;
     let report = repo.scan()?;
     println!("attached mbr to {}", repo.root.display());
@@ -210,20 +209,12 @@ fn info(repo: &mut Repo, spec: &str) -> Result<(), String> {
         println!("same blob was previously:  {}", s.past_names.join(", "));
     }
     for v in &s.previous_versions {
-        let stored = if v.present_locally && v.remotes.is_empty() {
-            "local only".to_owned()
-        } else if v.present_locally {
-            format!("local, {}", v.remotes.join(", "))
-        } else if v.remotes.is_empty() {
-            "NOT STORED ANYWHERE".to_owned()
-        } else {
-            v.remotes.join(", ")
-        };
         println!(
-            "previous version: {} ({}, removed {}, stored: {stored})",
+            "previous version: {} ({}, removed {}, stored: {})",
             util::short_hash(&v.hash),
             util::format_size(v.size),
             util::format_time(v.removed_at),
+            v.stored_summary(),
         );
     }
     Ok(())
@@ -301,22 +292,17 @@ fn remote_setup(repo: &mut Repo, name: &str, backend: &str) -> Result<(), String
         let answer = if field.kind == mbr::backends::Kind::Secret {
             rpassword::prompt_password(format!("{label}: ")).map_err(|e| e.to_string())?
         } else {
-            prompt(&label, &field.default)?
+            prompt(&label, field.default)?
         };
         if field.required && answer.trim().is_empty() {
             return Err(format!("'{}' is required", field.label));
         }
         values.push(answer);
     }
-    let spec = values
-        .iter()
-        .zip(backend.fields.iter())
-        .find(|(_, f)| f.to_target)
-        .map(|(v, _)| v.trim().to_owned())
-        .unwrap_or_default();
-    let target = mbr::backends::target_for(backend, &spec);
+    let spec = mbr::backends::target_spec(backend, &values);
+    let target = mbr::backends::target_for(name, backend, &spec);
 
-    let parameters = form_parameters(backend, &values);
+    let parameters = mbr::backends::form_parameters(backend, &values);
     let mut outcome = mbr::rclone::begin_setup(name, backend.name, parameters.clone())?;
     // Anything rclone still asks (OAuth, verification) goes through the
     // generic question protocol.
@@ -339,19 +325,6 @@ fn remote_setup(repo: &mut Repo, name: &str, backend: &str) -> Result<(), String
     repo.db.add_remote(name, &target)?;
     println!("added remote {name} -> {target}");
     Ok(())
-}
-
-/// Build the rclone `parameters` object from the collected answers (the
-/// CLI's non-secret answers already have defaults filled in).
-fn form_parameters(backend: &mbr::backends::Backend, values: &[String]) -> serde_json::Value {
-    let mut parameters = serde_json::Map::new();
-    for (field, value) in backend.fields.iter().zip(values.iter()) {
-        let value = value.trim();
-        if !value.is_empty() {
-            parameters.insert(field.name.to_owned(), serde_json::Value::from(value));
-        }
-    }
-    serde_json::Value::Object(parameters)
 }
 
 fn prompt(label: &str, default: &str) -> Result<String, String> {

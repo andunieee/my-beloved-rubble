@@ -64,6 +64,18 @@ pub struct PreviousVersion {
     pub remotes: Vec<String>,
 }
 
+impl PreviousVersion {
+    /// Where this old blob is still stored, for display.
+    pub fn stored_summary(&self) -> String {
+        match (self.present_locally, self.remotes.is_empty()) {
+            (true, true) => "local only".to_owned(),
+            (true, false) => format!("local, {}", self.remotes.join(", ")),
+            (false, true) => "NOT STORED ANYWHERE".to_owned(),
+            (false, false) => self.remotes.join(", "),
+        }
+    }
+}
+
 /// Result of checking a remote against what the database expects.
 #[derive(Debug, Default)]
 pub struct RemoteCheck {
@@ -108,7 +120,7 @@ impl Repo {
         let root = root
             .canonicalize()
             .map_err(|e| format!("cannot resolve {}: {e}", root.display()))?;
-        if !root.join(BLOBS_DIR).is_dir() || !root.join(DB_FILE).is_file() {
+        if !Self::is_initialized(&root) {
             return Err(format!(
                 "{} is not an mbr folder (run `mbr init` there first)",
                 root.display()
@@ -213,15 +225,16 @@ impl Repo {
         let hash = util::sha256_file(&abs)?;
         let blob = self.blob_path(&hash);
 
-        if blob.is_file() {
-            // Content already stored; this file is a duplicate.
-            std::fs::remove_file(&abs)
-                .map_err(|e| format!("cannot remove duplicate {}: {e}", abs.display()))?;
-        } else {
+        let moved = !blob.is_file();
+        if moved {
             std::fs::create_dir_all(blob.parent().unwrap())
                 .map_err(|e| format!("cannot create blob directory: {e}"))?;
             std::fs::rename(&abs, &blob)
                 .map_err(|e| format!("cannot move {} into blob store: {e}", abs.display()))?;
+        } else {
+            // Content already stored; this file is a duplicate.
+            std::fs::remove_file(&abs)
+                .map_err(|e| format!("cannot remove duplicate {}: {e}", abs.display()))?;
         }
 
         let depth = rel.components().count() - 1;
@@ -229,7 +242,15 @@ impl Repo {
             blob.strip_prefix(&self.root)
                 .expect("blob path is under root"),
         );
-        symlink(&target, &abs).map_err(|e| format!("cannot symlink {}: {e}", abs.display()))?;
+        if let Err(e) = symlink(&target, &abs) {
+            // Put the content back where the user left it.
+            if moved {
+                std::fs::rename(&blob, &abs).ok();
+            } else {
+                std::fs::copy(&blob, &abs).ok();
+            }
+            return Err(format!("cannot symlink {}: {e}", abs.display()));
+        }
         Ok(hash)
     }
 
@@ -327,19 +348,21 @@ impl Repo {
     /// Resolve a user-supplied spec (active path, full hash, or unique hash
     /// prefix) to a blob hash.
     pub fn resolve_spec(&mut self, spec: &str) -> Result<String, String> {
-        if util::is_hash(spec) {
-            return Ok(spec.to_owned());
-        }
         if let Some(record) = self.db.active_path(spec)? {
             return Ok(record.hash);
         }
-        if spec.len() >= 6 && spec.bytes().all(|b| b.is_ascii_hexdigit()) {
+        // Stored hashes are lowercase hex.
+        let hex = spec.to_ascii_lowercase();
+        if util::is_hash(&hex) {
+            return Ok(hex);
+        }
+        if hex.len() >= 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
             let matches: Vec<String> = self
                 .db
                 .list_blobs()?
                 .into_iter()
                 .map(|b| b.hash)
-                .filter(|h| h.starts_with(spec))
+                .filter(|h| h.starts_with(&hex))
                 .collect();
             match matches.len() {
                 1 => return Ok(matches.into_iter().next().unwrap()),
@@ -463,18 +486,21 @@ pub fn download_blob(holders: &[Remote], hash: &str, blob: &Path) -> Result<Stri
     let mut last_err = String::new();
     for remote in holders {
         match rclone::fetch_blob(&remote.target, hash, &tmp) {
-            Ok(()) => {
-                let actual = util::sha256_file(&tmp)?;
-                if actual != hash {
-                    std::fs::remove_file(&tmp).ok();
-                    last_err = format!("remote '{}' returned corrupt data", remote.name);
-                    continue;
+            Ok(()) => match util::sha256_file(&tmp) {
+                Ok(actual) if actual == hash => {
+                    return std::fs::rename(&tmp, blob)
+                        .map(|()| remote.name.clone())
+                        .map_err(|e| {
+                            std::fs::remove_file(&tmp).ok();
+                            format!("cannot finalize blob: {e}")
+                        });
                 }
-                std::fs::rename(&tmp, blob).map_err(|e| format!("cannot finalize blob: {e}"))?;
-                return Ok(remote.name.clone());
-            }
+                Ok(_) => last_err = format!("remote '{}' returned corrupt data", remote.name),
+                Err(e) => last_err = e,
+            },
             Err(e) => last_err = format!("remote '{}': {e}", remote.name),
         }
+        std::fs::remove_file(&tmp).ok();
     }
     Err(format!("could not fetch blob: {last_err}"))
 }
@@ -487,9 +513,8 @@ fn rel_str(rel: &Path) -> String {
 }
 
 /// Recursively list ingestable entries under `dir`, as paths relative to
-/// Dot-entries (including `.mbr`) are skipped, as
-
-/// are symlinks that don't point into the blob store.
+/// `root`. Dot-entries (including `.mbr`) are skipped, as are symlinks
+/// that don't point into the blob store.
 fn collect_entries(root: &Path, dir: &Path, out: &mut Vec<Entry>) -> Result<(), String> {
     let entries =
         std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
