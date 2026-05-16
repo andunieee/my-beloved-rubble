@@ -62,7 +62,7 @@ pub struct Backend {
 // All backends mbr can configure with a form, in picker order.
 pub const BACKENDS: &[Backend] = &[
     Backend { name: "local", title: "Local disk or directory", description: "Another folder on this machine or a mounted disk", needs_path: true, fields: &[
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
+        Field { name: "path", label: "Folder", help: "absolute path of the folder where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "", examples: &[], required: true, to_target: true },
     ] },
     Backend { name: "fichier", title: "1Fichier", description: "1Fichier", needs_path: true, fields: &[
         Field { name: "api_key", label: "API Key", help: "Your API Key, get it from https://1fichier.com/console/params.pl.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
@@ -500,13 +500,29 @@ pub const DEFAULT_PATH: &str = "mbr";
 /// Build the mbr target for the rclone remote `remote_name`. `spec` is the
 /// user's bucket or path answer; empty answers fall back to [`DEFAULT_PATH`].
 pub fn target_for(remote_name: &str, backend: &Backend, spec: &str) -> String {
-    let spec = spec.trim().trim_matches('/');
+    // Only trailing slashes go: a leading one is meaningful (an absolute
+    // local folder, or an absolute path on an SFTP/FTP server).
+    let spec = spec.trim();
+    let spec = match spec.trim_end_matches('/') {
+        "" if spec.starts_with('/') => "/",
+        trimmed => trimmed,
+    };
     let spec = if spec.is_empty() && backend.needs_path {
         DEFAULT_PATH
     } else {
         spec
     };
     format!("{remote_name}:{spec}")
+}
+
+/// Reject bucket/path answers that would point somewhere unintended:
+/// a relative folder for the `local` backend resolves against whatever
+/// directory mbr happens to run in.
+pub fn check_target_spec(backend: &Backend, spec: &str) -> Result<(), String> {
+    if backend.name == "local" && !std::path::Path::new(spec.trim()).is_absolute() {
+        return Err(format!("the folder must be an absolute path, not '{}'", spec.trim()));
+    }
+    Ok(())
 }
 
 /// The bucket/path answer among form `values` (in field order): the first
@@ -612,6 +628,15 @@ mod tests {
     }
 
     #[test]
+    fn local_folders_must_be_absolute() {
+        let local = backend("local").unwrap();
+        assert!(check_target_spec(local, "mbr").is_err());
+        assert!(check_target_spec(local, "").is_err());
+        assert!(check_target_spec(local, "/mnt/backup/mbr").is_ok());
+        assert!(check_target_spec(backend("s3").unwrap(), "bucket").is_ok());
+    }
+
+    #[test]
     fn backend_lookup() {
         assert!(backend("smb").is_some());
         assert!(backend("nope").is_none());
@@ -625,6 +650,11 @@ mod tests {
         let s3 = backend("s3").unwrap();
         assert_eq!(target_for("backup", s3, "mybucket"), "backup:mybucket");
         assert_eq!(target_for("backup", s3, "mybucket/"), "backup:mybucket");
+        let local = backend("local").unwrap();
+        assert_eq!(target_for("disk", local, "/mnt/x/"), "disk:/mnt/x");
+        assert_eq!(target_for("disk", local, "/"), "disk:/");
+        let sftp = backend("sftp").unwrap();
+        assert_eq!(target_for("srv", sftp, "/srv/mbr"), "srv:/srv/mbr");
     }
 
     #[test]
