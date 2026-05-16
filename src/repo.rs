@@ -1,9 +1,10 @@
 //! A rubble folder: scanning, the `.mbr/blobs` content store, and the
 //! metadata-backed file listing.
 
-use crate::db::{Db, Remote};
+use crate::db::{Db, PathRecord, Remote};
 use crate::{rclone, util};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 pub const BLOBS_DIR: &str = ".mbr/blobs";
@@ -87,11 +88,27 @@ pub struct RemoteCheck {
     pub discovered: Vec<String>,
 }
 
+/// One active path found on disk by [`ingest_tree`].
+#[derive(Debug, Clone)]
+pub struct ScannedEntry {
+    /// Path relative to the root, `/`-separated.
+    pub path: String,
+    pub hash: String,
+    /// Size of the local blob, if it is present.
+    pub size: Option<u64>,
+}
+
 enum Entry {
     File(PathBuf),
     /// A symlink into `.mbr/blobs`, carrying the hash it names.
     BlobLink(PathBuf, String),
 }
+
+/// Suffix of the hidden symlink staged next to a file while it is being
+/// ingested (`dir/.name.mbr-ingest`). If mbr dies after moving the file
+/// into the store but before renaming the link into place, the next scan
+/// finds the staged link and finishes the job.
+const STAGED_SUFFIX: &str = ".mbr-ingest";
 
 impl Repo {
     /// Attach mbr to `root`: create the `.mbr` store, database, and
@@ -156,11 +173,7 @@ impl Repo {
 
     /// Local path of a blob: `.mbr/blobs/aa/bb/<hash>`.
     pub fn blob_path(&self, hash: &str) -> PathBuf {
-        self.root
-            .join(BLOBS_DIR)
-            .join(&hash[..2])
-            .join(&hash[2..4])
-            .join(hash)
+        blob_path_in(&self.root, hash)
     }
 
     /// The rclone config owned by this repository.
@@ -175,6 +188,14 @@ impl Repo {
         rclone::set_config_path(&path)
     }
 
+    /// Run `f` with librclone using this repository's configuration (see
+    /// [`rclone::with_config`]).
+    pub fn with_rclone<T>(&self, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        let path = self.rclone_config_path();
+        ensure_rclone_config(&path)?;
+        rclone::with_config(&path, f)
+    }
+
     pub fn blob_present(&self, hash: &str) -> bool {
         self.blob_path(hash).is_file()
     }
@@ -185,102 +206,58 @@ impl Repo {
     /// (leaving symlinks behind), adopt untracked blob symlinks, and mark
     /// vanished paths as removed.
     pub fn scan(&mut self) -> Result<ScanReport, String> {
+        let entries = ingest_tree(&self.root)?;
+        self.apply_scan(entries)
+    }
+
+    /// The database half of [`Repo::scan`]: record what [`ingest_tree`]
+    /// found, in one transaction. Paths tracked but absent from `entries`
+    /// are marked removed.
+    pub fn apply_scan(&mut self, entries: Vec<ScannedEntry>) -> Result<ScanReport, String> {
         let now = util::now();
-        let mut report = ScanReport::default();
-        let mut entries = Vec::new();
-        collect_entries(&self.root, &self.root, &mut entries)?;
+        self.db.transaction(|db| {
+            let mut report = ScanReport::default();
+            let mut active: HashMap<String, PathRecord> = db
+                .list_paths()?
+                .into_iter()
+                .filter(PathRecord::is_active)
+                .map(|r| (r.path.clone(), r))
+                .collect();
 
-        let mut seen = HashSet::new();
-        for entry in entries {
-            let (rel, hash) = match entry {
-                Entry::File(rel) => {
-                    let hash = self.ingest_file(&rel)?;
-                    (rel, hash)
+            for entry in entries {
+                if let Some(size) = entry.size {
+                    db.upsert_blob(&entry.hash, size)?;
                 }
-                Entry::BlobLink(rel, hash) => (rel, hash),
-            };
-            if let Ok(meta) = std::fs::metadata(self.blob_path(&hash)) {
-                self.db.upsert_blob(&hash, meta.len())?;
+                match active.remove(&entry.path) {
+                    Some(record) if record.hash == entry.hash => {}
+                    Some(record) => {
+                        db.mark_path_removed(record.id, now)?;
+                        db.insert_path(&entry.path, &entry.hash, now)?;
+                        report.replaced.push(entry.path);
+                    }
+                    None => {
+                        db.insert_path(&entry.path, &entry.hash, now)?;
+                        report.added.push(entry.path);
+                    }
+                }
             }
-            let name = rel_str(&rel);
-            self.record_path(&name, &hash, now, &mut report)?;
-            seen.insert(name);
-        }
 
-        // Anything tracked but gone from disk is a removal.
-        for record in self.db.list_paths()? {
-            if record.is_active() && !seen.contains(&record.path) {
-                self.db.mark_path_removed(record.id, now)?;
+            // Anything still tracked but not seen on disk is a removal.
+            let mut gone: Vec<PathRecord> = active.into_values().collect();
+            gone.sort_by(|a, b| a.path.cmp(&b.path));
+            for record in gone {
+                db.mark_path_removed(record.id, now)?;
                 report.removed.push(record.path);
             }
-        }
-
-        Ok(report)
-    }
-
-    /// Move a regular file into the blob store and symlink it back.
-    /// Returns the content hash.
-    fn ingest_file(&self, rel: &Path) -> Result<String, String> {
-        let abs = self.root.join(rel);
-        let hash = util::sha256_file(&abs)?;
-        let blob = self.blob_path(&hash);
-
-        let moved = !blob.is_file();
-        if moved {
-            std::fs::create_dir_all(blob.parent().unwrap())
-                .map_err(|e| format!("cannot create blob directory: {e}"))?;
-            std::fs::rename(&abs, &blob)
-                .map_err(|e| format!("cannot move {} into blob store: {e}", abs.display()))?;
-        } else {
-            // Content already stored; this file is a duplicate.
-            std::fs::remove_file(&abs)
-                .map_err(|e| format!("cannot remove duplicate {}: {e}", abs.display()))?;
-        }
-
-        let depth = rel.components().count() - 1;
-        let target = PathBuf::from("../".repeat(depth)).join(
-            blob.strip_prefix(&self.root)
-                .expect("blob path is under root"),
-        );
-        if let Err(e) = symlink(&target, &abs) {
-            // Put the content back where the user left it.
-            if moved {
-                std::fs::rename(&blob, &abs).ok();
-            } else {
-                std::fs::copy(&blob, &abs).ok();
-            }
-            return Err(format!("cannot symlink {}: {e}", abs.display()));
-        }
-        Ok(hash)
-    }
-
-    /// Bring the `paths` table in line with `path` now holding `hash`.
-    fn record_path(
-        &mut self,
-        path: &str,
-        hash: &str,
-        now: i64,
-        report: &mut ScanReport,
-    ) -> Result<(), String> {
-        match self.db.active_path(path)? {
-            Some(active) if active.hash == hash => {}
-            Some(active) => {
-                self.db.mark_path_removed(active.id, now)?;
-                self.db.insert_path(path, hash, now)?;
-                report.replaced.push(path.to_owned());
-            }
-            None => {
-                self.db.insert_path(path, hash, now)?;
-                report.added.push(path.to_owned());
-            }
-        }
-        Ok(())
+            Ok(report)
+        })
     }
 
     // ── status ──
 
     /// The full annotated listing of active files.
     pub fn status(&mut self) -> Result<Vec<FileStatus>, String> {
+        // Ordered by path, then added_at.
         let paths = self.db.list_paths()?;
         let sizes: HashMap<String, u64> = self
             .db
@@ -292,13 +269,19 @@ impl Repo {
         for (hash, remote) in self.db.list_blob_remotes()? {
             remotes_of.entry(hash).or_default().push(remote);
         }
+        let mut by_hash: HashMap<&str, Vec<&PathRecord>> = HashMap::new();
+        let mut by_path: HashMap<&str, Vec<&PathRecord>> = HashMap::new();
+        for record in &paths {
+            by_hash.entry(&record.hash).or_default().push(record);
+            by_path.entry(&record.path).or_default().push(record);
+        }
 
         let mut statuses = Vec::new();
         for record in paths.iter().filter(|r| r.is_active()) {
             let mut other_names = Vec::new();
             let mut past_names = Vec::new();
-            for other in &paths {
-                if other.hash != record.hash || other.path == record.path {
+            for other in &by_hash[record.hash.as_str()] {
+                if other.path == record.path {
                     continue;
                 }
                 if other.is_active() {
@@ -311,8 +294,8 @@ impl Repo {
             past_names.retain(|p| !other_names.contains(p));
 
             let mut previous_versions: Vec<PreviousVersion> = Vec::new();
-            for old in &paths {
-                if old.path != record.path || old.is_active() || old.hash == record.hash {
+            for old in &by_path[record.path.as_str()] {
+                if old.is_active() || old.hash == record.hash {
                     continue;
                 }
                 if previous_versions.iter().any(|v| v.hash == old.hash) {
@@ -377,7 +360,6 @@ impl Repo {
 
     /// Push one blob to a remote and record it there.
     pub fn push_blob(&mut self, remote: &Remote, hash: &str) -> Result<(), String> {
-        self.configure_rclone()?;
         let blob = self.blob_path(hash);
         if !blob.is_file() {
             return Err(format!(
@@ -385,7 +367,7 @@ impl Repo {
                 util::short_hash(hash)
             ));
         }
-        rclone::push_blob(&remote.target, &blob, hash)?;
+        self.with_rclone(|| rclone::push_blob(&remote.target, &blob, hash))?;
         self.db.set_blob_on_remote(hash, &remote.name)
     }
 
@@ -404,7 +386,6 @@ impl Repo {
     /// Download a blob from the first configured remote that has it,
     /// verifying its hash. Returns the name of the remote used.
     pub fn fetch_blob(&mut self, hash: &str) -> Result<String, String> {
-        self.configure_rclone()?;
         if self.blob_present(hash) {
             return Err(format!(
                 "blob {} is already present",
@@ -424,14 +405,17 @@ impl Repo {
                 remotes.push(remote);
             }
         }
-        download_blob(&remotes, hash, &self.blob_path(hash))
+        let blob = self.blob_path(hash);
+        self.with_rclone(|| download_blob(&remotes, hash, &blob))
     }
 
     /// Verify a remote is reachable and compare its blobs against the
     /// database, updating `blob_remotes` to match reality.
     pub fn check_remote(&mut self, remote: &Remote) -> Result<RemoteCheck, String> {
-        self.configure_rclone()?;
-        let found = rclone::list_blobs(&remote.target)?.into_iter().collect();
+        let found = self
+            .with_rclone(|| rclone::list_blobs(&remote.target))?
+            .into_iter()
+            .collect();
         self.apply_remote_listing(remote, found)
     }
 
@@ -505,6 +489,120 @@ pub fn download_blob(holders: &[Remote], hash: &str, blob: &Path) -> Result<Stri
     Err(format!("could not fetch blob: {last_err}"))
 }
 
+/// Local path of a blob under `root`: `.mbr/blobs/aa/bb/<hash>`.
+fn blob_path_in(root: &Path, hash: &str) -> PathBuf {
+    root.join(BLOBS_DIR)
+        .join(&hash[..2])
+        .join(&hash[2..4])
+        .join(hash)
+}
+
+/// The filesystem half of [`Repo::scan`]: move new regular files under
+/// `root` into the blob store (leaving symlinks behind) and list every
+/// tracked-looking path with its hash. Touches no database, so it is safe
+/// to run off the UI thread; feed the result to [`Repo::apply_scan`].
+pub fn ingest_tree(root: &Path) -> Result<Vec<ScannedEntry>, String> {
+    let mut entries = Vec::new();
+    collect_entries(root, root, &mut entries)?;
+    let mut scanned = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let (rel, hash) = match entry {
+            Entry::File(rel) => {
+                let hash = ingest_file(root, &rel)?;
+                (rel, hash)
+            }
+            Entry::BlobLink(rel, hash) => (rel, hash),
+        };
+        let size = std::fs::metadata(blob_path_in(root, &hash))
+            .ok()
+            .map(|m| m.len());
+        scanned.push(ScannedEntry {
+            path: rel_str(&rel),
+            hash,
+            size,
+        });
+    }
+    Ok(scanned)
+}
+
+/// Move a regular file into the blob store and symlink it back. Returns
+/// the content hash.
+///
+/// The symlink is staged under a hidden name first, so at every instant
+/// either the original file or a link to its blob exists (or, after a
+/// crash, a staged link that [`collect_entries`] recovers).
+fn ingest_file(root: &Path, rel: &Path) -> Result<String, String> {
+    let abs = root.join(rel);
+    let hash = util::sha256_file(&abs)?;
+    let blob = blob_path_in(root, &hash);
+
+    let depth = rel.components().count() - 1;
+    let target = PathBuf::from("../".repeat(depth)).join(
+        blob.strip_prefix(root)
+            .expect("blob path is under root"),
+    );
+    let staged = staged_link_path(&abs);
+    std::fs::remove_file(&staged).ok();
+    symlink(&target, &staged).map_err(|e| format!("cannot symlink {}: {e}", abs.display()))?;
+
+    let moved = !blob.is_file();
+    let stored = if moved {
+        std::fs::create_dir_all(blob.parent().unwrap())
+            .and_then(|()| std::fs::rename(&abs, &blob))
+            .map_err(|e| format!("cannot move {} into blob store: {e}", abs.display()))
+    } else {
+        // Content already stored; this file is a duplicate.
+        std::fs::remove_file(&abs)
+            .map_err(|e| format!("cannot remove duplicate {}: {e}", abs.display()))
+    };
+    if let Err(e) = stored {
+        std::fs::remove_file(&staged).ok();
+        return Err(e);
+    }
+
+    if let Err(e) = std::fs::rename(&staged, &abs) {
+        // Put the content back where the user left it.
+        if moved {
+            std::fs::rename(&blob, &abs).ok();
+        } else {
+            std::fs::copy(&blob, &abs).ok();
+        }
+        std::fs::remove_file(&staged).ok();
+        return Err(format!("cannot symlink {}: {e}", abs.display()));
+    }
+    Ok(hash)
+}
+
+/// `dir/.name.mbr-ingest` for `dir/name`.
+fn staged_link_path(abs: &Path) -> PathBuf {
+    let mut name = OsString::from(".");
+    name.push(abs.file_name().expect("ingested path has a file name"));
+    name.push(STAGED_SUFFIX);
+    abs.with_file_name(name)
+}
+
+/// For a leftover staged link (see [`STAGED_SUFFIX`]), the path it was
+/// meant to replace.
+fn staged_link_destination(staged: &Path) -> Option<PathBuf> {
+    let name = staged.file_name()?.to_str()?;
+    let original = name.strip_prefix('.')?.strip_suffix(STAGED_SUFFIX)?;
+    (!original.is_empty()).then(|| staged.with_file_name(original))
+}
+
+/// Finish or discard an interrupted ingest. Returns the restored path if
+/// the staged link was moved into place.
+fn recover_staged_link(staged: &Path) -> Option<PathBuf> {
+    let dest = staged_link_destination(staged)?;
+    let dest_free = std::fs::symlink_metadata(&dest).is_err();
+    // `exists` follows the link: the blob made it into the store.
+    if dest_free && staged.exists() && std::fs::rename(staged, &dest).is_ok() {
+        return Some(dest);
+    }
+    // The original is still there (crash before the move): drop the link.
+    std::fs::remove_file(staged).ok();
+    None
+}
+
 fn rel_str(rel: &Path) -> String {
     rel.components()
         .map(|c| c.as_os_str().to_string_lossy())
@@ -521,10 +619,17 @@ fn collect_entries(root: &Path, dir: &Path, out: &mut Vec<Entry>) -> Result<(), 
     for entry in entries {
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name();
+        let mut abs = entry.path();
         if name.to_string_lossy().starts_with('.') {
-            continue;
+            let is_link = entry.file_type().is_ok_and(|t| t.is_symlink());
+            if !(is_link && name.to_string_lossy().ends_with(STAGED_SUFFIX)) {
+                continue;
+            }
+            match recover_staged_link(&abs) {
+                Some(restored) => abs = restored,
+                None => continue,
+            }
         }
-        let abs = entry.path();
         let meta = std::fs::symlink_metadata(&abs)
             .map_err(|e| format!("cannot stat {}: {e}", abs.display()))?;
         let rel = abs.strip_prefix(root).unwrap().to_path_buf();

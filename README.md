@@ -94,8 +94,9 @@ Check / Push all / per-file Push and Fetch buttons, plus Add Existing
 Remote and a guided remote setup: pick a backend from the picker and fill
 in the generated form (secrets masked, choices as dropdowns, required
 fields marked). If rclone still needs an answer after the form — usually
-OAuth — the question is shown inline. rclone operations run in the
-background, backed by the repository-local `.mbr/rclone.conf`. The last
+OAuth — the question is shown inline. Scans and rclone operations run in
+the background, the latter backed by the repository-local
+`.mbr/rclone.conf`. The last
 opened folder is reopened on start.
 
 ## Building

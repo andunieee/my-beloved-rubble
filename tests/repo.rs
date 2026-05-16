@@ -1,6 +1,8 @@
 //! Scanning and spec resolution against real temporary folders. No rclone
 //! calls are made, so these run without network or remote configuration.
 
+#![cfg(unix)]
+
 use mbr::Repo;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -104,4 +106,42 @@ fn discover_walks_up_from_subdirectories() {
     Repo::init(&tmp.0).unwrap();
     let repo = Repo::discover(&tmp.0.join("deep/er")).unwrap();
     assert_eq!(repo.root, tmp.0.canonicalize().unwrap());
+}
+
+#[test]
+fn scan_recovers_interrupted_ingest() {
+    let tmp = TempDir::new("recover");
+    let root = &tmp.0;
+    fs::write(root.join("moved"), "moved").unwrap();
+    let mut repo = Repo::init(root).unwrap();
+    repo.scan().unwrap();
+
+    // Crash after the move into the store, before the staged link was
+    // renamed into place: only the hidden link remains.
+    fs::rename(root.join("moved"), root.join(".moved.mbr-ingest")).unwrap();
+    // Crash before the move: the original file and a stale staged link.
+    fs::write(root.join("kept"), "kept").unwrap();
+    std::os::unix::fs::symlink(".mbr/blobs/00/00/nothing", root.join(".kept.mbr-ingest")).unwrap();
+
+    let report = repo.scan().unwrap();
+    assert_eq!(report.added, ["kept"]);
+    assert!(report.removed.is_empty());
+    assert_eq!(fs::read_to_string(root.join("moved")).unwrap(), "moved");
+    assert_eq!(fs::read_to_string(root.join("kept")).unwrap(), "kept");
+    assert!(is_symlink(&root.join("kept")));
+    assert!(fs::symlink_metadata(root.join(".moved.mbr-ingest")).is_err());
+    assert!(fs::symlink_metadata(root.join(".kept.mbr-ingest")).is_err());
+}
+
+#[test]
+fn ingest_tree_then_apply_scan_matches_scan() {
+    let tmp = TempDir::new("split");
+    fs::write(tmp.0.join("f"), "f").unwrap();
+    let mut repo = Repo::init(&tmp.0).unwrap();
+    let entries = mbr::repo::ingest_tree(&repo.root).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].size, Some(1));
+    let report = repo.apply_scan(entries).unwrap();
+    assert_eq!(report.added, ["f"]);
+    assert!(repo.scan().unwrap().is_empty());
 }
