@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 pub const BLOBS_DIR: &str = ".mbr/blobs";
 pub const DB_FILE: &str = ".mbr/mbr.db";
 pub const RCLONE_CONFIG_FILE: &str = ".mbr/rclone.conf";
+/// Folder (relative to the root) where blobs found on a remote, but never
+/// seen before, get a name: `unnamed/<hash>`.
+pub const UNNAMED_DIR: &str = "unnamed";
 
 pub struct Repo {
     pub root: PathBuf,
@@ -77,15 +80,19 @@ impl PreviousVersion {
     }
 }
 
-/// Result of checking a remote against what the database expects.
+/// Result of scanning a remote and reconciling the database with it.
 #[derive(Debug, Default)]
 pub struct RemoteCheck {
     /// Blobs we expected on the remote and found.
     pub present: Vec<String>,
     /// Blobs we expected on the remote but did not find (unrecorded in db).
     pub missing: Vec<String>,
-    /// Blobs found on the remote that we did not expect (recorded in db).
+    /// Known blobs found on the remote that we did not expect there
+    /// (recorded in db).
     pub discovered: Vec<String>,
+    /// Blobs found on the remote that the database had never heard of:
+    /// recorded, and given the name `unnamed/<hash>`.
+    pub adopted: Vec<String>,
 }
 
 /// One active path found on disk by [`ingest_tree`].
@@ -409,48 +416,160 @@ impl Repo {
         self.with_rclone(|| download_blob(&remotes, hash, &blob))
     }
 
-    /// Verify a remote is reachable and compare its blobs against the
-    /// database, updating `blob_remotes` to match reality.
-    pub fn check_remote(&mut self, remote: &Remote) -> Result<RemoteCheck, String> {
-        let found = self
-            .with_rclone(|| rclone::list_blobs(&remote.target))?
+    /// Download a blob from one specific remote, verifying its hash.
+    pub fn fetch_blob_from(&mut self, remote: &Remote, hash: &str) -> Result<(), String> {
+        if self.blob_present(hash) {
+            return Err(format!(
+                "blob {} is already present",
+                util::short_hash(hash)
+            ));
+        }
+        let blob = self.blob_path(hash);
+        let holders = [remote.clone()];
+        self.with_rclone(|| download_blob(&holders, hash, &blob))?;
+        Ok(())
+    }
+
+    /// Blobs recorded on `remote` but missing locally (candidates for
+    /// "download everything from this remote").
+    pub fn blobs_missing_locally(&mut self, remote: &str) -> Result<Vec<String>, String> {
+        Ok(self
+            .db
+            .blobs_on_remote(remote)?
             .into_iter()
-            .collect();
+            .filter(|h| !self.blob_present(h))
+            .collect())
+    }
+
+    /// List everything on a remote (verifying it is reachable) and
+    /// reconcile the database with it; see [`Repo::apply_remote_listing`].
+    pub fn scan_remote(&mut self, remote: &Remote) -> Result<RemoteCheck, String> {
+        let found = self.with_rclone(|| rclone::list_blobs(&remote.target))?;
         self.apply_remote_listing(remote, found)
     }
 
-    /// Reconcile the database with the set of blob hashes actually found on
-    /// a remote (the second half of [`Repo::check_remote`], split out so the
-    /// slow rclone listing can run on another thread).
+    /// Reconcile the database with the blobs actually found on a remote
+    /// (the second half of [`Repo::scan_remote`], split out so the slow
+    /// rclone listing can run on another thread):
+    ///
+    /// - recorded blobs that are gone lose their record;
+    /// - every blob found is recorded as stored there;
+    /// - blobs the database never heard of are added, and named
+    ///   `unnamed/<hash>` (a symlink into the blob store, like any other
+    ///   tracked file, dangling until the blob is fetched).
     pub fn apply_remote_listing(
         &mut self,
         remote: &Remote,
-        found: HashSet<String>,
+        found: Vec<rclone::RemoteBlob>,
     ) -> Result<RemoteCheck, String> {
-        let expected: HashSet<String> =
-            self.db.blobs_on_remote(&remote.name)?.into_iter().collect();
-        let known: HashSet<String> = self.db.list_blobs()?.into_iter().map(|b| b.hash).collect();
+        let root = self.root.clone();
+        let now = util::now();
+        self.db.transaction(|db| {
+            let found: HashMap<String, u64> =
+                found.into_iter().map(|b| (b.hash, b.size)).collect();
+            let expected: HashSet<String> = db.blobs_on_remote(&remote.name)?.into_iter().collect();
+            let sized: HashSet<String> = db.list_blobs()?.into_iter().map(|b| b.hash).collect();
+            let known: HashSet<String> = db.known_hashes()?.into_iter().collect();
 
-        let mut check = RemoteCheck::default();
-        for hash in &expected {
-            if found.contains(hash) {
-                check.present.push(hash.clone());
-            } else {
-                self.db.unset_blob_on_remote(hash, &remote.name)?;
-                check.missing.push(hash.clone());
+            let mut check = RemoteCheck::default();
+            for hash in &expected {
+                if found.contains_key(hash) {
+                    check.present.push(hash.clone());
+                } else {
+                    db.unset_blob_on_remote(hash, &remote.name)?;
+                    check.missing.push(hash.clone());
+                }
             }
-        }
-        for hash in &found {
-            if !expected.contains(hash) && known.contains(hash) {
-                self.db.set_blob_on_remote(hash, &remote.name)?;
-                check.discovered.push(hash.clone());
+            for (hash, &size) in &found {
+                if !sized.contains(hash) {
+                    db.upsert_blob(hash, size)?;
+                }
+                if !known.contains(hash) {
+                    let path = name_unnamed_blob(&root, hash)?;
+                    if db.active_path(&path)?.is_none() {
+                        db.insert_path(&path, hash, now)?;
+                    }
+                    check.adopted.push(hash.clone());
+                } else if !expected.contains(hash) {
+                    check.discovered.push(hash.clone());
+                }
+                if !expected.contains(hash) {
+                    db.set_blob_on_remote(hash, &remote.name)?;
+                }
             }
-        }
-        check.present.sort();
-        check.missing.sort();
-        check.discovered.sort();
-        Ok(check)
+            check.present.sort();
+            check.missing.sort();
+            check.discovered.sort();
+            check.adopted.sort();
+            Ok(check)
+        })
     }
+
+    /// Ask a remote whether it stores each of `hashes`, updating the
+    /// database to match. Returns `(hash, stored)` pairs.
+    pub fn check_blobs(
+        &mut self,
+        remote: &Remote,
+        hashes: &[String],
+    ) -> Result<Vec<(String, bool)>, String> {
+        let found = self.with_rclone(|| {
+            hashes
+                .iter()
+                .map(|h| Ok((h.clone(), rclone::stat_blob(&remote.target, h)?)))
+                .collect::<Result<Vec<_>, String>>()
+        })?;
+        found
+            .into_iter()
+            .map(|(hash, size)| {
+                self.record_blob_check(&remote.name, &hash, size)?;
+                Ok((hash, size.is_some()))
+            })
+            .collect()
+    }
+
+    /// Record the outcome of [`rclone::stat_blob`] for one blob: stored on
+    /// `remote` with `size`, or not stored there.
+    pub fn record_blob_check(
+        &mut self,
+        remote: &str,
+        hash: &str,
+        size: Option<u64>,
+    ) -> Result<(), String> {
+        match size {
+            Some(size) => {
+                if !self.db.has_blob(hash)? {
+                    self.db.upsert_blob(hash, size)?;
+                }
+                self.db.set_blob_on_remote(hash, remote)
+            }
+            None => self.db.unset_blob_on_remote(hash, remote),
+        }
+    }
+}
+
+/// Create the `unnamed/<hash>` symlink for a blob first seen on a remote,
+/// unless something already occupies that name. Returns the path.
+fn name_unnamed_blob(root: &Path, hash: &str) -> Result<String, String> {
+    let rel = Path::new(UNNAMED_DIR).join(hash);
+    let abs = root.join(&rel);
+    if std::fs::symlink_metadata(&abs).is_err() {
+        std::fs::create_dir_all(root.join(UNNAMED_DIR))
+            .map_err(|e| format!("cannot create {UNNAMED_DIR}/: {e}"))?;
+        symlink(&link_target(root, &rel, hash), &abs)
+            .map_err(|e| format!("cannot symlink {}: {e}", abs.display()))?;
+    }
+    Ok(rel_str(&rel))
+}
+
+/// The relative symlink target that makes `rel` (relative to `root`)
+/// point at the blob `hash`.
+fn link_target(root: &Path, rel: &Path, hash: &str) -> PathBuf {
+    let depth = rel.components().count() - 1;
+    PathBuf::from("../".repeat(depth)).join(
+        blob_path_in(root, hash)
+            .strip_prefix(root)
+            .expect("blob path is under root"),
+    )
 }
 
 /// Download `hash` from the first of `holders` that delivers intact data,
@@ -490,7 +609,7 @@ pub fn download_blob(holders: &[Remote], hash: &str, blob: &Path) -> Result<Stri
 }
 
 /// Local path of a blob under `root`: `.mbr/blobs/aa/bb/<hash>`.
-fn blob_path_in(root: &Path, hash: &str) -> PathBuf {
+pub fn blob_path_in(root: &Path, hash: &str) -> PathBuf {
     root.join(BLOBS_DIR)
         .join(&hash[..2])
         .join(&hash[2..4])
@@ -535,12 +654,7 @@ fn ingest_file(root: &Path, rel: &Path) -> Result<String, String> {
     let abs = root.join(rel);
     let hash = util::sha256_file(&abs)?;
     let blob = blob_path_in(root, &hash);
-
-    let depth = rel.components().count() - 1;
-    let target = PathBuf::from("../".repeat(depth)).join(
-        blob.strip_prefix(root)
-            .expect("blob path is under root"),
-    );
+    let target = link_target(root, rel, &hash);
     let staged = staged_link_path(&abs);
     std::fs::remove_file(&staged).ok();
     symlink(&target, &staged).map_err(|e| format!("cannot symlink {}: {e}", abs.display()))?;
