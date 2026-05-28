@@ -1,28 +1,16 @@
 +++
 title = "Metadata backup"
-weight = 4
+weight = 5
 [extra]
 nav = "metadata backup"
 +++
 
 Remotes store your files by their content only. The names, folders and history of your files live in the folder's
 database, `.mbr/mbr.db`. If the folder is lost along with the computer, its remotes would come back as a heap of
-nameless files. So the database is backed up separately, encrypted with a master password, to the remotes you choose
-in the **Metadata backup** tab.
+nameless files. So the database is backed up separately, encrypted with the [master password](../settings/), to the
+remotes you choose in the **Settings** tab.
 
 Each remote shows when it was last backed up, and whether that backup is out of date because files changed since.
-
-## The master password
-
-Before the first backup, choose a master password. The database is encrypted with it before it leaves the computer,
-so whoever runs a remote can't read the names of your files.
-
-**Write it down somewhere safe.** Nobody can recover it: without it, the backups can't be read.
-
-## Unlocking
-
-To back up, enter the master password once. The app keeps it in memory until you click **Lock**, open another folder
-or quit, and never writes it to disk; it only stores a check to catch typos.
 
 ## Backing up
 
@@ -38,9 +26,13 @@ opened without the app: `age -d mbr.db.age > mbr.db`.
 ## Restoring a lost folder
 
 1. Open a new, empty folder in the app.
-2. In the **Remotes** tab, set up one of the remotes the old folder backed up to.
-3. In the **Metadata backup** tab, pick that remote under **Restore from a backup**, enter the master password and
-   click **Restore**.
+2. In the **Settings** tab, set the same master password as the old folder.
+3. In the **Remotes** tab, set up one of the remotes the old folder backed up to, with the same kind of storage and
+   the same bucket or folder.
+4. In the **Settings** tab, pick that remote under **Restore from a backup** and click **Restore**.
+
+The new folder finds the old one's directory on the remote and takes it over, so the remotes set up here reach what
+the old folder stored.
 
 Every file reappears with its name, history and records of where it is stored; the other remotes come back too, with
 their settings. The files' content is still on the remotes: download it from the **Remotes** tab with **Download
@@ -50,7 +42,7 @@ all**, or only the files you need.
 
 A folder already in use can take in a backup too, for instance after its database was damaged and rebuilt by a scan,
 or to bring back the history of its files. Under **Merge in a backup**, pick the remote and click **Restore**; once
-unlocked, the password field can stay empty if the backup uses the current password.
+password field can stay empty if the backup uses the folder's master password.
 
 Merging only ever adds what the backup knows and the folder doesn't:
 

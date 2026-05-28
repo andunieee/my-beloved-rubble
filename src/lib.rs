@@ -16,7 +16,8 @@
 //! ```
 //!
 //! Blobs can be pushed to / fetched from rclone remotes, named on the
-//! remote purely by hash (sharded `fa/2e/fa2e38…`, no metadata). The
+//! remote purely by hash (sharded `fa/2e/fa2e38…`, no metadata) and
+//! encrypted with the master password ([`remotes`]). The
 //! database itself is backed up separately, encrypted with a master
 //! password ([`metadata`]); local per-machine state lives in [`state`].
 
@@ -24,6 +25,7 @@ pub mod backends;
 pub mod db;
 pub mod metadata;
 pub mod rclone;
+pub mod remotes;
 pub mod repo;
 pub mod state;
 pub mod util;

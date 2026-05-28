@@ -19,5 +19,6 @@ The folder stays a normal folder: files open like before, from any program.
 - [Getting started](getting-started/): attaching a folder and adding files to it.
 - [Files](files/): selecting files, uploading and downloading them, freeing up space and checking for damage.
 - [Remotes](remotes/): the places your files are copied to, and how many copies to keep.
+- [Settings](settings/): the master password your remotes are encrypted with.
 - [Metadata backup](metadata/): backing up the names and history of your files, and restoring a lost folder.
 - [Command line](cli/): doing all of the above from a terminal.

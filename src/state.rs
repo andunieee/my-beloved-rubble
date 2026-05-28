@@ -1,8 +1,8 @@
 //! Local, per-machine app state, kept in `<config dir>/mbr/state.json` and
 //! loaded on every start. Unlike `.mbr/mbr.db`, it is never pushed or
 //! backed up anywhere: it records facts about *this* machine — the last
-//! folder opened, and for each folder the master-password check and when
-//! its metadata was last backed up to which remote.
+//! folder opened, and for each folder its master password and when its
+//! metadata was last backed up to which remote.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -24,6 +24,10 @@ pub struct RepoState {
     /// password is caught before anything is encrypted with it.
     #[serde(default)]
     pub password_check: Option<String>,
+    /// The master password itself, so it is asked for only once per
+    /// machine: remotes are encrypted with it and need it at every setup.
+    #[serde(default)]
+    pub password: Option<String>,
     /// The last successful metadata backup, per remote name.
     #[serde(default)]
     pub metadata_backups: BTreeMap<String, BackupRecord>,
@@ -35,6 +39,15 @@ pub struct BackupRecord {
     pub at: i64,
     /// SHA-256 of `mbr.db` as backed up, to tell whether it changed since.
     pub db_hash: String,
+}
+
+impl RepoState {
+    /// Make `password` the folder's master password, saved on this machine.
+    pub fn set_password(&mut self, password: &str) -> Result<(), String> {
+        self.password_check = Some(crate::metadata::password_check(password)?);
+        self.password = Some(password.to_owned());
+        Ok(())
+    }
 }
 
 impl AppState {
@@ -78,7 +91,7 @@ impl AppState {
     }
 
     /// Write atomically to `path`, readable only by the owner (it holds the
-    /// password check).
+    /// master password).
     pub fn save_to(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
