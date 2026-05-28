@@ -40,7 +40,7 @@ mbr metadata status               where metadata is backed up, and when
 mbr metadata add|rm <remote>...   choose the remotes for metadata backups
 mbr metadata password             set or change the master password
 mbr metadata backup               encrypt and upload the metadata
-mbr metadata restore <remote>     restore metadata into an empty folder
+mbr metadata restore <remote>     merge the backup on a remote into this folder
 ```
 
 `mbr gc --purge` deletes old versions and deleted files everywhere, remotes included, after asking you to confirm.

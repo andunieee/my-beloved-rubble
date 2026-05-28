@@ -120,7 +120,7 @@ enum MetadataCommand {
     Password,
     /// encrypt the metadata and upload it to every chosen remote
     Backup,
-    /// restore metadata from a remote into this (empty) folder
+    /// merge the metadata backup on a remote into this folder
     Restore { remote: String },
 }
 
@@ -1067,9 +1067,6 @@ fn metadata_backup(repo: &mut Repo) -> Result<(), String> {
 
 fn metadata_restore(repo: &mut Repo, remote_name: &str) -> Result<(), String> {
     let remote = lookup_remote(repo, remote_name)?;
-    if !repo.is_empty_folder()? {
-        return Err("metadata can only be restored into a folder that tracks no files yet".into());
-    }
     let scratch = repo.scratch_dir();
     let sealed = repo.with_rclone(|| metadata::download(&remote.target, &scratch))?;
     let password = rpassword::prompt_password("master password: ").map_err(|e| e.to_string())?;
@@ -1077,17 +1074,31 @@ fn metadata_restore(repo: &mut Repo, remote_name: &str) -> Result<(), String> {
     let (db, conf) = metadata::unseal(&sealed, &password)?;
     let report = repo.restore_metadata(&db, &conf)?;
 
+    // A folder without a password adopts the backup's; one with its own
+    // keeps it (the backup may predate a password change).
     let mut state = AppState::load();
-    state.repo_mut(&repo.root).password_check = Some(metadata::password_check(&password)?);
-    state.save()?;
+    let repo_state = state.repo_mut(&repo.root);
+    if repo_state.password_check.is_none() {
+        repo_state.password_check = Some(metadata::password_check(&password)?);
+        state.save()?;
+    }
 
     println!(
-        "restored {} file name(s) and {} remote(s)",
-        report.files, report.remotes
+        "restored {} file name(s) and {} remote(s); {} older version(s) added to the history",
+        report.files, report.remotes, report.history
     );
+    for name in &report.conflicts {
+        println!("  kept this folder's target for remote '{name}' (the backup's differs)");
+    }
     for (path, why) in &report.skipped {
         println!("  skipped {path}: {why}");
     }
-    println!("the files' content is still on the remotes: `mbr pull <remote>` downloads it");
+    println!(
+        "the previous database is in {}",
+        metadata::BEFORE_RESTORE_FILE
+    );
+    if report.files > 0 {
+        println!("the files' content is still on the remotes: `mbr pull <remote>` downloads it");
+    }
     Ok(())
 }

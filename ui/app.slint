@@ -276,6 +276,50 @@ component BackendForm inherits VerticalLayout {
     }
 }
 
+// Pick a remote and merge the metadata backup it holds into the folder.
+component RestoreForm inherits VerticalLayout {
+    in property <[string]> remote-names;
+    in property <bool> busy;
+    // The folder is unlocked: an empty password means that one.
+    in property <bool> unlocked;
+    in-out property <int> remote-index;
+    in-out property <string> password;
+    callback restore(remote: string, password: string);
+
+    spacing: 6px;
+    if root.remote-names.length == 0: Hint {
+        text: "No remotes configured yet.";
+    }
+    if root.remote-names.length > 0: VerticalLayout {
+        spacing: 6px;
+        ComboBox {
+            // Reports a far too tall preferred height in sidebar layouts.
+            max-height: self.min-height;
+            model: root.remote-names;
+            current-index <=> root.remote-index;
+        }
+        LineEdit {
+            input-type: InputType.password;
+            placeholder-text: root.unlocked
+                ? "the backup's master password, if different"
+                : "the backup's master password";
+            text <=> root.password;
+        }
+        HorizontalLayout {
+            alignment: start;
+            Button {
+                text: "Restore";
+                enabled: !root.busy && (root.password != "" || root.unlocked);
+                clicked => {
+                    root.restore(
+                        root.remote-names[clamp(root.remote-index, 0, root.remote-names.length - 1)],
+                        root.password);
+                }
+            }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: "My Beloved Rubble";
     preferred-width: 1100px;
@@ -306,7 +350,7 @@ export component AppWindow inherits Window {
     in-out property <string> metadata-summary: "";
     in-out property <bool> password-set: false;
     in-out property <bool> unlocked: false;
-    // The folder tracks nothing yet, so a backup can be restored into it.
+    // The folder tracks nothing yet: restoring a backup comes first.
     in-out property <bool> folder-empty: false;
     in-out property <string> pw-new: "";
     in-out property <string> pw-repeat: "";
@@ -1027,34 +1071,13 @@ width: Side.text-width;
                         if root.active-tab == 2 && root.folder != "" && root.folder-empty: VerticalLayout {
                             spacing: 6px;
                             SectionTitle { text: "RESTORE FROM A BACKUP"; help: "metadata/#restoring-a-lost-folder"; }
-                            if root.remote-names.length == 0: Hint {
-                                text: "No remotes configured yet.";
-                            }
-                            if root.remote-names.length > 0: VerticalLayout {
-                                spacing: 6px;
-                                ComboBox {
-                                    // Reports a far too tall preferred height in sidebar layouts.
-                                    max-height: self.min-height;
-                                    model: root.remote-names;
-                                    current-index <=> root.restore-remote-index;
-                                }
-                                LineEdit {
-                                    input-type: InputType.password;
-                                    placeholder-text: "the backup's master password";
-                                    text <=> root.pw-restore;
-                                }
-                                HorizontalLayout {
-                                    alignment: start;
-                                    Button {
-                                        text: "Restore";
-                                        enabled: !root.busy && root.pw-restore != "";
-                                        clicked => {
-                                            root.restore-metadata(
-                                                root.remote-names[clamp(root.restore-remote-index, 0, root.remote-names.length - 1)],
-                                                root.pw-restore);
-                                        }
-                                    }
-                                }
+                            RestoreForm {
+                                remote-names: root.remote-names;
+                                busy: root.busy;
+                                unlocked: root.unlocked;
+                                remote-index <=> root.restore-remote-index;
+                                password <=> root.pw-restore;
+                                restore(remote, password) => { root.restore-metadata(remote, password); }
                             }
                             Rectangle { height: 1px; background: Palette.border; }
                         }
@@ -1144,6 +1167,20 @@ width: Side.text-width;
                                     enabled: !root.busy && root.pw-new != "" && root.pw-repeat != "";
                                     clicked => { root.set-password(root.pw-new, root.pw-repeat); }
                                 }
+                            }
+                        }
+
+                        if root.active-tab == 2 && root.folder != "" && !root.folder-empty: VerticalLayout {
+                            spacing: 6px;
+                            Rectangle { height: 1px; background: Palette.border; }
+                            SectionTitle { text: "MERGE IN A BACKUP"; help: "metadata/#merging-in-a-backup"; }
+                            RestoreForm {
+                                remote-names: root.remote-names;
+                                busy: root.busy;
+                                unlocked: root.unlocked;
+                                remote-index <=> root.restore-remote-index;
+                                password <=> root.pw-restore;
+                                restore(remote, password) => { root.restore-metadata(remote, password); }
                             }
                         }
 
