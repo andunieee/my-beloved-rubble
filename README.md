@@ -4,6 +4,11 @@ Content-addressed folders in the spirit of git-annex, with rclone remotes.
 One core library, two frontends: the `mbr` CLI and the `my-beloved-rubble`
 Slint GUI.
 
+The user guide lives in `docs/` (a [zola](https://www.getzola.org) site,
+`zola --root docs serve` to preview) and is published to
+<https://andunieee.github.io/my-beloved-rubble/> on every push to master.
+The GUI's "?" buttons link into it.
+
 ## The model
 
 Attach mbr to any folder (`mbr init`, or "Open Folder" in the GUI). From
@@ -198,8 +203,9 @@ copy and clean up old versions.
 Scan (and Scan all), Download all
 (everything recorded there that is missing here), Upload all, Edit and
 Remove. The sidebar adds remotes — an existing rclone target, or a
-guided setup: pick a backend and fill in the generated form (secrets
-masked, choices as dropdowns, required fields marked); if rclone still
+guided setup: pick a backend and fill in the generated form (choices as
+dropdowns, required fields marked, each field's "?" opening its rclone
+documentation); if rclone still
 needs an answer — usually OAuth — the question is shown inline. Edit
 renames or retargets a remote and, for backends mbr has a form for,
 changes its rclone settings (secrets stay hidden; blank keeps them).

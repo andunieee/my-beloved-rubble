@@ -1,0 +1,11 @@
+base_url = "https://andunieee.github.io/my-beloved-rubble"
+title = "my beloved rubble"
+description = "keep your old documents, pictures and videos safe, in several places at once"
+compile_sass = false
+build_search_index = false
+
+[markdown]
+smart_punctuation = true
+
+[extra]
+repo = "https://github.com/andunieee/my-beloved-rubble"

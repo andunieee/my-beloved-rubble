@@ -239,10 +239,28 @@ struct App {
     password: RefCell<Option<SecretString>>,
 }
 
+/// The user guide, built from `docs/` and published to GitHub Pages.
+const DOCS_URL: &str = "https://andunieee.github.io/my-beloved-rubble/";
+
+/// `page` as a URL: itself if it already is one, else a page of the docs.
+fn docs_url(page: &str) -> String {
+    if page.starts_with("https://") {
+        page.to_owned()
+    } else {
+        format!("{DOCS_URL}{page}")
+    }
+}
+
 fn main() -> Result<(), slint::PlatformError> {
     env_logger::init();
 
     let window = AppWindow::new()?;
+    window.global::<Docs>().on_open(|page| {
+        let url = docs_url(&page);
+        if let Err(e) = open::that_detached(&url) {
+            log::warn!("cannot open {url}: {e}");
+        }
+    });
     let (tx, rx) = mpsc::channel::<Msg>();
     let files = Rc::new(VecModel::default());
     window.set_files(ModelRc::from(files.clone()));
@@ -1399,7 +1417,7 @@ impl App {
                     (Kind::Secret, None) => "(not set)",
                     _ => f.default,
                 };
-                form_field(f, value, placeholder)
+                form_field(backend, f, value, placeholder)
             })
             .collect();
         w.set_edit_note(
@@ -1505,11 +1523,13 @@ impl App {
     /// Populate the UI with the hardcoded form fields of `backend_name`.
     fn show_form(&self, backend_name: &str) {
         let fields: Vec<FormField> = backends::backend(backend_name)
-            .map(|b| b.fields.to_vec())
-            .unwrap_or_default()
-            .iter()
-            .map(|field| form_field(field, field.default, field.default))
-            .collect();
+            .map(|b| {
+                b.fields
+                    .iter()
+                    .map(|field| form_field(b, field, field.default, field.default))
+                    .collect()
+            })
+            .unwrap_or_default();
         let values: Vec<SharedString> = backends::backend(backend_name)
             .map(|b| {
                 b.fields
@@ -1660,7 +1680,6 @@ impl App {
         self.window.set_setup_answer(SharedString::default());
         self.window.set_setup_default(SharedString::default());
         self.window.set_setup_url(SharedString::default());
-        self.window.set_setup_password(false);
         self.window.set_form_fields(ModelRc::default());
         self.window.set_form_values(ModelRc::default());
         self.window.set_new_remote_name(SharedString::default());
@@ -1777,7 +1796,6 @@ impl App {
                 }
                 Ok(mbr::rclone::SetupOutcome::Question(q)) => {
                     self.window.set_setup_state(SharedString::from(q.state));
-                    self.window.set_setup_password(q.password);
                     self.window.set_setup_question(SharedString::from(q.name));
                     self.window.set_setup_help(SharedString::from(q.help));
                     self.window.set_setup_default(SharedString::from(q.default));
@@ -2082,7 +2100,7 @@ impl App {
 
 /// One form row for `field`, prefilled with `value` (for choices: the
 /// option preselected), showing `placeholder` while empty.
-fn form_field(field: &Field, value: &str, placeholder: &str) -> FormField {
+fn form_field(backend: &Backend, field: &Field, value: &str, placeholder: &str) -> FormField {
     let mut values = match field.kind {
         Kind::Choice => backends::choice_values(field),
         _ => field.examples.to_vec(),
@@ -2105,7 +2123,9 @@ fn form_field(field: &Field, value: &str, placeholder: &str) -> FormField {
     FormField {
         key: field.name.into(),
         label: field.label.into(),
-        help: field.help.into(),
+        docs: backends::rclone_docs_url(backend, field)
+            .unwrap_or_else(|| "remotes/#setting-up-a-new-remote".into())
+            .into(),
         kind: match field.kind {
             Kind::Text => 0,
             Kind::Secret => 1,

@@ -494,6 +494,30 @@ pub fn backend_names() -> Vec<&'static str> {
     BACKENDS.iter().map(|b| b.name).collect()
 }
 
+/// Where rclone documents `field` of `backend`: the option's entry on the
+/// backend's page at rclone.org. `None` for [`Field::to_target`] fields,
+/// which are mbr's own.
+pub fn rclone_docs_url(backend: &Backend, field: &Field) -> Option<String> {
+    if field.to_target {
+        return None;
+    }
+    // Pages are named after the backend, except where its option prefix
+    // is an abbreviation.
+    let page = match backend.name {
+        "gcs" => "googlecloudstorage",
+        "gphotos" => "googlephotos",
+        "oos" => "oracleobjectstorage",
+        // The service shut down and rclone.org dropped its page.
+        "uptobox" => return None,
+        name => name,
+    };
+    Some(format!(
+        "https://rclone.org/{page}/#{}-{}",
+        backend.name,
+        field.name.replace('_', "-")
+    ))
+}
+
 /// Default path prefix mbr uses when no user path is supplied.
 pub const DEFAULT_PATH: &str = "mbr";
 
@@ -562,6 +586,21 @@ mod tests {
         names.sort();
         names.dedup();
         assert_eq!(names.len(), BACKENDS.len());
+    }
+
+    #[test]
+    fn rclone_docs_urls_point_at_the_option() {
+        let s3 = backend("s3").unwrap();
+        let secret = s3.fields.iter().find(|f| f.name == "secret_access_key").unwrap();
+        assert_eq!(
+            rclone_docs_url(s3, secret).unwrap(),
+            "https://rclone.org/s3/#s3-secret-access-key"
+        );
+        let gcs = backend("gcs").unwrap();
+        let url = rclone_docs_url(gcs, &gcs.fields[0]).unwrap();
+        assert!(url.starts_with("https://rclone.org/googlecloudstorage/#gcs-"), "{url}");
+        let target = s3.fields.iter().find(|f| f.to_target).unwrap();
+        assert!(rclone_docs_url(s3, target).is_none());
     }
 
     #[test]

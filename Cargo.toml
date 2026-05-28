@@ -23,6 +23,7 @@ slint = "1.17"
 minisqlite = { git = "https://github.com/cursor/minisqlite" }
 sha2 = "0.10"
 rfd = "0.15"
+open = "5"
 dirs = "6"
 log = "0.4"
 env_logger = "0.11"
