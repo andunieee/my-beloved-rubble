@@ -10,6 +10,14 @@ use std::path::{Path, PathBuf};
 pub const BLOBS_DIR: &str = ".mbr/blobs";
 pub const DB_FILE: &str = ".mbr/mbr.db";
 pub const RCLONE_CONFIG_FILE: &str = ".mbr/rclone.conf";
+/// Scratch space for downloads being verified and backups being sealed.
+pub const TMP_DIR: &str = ".mbr/tmp";
+/// Where local blobs that fail verification are moved, so the bytes are
+/// kept but no longer count as a good copy.
+pub const CORRUPT_DIR: &str = ".mbr/corrupt";
+/// Copies of a blob (local + remotes) to keep, unless the folder says
+/// otherwise: dropping a local copy needs this many verified remote ones.
+pub const DEFAULT_MIN_COPIES: u32 = 2;
 /// Folder (relative to the root) where blobs found on a remote, but never
 /// seen before, get a name: `unnamed/<hash>`.
 pub const UNNAMED_DIR: &str = "unnamed";
@@ -68,6 +76,13 @@ pub struct PreviousVersion {
     pub remotes: Vec<String>,
 }
 
+impl FileStatus {
+    /// Copies known to exist: the local one, if present, plus remotes.
+    pub fn copies(&self) -> usize {
+        usize::from(self.present_locally) + self.remotes.len()
+    }
+}
+
 impl PreviousVersion {
     /// Where this old blob is still stored, for display.
     pub fn stored_summary(&self) -> String {
@@ -93,6 +108,70 @@ pub struct RemoteCheck {
     /// Blobs found on the remote that the database had never heard of:
     /// recorded, and given the name `unnamed/<hash>`.
     pub adopted: Vec<String>,
+}
+
+/// A blob no active path points at: an old version or a deleted file.
+#[derive(Debug, Clone)]
+pub struct Unreferenced {
+    pub hash: String,
+    pub size: u64,
+    /// When the last path pointing at it went away (0 if none ever did).
+    pub removed_at: i64,
+    pub present_locally: bool,
+    pub remotes: Vec<String>,
+}
+
+/// Outcome of verifying the local copy of a blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalHealth {
+    Ok,
+    /// Not present locally; nothing to verify.
+    Missing,
+    /// Its content no longer matches its hash. It was moved to `moved_to`
+    /// (under [`CORRUPT_DIR`]), so it now counts as missing.
+    Corrupt { moved_to: PathBuf },
+}
+
+/// Outcome of verifying the copy of a blob stored on a remote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteHealth {
+    Ok,
+    /// The remote does not have it.
+    Missing,
+    /// The remote's copy did not match the hash and was deleted, so that
+    /// pushing again replaces it.
+    Corrupt,
+}
+
+/// Outcome of trying to drop a local copy (see [`drop_local_blob`]).
+#[derive(Debug, Clone, Default)]
+pub struct DropOutcome {
+    pub hash: String,
+    /// Remotes confirmed, just now, to hold a copy of the right size.
+    pub verified: Vec<String>,
+    /// Remotes recorded as holding it that turned out not to.
+    pub absent: Vec<String>,
+    /// Remotes holding something else under its name, or unreachable,
+    /// with the reason. Neither counts as a copy.
+    pub doubtful: Vec<(String, String)>,
+    /// The local copy was removed.
+    pub dropped: bool,
+}
+
+impl DropOutcome {
+    /// One-line explanation of why the local copy was kept.
+    pub fn kept_reason(&self, min_copies: u32) -> String {
+        let mut text = format!(
+            "kept {}: {} verified remote cop{} (need {min_copies})",
+            util::short_hash(&self.hash),
+            self.verified.len(),
+            if self.verified.len() == 1 { "y" } else { "ies" },
+        );
+        for (remote, why) in &self.doubtful {
+            text += &format!("; {remote}: {why}");
+        }
+        text
+    }
 }
 
 /// One active path found on disk by [`ingest_tree`].
@@ -363,6 +442,150 @@ impl Repo {
         Err(format!("'{spec}' matches no tracked file or blob"))
     }
 
+    // ── copies ──
+
+    /// How many copies of each blob to keep (see [`DEFAULT_MIN_COPIES`]).
+    pub fn min_copies(&mut self) -> Result<u32, String> {
+        Ok(self
+            .db
+            .setting("min_copies")?
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(DEFAULT_MIN_COPIES))
+    }
+
+    pub fn set_min_copies(&mut self, n: u32) -> Result<(), String> {
+        if n == 0 {
+            return Err("at least one copy must be kept".to_owned());
+        }
+        self.db.set_setting("min_copies", &n.to_string())
+    }
+
+    /// The remotes recorded as holding `hash`.
+    pub fn holders(&mut self, hash: &str) -> Result<Vec<Remote>, String> {
+        let mut remotes = Vec::new();
+        for name in self.db.remotes_for_blob(hash)? {
+            if let Some(remote) = self.db.remote(&name)? {
+                remotes.push(remote);
+            }
+        }
+        Ok(remotes)
+    }
+
+    /// Remove the local copy of `hash` if at least [`Repo::min_copies`]
+    /// remotes are confirmed, right now, to hold it; see
+    /// [`drop_local_blob`]. The records are updated with what was found.
+    pub fn drop_blob(&mut self, hash: &str) -> Result<DropOutcome, String> {
+        let holders = self.holders(hash)?;
+        let min_copies = self.min_copies()?;
+        let root = self.root.clone();
+        let outcome =
+            self.with_rclone(|| drop_local_blob(&root, hash, &holders, min_copies))?;
+        self.record_drop(&outcome)?;
+        Ok(outcome)
+    }
+
+    /// Record what [`drop_local_blob`] learned about the remotes.
+    pub fn record_drop(&mut self, outcome: &DropOutcome) -> Result<(), String> {
+        for remote in &outcome.absent {
+            self.db.unset_blob_on_remote(&outcome.hash, remote)?;
+        }
+        Ok(())
+    }
+
+    /// Blobs no active path points at, oldest removal first.
+    pub fn unreferenced_blobs(&mut self) -> Result<Vec<Unreferenced>, String> {
+        let paths = self.db.list_paths()?;
+        let active: HashSet<&str> = paths
+            .iter()
+            .filter(|p| p.is_active())
+            .map(|p| p.hash.as_str())
+            .collect();
+        let mut removed_at: HashMap<&str, i64> = HashMap::new();
+        for p in &paths {
+            let at = removed_at.entry(p.hash.as_str()).or_default();
+            *at = (*at).max(p.removed_at.unwrap_or(0));
+        }
+        let mut remotes_of: HashMap<String, Vec<String>> = HashMap::new();
+        for (hash, remote) in self.db.list_blob_remotes()? {
+            remotes_of.entry(hash).or_default().push(remote);
+        }
+        let mut found: Vec<Unreferenced> = self
+            .db
+            .list_blobs()?
+            .into_iter()
+            .filter(|b| !active.contains(b.hash.as_str()))
+            .map(|b| Unreferenced {
+                removed_at: removed_at.get(b.hash.as_str()).copied().unwrap_or(0),
+                present_locally: self.blob_present(&b.hash),
+                remotes: remotes_of.remove(&b.hash).unwrap_or_default(),
+                hash: b.hash,
+                size: b.size,
+            })
+            .collect();
+        found.sort_by_key(|u| u.removed_at);
+        Ok(found)
+    }
+
+    /// Delete a blob everywhere — every remote recorded as holding it, and
+    /// the local copy — and forget it. Path rows that pointed at it stay as
+    /// history. Refuses blobs an active path still points at.
+    pub fn purge_blob(&mut self, hash: &str) -> Result<(), String> {
+        let paths = self.db.list_paths()?;
+        if let Some(p) = paths.iter().find(|p| p.is_active() && p.hash == hash) {
+            return Err(format!(
+                "blob {} is still in use by {}",
+                util::short_hash(hash),
+                p.path
+            ));
+        }
+        let holders = self.holders(hash)?;
+        self.with_rclone(|| {
+            holders
+                .iter()
+                .try_for_each(|r| rclone::delete_blob(&r.target, hash))
+        })?;
+        let blob = self.blob_path(hash);
+        if blob.is_file() {
+            remove_blob_file(&blob)
+                .map_err(|e| format!("cannot remove {}: {e}", blob.display()))?;
+        }
+        self.db.forget_blob(hash)
+    }
+
+    /// Re-hash the local copy of `hash`; see [`verify_local_blob`].
+    pub fn verify_local(&self, hash: &str) -> Result<LocalHealth, String> {
+        verify_local_blob(&self.root, hash)
+    }
+
+    /// Download the copy of `hash` on `remote` and check it, recording the
+    /// outcome; see [`verify_remote_blob`].
+    pub fn verify_on_remote(
+        &mut self,
+        remote: &Remote,
+        hash: &str,
+    ) -> Result<RemoteHealth, String> {
+        let root = self.root.clone();
+        let health = self.with_rclone(|| verify_remote_blob(&root, &remote.target, hash))?;
+        self.record_remote_health(&remote.name, hash, &health)?;
+        Ok(health)
+    }
+
+    /// Record the outcome of [`verify_remote_blob`].
+    pub fn record_remote_health(
+        &mut self,
+        remote: &str,
+        hash: &str,
+        health: &RemoteHealth,
+    ) -> Result<(), String> {
+        match health {
+            RemoteHealth::Ok => self.db.set_blob_on_remote(hash, remote),
+            RemoteHealth::Missing | RemoteHealth::Corrupt => {
+                self.db.unset_blob_on_remote(hash, remote)
+            }
+        }
+    }
+
     // ── remote operations ──
 
     /// Push one blob to a remote and record it there.
@@ -399,19 +622,7 @@ impl Repo {
                 util::short_hash(hash)
             ));
         }
-        let holders = self.db.remotes_for_blob(hash)?;
-        if holders.is_empty() {
-            return Err(format!(
-                "blob {} is not recorded on any remote",
-                util::short_hash(hash)
-            ));
-        }
-        let mut remotes = Vec::new();
-        for name in holders {
-            if let Some(remote) = self.db.remote(&name)? {
-                remotes.push(remote);
-            }
-        }
+        let remotes = self.holders(hash)?;
         let blob = self.blob_path(hash);
         self.with_rclone(|| download_blob(&remotes, hash, &blob))
     }
@@ -555,10 +766,16 @@ fn name_unnamed_blob(root: &Path, hash: &str) -> Result<String, String> {
     if std::fs::symlink_metadata(&abs).is_err() {
         std::fs::create_dir_all(root.join(UNNAMED_DIR))
             .map_err(|e| format!("cannot create {UNNAMED_DIR}/: {e}"))?;
-        symlink(&link_target(root, &rel, hash), &abs)
-            .map_err(|e| format!("cannot symlink {}: {e}", abs.display()))?;
+        link_blob(root, &rel, hash)?;
     }
     Ok(rel_str(&rel))
+}
+
+/// Create the symlink `rel` (relative to `root`) pointing at blob `hash`.
+pub(crate) fn link_blob(root: &Path, rel: &Path, hash: &str) -> Result<(), String> {
+    let abs = root.join(rel);
+    symlink(&link_target(root, rel, hash), &abs)
+        .map_err(|e| format!("cannot symlink {}: {e}", abs.display()))
 }
 
 /// The relative symlink target that makes `rel` (relative to `root`)
@@ -591,7 +808,8 @@ pub fn download_blob(holders: &[Remote], hash: &str, blob: &Path) -> Result<Stri
         match rclone::fetch_blob(&remote.target, hash, &tmp) {
             Ok(()) => match util::sha256_file(&tmp) {
                 Ok(actual) if actual == hash => {
-                    return std::fs::rename(&tmp, blob)
+                    return make_readonly(&tmp)
+                        .and_then(|()| std::fs::rename(&tmp, blob))
                         .map(|()| remote.name.clone())
                         .map_err(|e| {
                             std::fs::remove_file(&tmp).ok();
@@ -606,6 +824,111 @@ pub fn download_blob(holders: &[Remote], hash: &str, blob: &Path) -> Result<Stri
         std::fs::remove_file(&tmp).ok();
     }
     Err(format!("could not fetch blob: {last_err}"))
+}
+
+/// Remove the local copy of `hash` under `root` if at least `min_copies`
+/// of `holders` are confirmed, right now, to hold a copy of the same size.
+/// Remotes are asked directly rather than trusting the records. Pure
+/// filesystem + rclone — safe off-thread; record the outcome with
+/// [`Repo::record_drop`].
+pub fn drop_local_blob(
+    root: &Path,
+    hash: &str,
+    holders: &[Remote],
+    min_copies: u32,
+) -> Result<DropOutcome, String> {
+    let blob = blob_path_in(root, hash);
+    let size = std::fs::metadata(&blob)
+        .map_err(|_| format!("blob {} is not present locally", util::short_hash(hash)))?
+        .len();
+    let mut outcome = DropOutcome {
+        hash: hash.to_owned(),
+        ..DropOutcome::default()
+    };
+    for remote in holders {
+        match rclone::stat_blob(&remote.target, hash) {
+            Ok(Some(found)) if found == size => outcome.verified.push(remote.name.clone()),
+            Ok(Some(found)) => outcome.doubtful.push((
+                remote.name.clone(),
+                format!("holds {found} bytes instead of {size}"),
+            )),
+            Ok(None) => outcome.absent.push(remote.name.clone()),
+            Err(e) => outcome.doubtful.push((remote.name.clone(), e)),
+        }
+    }
+    if outcome.verified.len() >= min_copies as usize {
+        remove_blob_file(&blob).map_err(|e| format!("cannot remove {}: {e}", blob.display()))?;
+        outcome.dropped = true;
+    }
+    Ok(outcome)
+}
+
+/// Re-hash the local copy of `hash` under `root`. A copy that no longer
+/// matches is moved into [`CORRUPT_DIR`] (kept, but no longer counted), so
+/// it can be downloaded again. Pure filesystem — safe off-thread.
+pub fn verify_local_blob(root: &Path, hash: &str) -> Result<LocalHealth, String> {
+    let blob = blob_path_in(root, hash);
+    if !blob.is_file() {
+        return Ok(LocalHealth::Missing);
+    }
+    if util::sha256_file(&blob)? == hash {
+        return Ok(LocalHealth::Ok);
+    }
+    let dir = root.join(CORRUPT_DIR);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {CORRUPT_DIR}: {e}"))?;
+    let moved_to = dir.join(format!("{hash}.{}", util::now()));
+    std::fs::rename(&blob, &moved_to)
+        .map_err(|e| format!("cannot move corrupt blob {}: {e}", blob.display()))?;
+    Ok(LocalHealth::Corrupt { moved_to })
+}
+
+/// Download the copy of `hash` stored under `target` and check its hash.
+/// A corrupt copy is deleted from the remote, so that pushing again
+/// replaces it (rclone could otherwise skip a same-sized file). Pure
+/// filesystem + rclone — safe off-thread; record the outcome with
+/// [`Repo::record_remote_health`].
+pub fn verify_remote_blob(root: &Path, target: &str, hash: &str) -> Result<RemoteHealth, String> {
+    let dir = root.join(TMP_DIR);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {TMP_DIR}: {e}"))?;
+    let tmp = dir.join(format!("{hash}.verify"));
+    let fetched = rclone::fetch_blob(target, hash, &tmp);
+    let actual = fetched.as_ref().ok().map(|()| util::sha256_file(&tmp));
+    std::fs::remove_file(&tmp).ok();
+    match (fetched, actual) {
+        (Err(e), _) if rclone::is_not_found(&e) => Ok(RemoteHealth::Missing),
+        (Err(e), _) => Err(e),
+        (Ok(()), Some(Ok(actual))) if actual == hash => Ok(RemoteHealth::Ok),
+        (Ok(()), Some(Ok(_))) => {
+            rclone::delete_blob(target, hash)?;
+            Ok(RemoteHealth::Corrupt)
+        }
+        (Ok(()), Some(Err(e))) => Err(e),
+        (Ok(()), None) => unreachable!("a successful fetch is always hashed"),
+    }
+}
+
+/// Make a blob file read-only, so programs that write into files in place
+/// fail instead of silently changing content stored under its old hash.
+fn make_readonly(path: &Path) -> std::io::Result<()> {
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    if !permissions.readonly() {
+        permissions.set_readonly(true);
+        std::fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+/// Delete a (read-only) blob file.
+fn remove_blob_file(path: &Path) -> std::io::Result<()> {
+    // Windows refuses to delete read-only files; Unix only cares about
+    // the directory.
+    #[cfg(windows)]
+    {
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(path, permissions)?;
+    }
+    std::fs::remove_file(path)
 }
 
 /// Local path of a blob under `root`: `.mbr/blobs/aa/bb/<hash>`.
@@ -632,9 +955,14 @@ pub fn ingest_tree(root: &Path) -> Result<Vec<ScannedEntry>, String> {
             }
             Entry::BlobLink(rel, hash) => (rel, hash),
         };
-        let size = std::fs::metadata(blob_path_in(root, &hash))
-            .ok()
-            .map(|m| m.len());
+        let blob = blob_path_in(root, &hash);
+        let size = std::fs::metadata(&blob).ok().map(|m| {
+            // Also protects blobs stored before mbr made them read-only.
+            if !m.permissions().readonly() {
+                make_readonly(&blob).ok();
+            }
+            m.len()
+        });
         scanned.push(ScannedEntry {
             path: rel_str(&rel),
             hash,
@@ -784,7 +1112,7 @@ fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
 
 /// Ensure the repository-local rclone config exists, with restrictive
 /// permissions since it holds OAuth tokens and other secrets.
-fn ensure_rclone_config(path: &Path) -> Result<(), String> {
+pub(crate) fn ensure_rclone_config(path: &Path) -> Result<(), String> {
     if path.is_file() {
         restrict_config_permissions(path)?;
         return Ok(());

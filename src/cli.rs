@@ -2,7 +2,9 @@
 
 use clap::{Parser, Subcommand};
 use mbr::db::Remote;
-use mbr::repo::Repo;
+use mbr::metadata;
+use mbr::repo::{LocalHealth, RemoteHealth, Repo};
+use mbr::state::{AppState, BackupRecord};
 use mbr::util;
 use std::path::{Path, PathBuf};
 
@@ -59,6 +61,73 @@ enum Command {
         /// optional paths or hashes to check; without them this is `remote scan`
         specs: Vec<String>,
     },
+    /// verify blobs against their hashes (default: every local blob)
+    Fsck {
+        /// verify the copies on this remote instead (downloads them)
+        #[arg(long)]
+        remote: Option<String>,
+        /// optional paths or hashes to verify
+        specs: Vec<String>,
+    },
+    /// free local space: remove local copies that enough remotes hold
+    Drop {
+        /// every local blob that is safely stored elsewhere
+        #[arg(long, conflicts_with = "specs")]
+        all: bool,
+        /// paths or hashes to drop
+        #[arg(required_unless_present = "all")]
+        specs: Vec<String>,
+    },
+    /// drop local copies of old versions and deleted files
+    Gc {
+        /// delete them everywhere instead, remotes included (irreversible)
+        #[arg(long)]
+        purge: bool,
+        /// only those whose last name went away at least DAYS ago
+        #[arg(long, value_name = "DAYS")]
+        older_than: Option<u32>,
+        /// don't ask before purging
+        #[arg(long, requires = "purge")]
+        yes: bool,
+    },
+    /// encrypted backups of this folder's metadata
+    Metadata {
+        #[command(subcommand)]
+        command: MetadataCommand,
+    },
+    /// folder settings
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum MetadataCommand {
+    /// show where metadata is backed up and when it last was
+    Status,
+    /// back up metadata to these remotes from now on
+    Add {
+        #[arg(required = true)]
+        remotes: Vec<String>,
+    },
+    /// stop backing up metadata to these remotes
+    Rm {
+        #[arg(required = true)]
+        remotes: Vec<String>,
+    },
+    /// set or change the master password
+    Password,
+    /// encrypt the metadata and upload it to every chosen remote
+    Backup,
+    /// restore metadata from a remote into this (empty) folder
+    Restore { remote: String },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// copies of each file to keep (local + remotes); shows it without N
+    MinCopies { n: Option<u32> },
 }
 
 #[derive(Subcommand)]
@@ -130,6 +199,24 @@ fn run(cli: Cli) -> Result<(), String> {
             remote_scan(&mut open()?, &[remote])
         }
         Command::Check { remote, specs } => check(&mut open()?, &remote, &specs),
+        Command::Fsck { remote, specs } => fsck(&mut open()?, remote.as_deref(), &specs),
+        Command::Drop { all, specs } => drop_blobs(&mut open()?, all, &specs),
+        Command::Gc {
+            purge,
+            older_than,
+            yes,
+        } => gc(&mut open()?, purge, older_than, yes),
+        Command::Metadata { command } => match command {
+            MetadataCommand::Status => metadata_status(&mut open()?),
+            MetadataCommand::Add { remotes } => metadata_use(&mut open()?, &remotes, true),
+            MetadataCommand::Rm { remotes } => metadata_use(&mut open()?, &remotes, false),
+            MetadataCommand::Password => metadata_password(&mut open()?),
+            MetadataCommand::Backup => metadata_backup(&mut open()?),
+            MetadataCommand::Restore { remote } => metadata_restore(&mut open()?, &remote),
+        },
+        Command::Config { command } => match command {
+            ConfigCommand::MinCopies { n } => config_min_copies(&mut open()?, n),
+        },
     }
 }
 
@@ -177,6 +264,7 @@ fn print_scan_report(report: &mbr::repo::ScanReport) {
 
 fn ls(repo: &mut Repo) -> Result<(), String> {
     let statuses = repo.status()?;
+    let min_copies = repo.min_copies()? as usize;
     if statuses.is_empty() {
         println!("no tracked files (drop files into the folder and run `mbr scan`)");
         return Ok(());
@@ -189,6 +277,9 @@ fn ls(repo: &mut Repo) -> Result<(), String> {
             s.remotes.join(",")
         };
         let mut notes = Vec::new();
+        if s.copies() < min_copies {
+            notes.push(format!("AT RISK: {} of {min_copies} copies", s.copies()));
+        }
         if !s.other_names.is_empty() {
             notes.push(format!("={}", s.other_names.join("=")));
         }
@@ -650,5 +741,353 @@ fn check(repo: &mut Repo, remote_name: &str, specs: &[String]) -> Result<(), Str
         let verdict = if stored { "stored" } else { "NOT STORED" };
         println!("{}  {verdict} on {remote_name}", util::short_hash(&hash));
     }
+    Ok(())
+}
+
+/// Distinct hashes for `specs`, in order.
+fn resolve_all(repo: &mut Repo, specs: &[String]) -> Result<Vec<String>, String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut hashes = Vec::new();
+    for spec in specs {
+        let hash = repo.resolve_spec(spec)?;
+        if seen.insert(hash.clone()) {
+            hashes.push(hash);
+        }
+    }
+    Ok(hashes)
+}
+
+fn fsck(repo: &mut Repo, remote: Option<&str>, specs: &[String]) -> Result<(), String> {
+    let hashes = if specs.is_empty() {
+        match remote {
+            Some(name) => repo.db.blobs_on_remote(name)?,
+            None => repo
+                .db
+                .list_blobs()?
+                .into_iter()
+                .map(|b| b.hash)
+                .filter(|h| repo.blob_present(h))
+                .collect(),
+        }
+    } else {
+        resolve_all(repo, specs)?
+    };
+    let remote = remote.map(|name| lookup_remote(repo, name)).transpose()?;
+    let mut bad = 0;
+    for hash in &hashes {
+        let short = util::short_hash(hash);
+        match &remote {
+            None => match repo.verify_local(hash)? {
+                LocalHealth::Ok => println!("{short}  ok"),
+                LocalHealth::Missing => println!("{short}  not present locally"),
+                LocalHealth::Corrupt { moved_to } => {
+                    bad += 1;
+                    println!(
+                        "{short}  CORRUPT: moved to {} (fetch it again from a remote)",
+                        moved_to.display()
+                    );
+                }
+            },
+            Some(remote) => match repo.verify_on_remote(remote, hash)? {
+                RemoteHealth::Ok => println!("{short}  ok on {}", remote.name),
+                RemoteHealth::Missing => {
+                    bad += 1;
+                    println!("{short}  MISSING on {} (record dropped)", remote.name);
+                }
+                RemoteHealth::Corrupt => {
+                    bad += 1;
+                    println!(
+                        "{short}  CORRUPT on {}: deleted there (push it again)",
+                        remote.name
+                    );
+                }
+            },
+        }
+    }
+    println!("verified {} blob(s), {bad} problem(s)", hashes.len());
+    if bad > 0 {
+        return Err(format!("{bad} blob(s) failed verification"));
+    }
+    Ok(())
+}
+
+fn drop_blobs(repo: &mut Repo, all: bool, specs: &[String]) -> Result<(), String> {
+    let hashes: Vec<String> = if all {
+        repo.db
+            .list_blobs()?
+            .into_iter()
+            .map(|b| b.hash)
+            .filter(|h| repo.blob_present(h))
+            .collect()
+    } else {
+        resolve_all(repo, specs)?
+    };
+    let min_copies = repo.min_copies()?;
+    let mut freed = 0u64;
+    let mut kept = 0;
+    for hash in &hashes {
+        if !repo.blob_present(hash) {
+            if !all {
+                println!("{}  not present locally", util::short_hash(hash));
+            }
+            continue;
+        }
+        let size = std::fs::metadata(repo.blob_path(hash)).map_or(0, |m| m.len());
+        let outcome = repo.drop_blob(hash)?;
+        if outcome.dropped {
+            freed += size;
+            println!(
+                "{}  dropped (on {})",
+                util::short_hash(hash),
+                outcome.verified.join(", ")
+            );
+        } else {
+            kept += 1;
+            println!("{}", outcome.kept_reason(min_copies));
+        }
+    }
+    println!("freed {}", util::format_size(freed));
+    if kept > 0 {
+        println!(
+            "{kept} blob(s) kept: push them to more remotes, or lower the requirement with \
+             `mbr config min-copies`"
+        );
+    }
+    Ok(())
+}
+
+fn gc(repo: &mut Repo, purge: bool, older_than: Option<u32>, yes: bool) -> Result<(), String> {
+    let cutoff = older_than.map(|days| util::now() - i64::from(days) * 86_400);
+    let candidates: Vec<_> = repo
+        .unreferenced_blobs()?
+        .into_iter()
+        .filter(|u| cutoff.is_none_or(|cutoff| u.removed_at <= cutoff))
+        .collect();
+    if candidates.is_empty() {
+        println!("no old versions or deleted files to clean up");
+        return Ok(());
+    }
+
+    if purge {
+        let total: u64 = candidates.iter().map(|u| u.size).sum();
+        println!(
+            "about to delete {} old version(s) / deleted file(s), {}, from this folder AND \
+             every remote:",
+            candidates.len(),
+            util::format_size(total)
+        );
+        for u in &candidates {
+            println!(
+                "  {}  {:>10}  gone since {}",
+                util::short_hash(&u.hash),
+                util::format_size(u.size),
+                util::format_time(u.removed_at)
+            );
+        }
+        if !yes && prompt("type 'delete' to confirm", "")? != "delete" {
+            return Err("not confirmed; nothing deleted".to_owned());
+        }
+        for u in &candidates {
+            repo.purge_blob(&u.hash)?;
+        }
+        println!("deleted {} blob(s)", candidates.len());
+        return Ok(());
+    }
+
+    let min_copies = repo.min_copies()?;
+    let mut freed = 0;
+    let mut kept = 0;
+    for u in candidates.iter().filter(|u| u.present_locally) {
+        let outcome = repo.drop_blob(&u.hash)?;
+        if outcome.dropped {
+            freed += u.size;
+        } else {
+            kept += 1;
+            println!("{}", outcome.kept_reason(min_copies));
+        }
+    }
+    println!("freed {} locally", util::format_size(freed));
+    if kept > 0 {
+        println!("{kept} old blob(s) kept here: they are not stored on enough remotes yet");
+    }
+    Ok(())
+}
+
+fn config_min_copies(repo: &mut Repo, n: Option<u32>) -> Result<(), String> {
+    if let Some(n) = n {
+        repo.set_min_copies(n)?;
+    }
+    println!("min-copies: {}", repo.min_copies()?);
+    Ok(())
+}
+
+// ── metadata backups ──
+
+fn metadata_status(repo: &mut Repo) -> Result<(), String> {
+    let state = AppState::load().repo(&repo.root);
+    println!(
+        "master password: {}",
+        if state.password_check.is_some() {
+            "set"
+        } else {
+            "not set (`mbr metadata password`)"
+        }
+    );
+    let remotes = repo.db.metadata_remotes()?;
+    if remotes.is_empty() {
+        println!("no remotes chosen for metadata backups (`mbr metadata add <remote>`)");
+        return Ok(());
+    }
+    let current = repo.db_hash()?;
+    for remote in remotes {
+        let line = match state.metadata_backups.get(&remote.name) {
+            None => "never backed up".to_owned(),
+            Some(r) if r.db_hash == current => {
+                format!("up to date (backed up {})", util::format_time(r.at))
+            }
+            Some(r) => format!("OUT OF DATE (last backed up {})", util::format_time(r.at)),
+        };
+        println!("{:<16} {line}", remote.name);
+    }
+    Ok(())
+}
+
+fn metadata_use(repo: &mut Repo, remotes: &[String], enabled: bool) -> Result<(), String> {
+    for name in remotes {
+        lookup_remote(repo, name)?;
+        repo.db.set_metadata_remote(name, enabled)?;
+        if enabled {
+            println!("metadata will be backed up to {name}");
+        } else {
+            println!("metadata will no longer be backed up to {name}");
+        }
+    }
+    Ok(())
+}
+
+/// Ask for a new master password, twice.
+fn prompt_new_password() -> Result<String, String> {
+    println!(
+        "The master password encrypts the metadata backups. Without it they can't be read: \
+         there is no way to recover it."
+    );
+    let password =
+        rpassword::prompt_password("new master password: ").map_err(|e| e.to_string())?;
+    metadata::check_new_password(&password)?;
+    let again = rpassword::prompt_password("repeat it: ").map_err(|e| e.to_string())?;
+    if password != again {
+        return Err("the passwords differ".to_owned());
+    }
+    Ok(password)
+}
+
+/// The master password of this folder: asked and checked, or set now.
+fn master_password(repo: &Repo, state: &mut AppState) -> Result<String, String> {
+    let saved = state.repo(&repo.root).password_check;
+    match saved {
+        Some(check) => {
+            let password =
+                rpassword::prompt_password("master password: ").map_err(|e| e.to_string())?;
+            if !metadata::password_matches(&check, &password) {
+                return Err("wrong master password".to_owned());
+            }
+            Ok(password)
+        }
+        None => {
+            let password = prompt_new_password()?;
+            state.repo_mut(&repo.root).password_check = Some(metadata::password_check(&password)?);
+            state.save()?;
+            Ok(password)
+        }
+    }
+}
+
+fn metadata_password(repo: &mut Repo) -> Result<(), String> {
+    let mut state = AppState::load();
+    if let Some(check) = state.repo(&repo.root).password_check {
+        let current =
+            rpassword::prompt_password("current master password: ").map_err(|e| e.to_string())?;
+        if !metadata::password_matches(&check, &current) {
+            return Err("wrong master password".to_owned());
+        }
+    }
+    let password = prompt_new_password()?;
+    let repo_state = state.repo_mut(&repo.root);
+    repo_state.password_check = Some(metadata::password_check(&password)?);
+    // Existing backups still use the old password until replaced.
+    let stale = !repo_state.metadata_backups.is_empty();
+    repo_state.metadata_backups.clear();
+    state.save()?;
+    println!("master password set");
+    if stale {
+        println!("existing backups still use the old one: run `mbr metadata backup`");
+    }
+    Ok(())
+}
+
+fn metadata_backup(repo: &mut Repo) -> Result<(), String> {
+    let remotes = repo.db.metadata_remotes()?;
+    if remotes.is_empty() {
+        return Err("no remotes chosen for metadata backups (`mbr metadata add <remote>`)".into());
+    }
+    let mut state = AppState::load();
+    let password = master_password(repo, &mut state)?;
+    let snapshot = repo.metadata_snapshot()?;
+    println!("encrypting…");
+    let sealed = metadata::seal(&snapshot, &password)?;
+    let scratch = repo.scratch_dir();
+    let mut failed = 0;
+    for remote in &remotes {
+        print!("uploading to {}... ", remote.name);
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        match repo.with_rclone(|| metadata::upload(&remote.target, &sealed, &scratch)) {
+            Ok(()) => {
+                println!("ok");
+                state.repo_mut(&repo.root).metadata_backups.insert(
+                    remote.name.clone(),
+                    BackupRecord {
+                        at: util::now(),
+                        db_hash: snapshot.db_hash.clone(),
+                    },
+                );
+            }
+            Err(e) => {
+                failed += 1;
+                println!("FAILED: {e}");
+            }
+        }
+    }
+    state.save()?;
+    if failed > 0 {
+        return Err(format!("{failed} remote(s) could not be backed up to"));
+    }
+    Ok(())
+}
+
+fn metadata_restore(repo: &mut Repo, remote_name: &str) -> Result<(), String> {
+    let remote = lookup_remote(repo, remote_name)?;
+    if !repo.is_empty_folder()? {
+        return Err("metadata can only be restored into a folder that tracks no files yet".into());
+    }
+    let scratch = repo.scratch_dir();
+    let sealed = repo.with_rclone(|| metadata::download(&remote.target, &scratch))?;
+    let password = rpassword::prompt_password("master password: ").map_err(|e| e.to_string())?;
+    println!("decrypting…");
+    let (db, conf) = metadata::unseal(&sealed, &password)?;
+    let report = repo.restore_metadata(&db, &conf)?;
+
+    let mut state = AppState::load();
+    state.repo_mut(&repo.root).password_check = Some(metadata::password_check(&password)?);
+    state.save()?;
+
+    println!(
+        "restored {} file name(s) and {} remote(s)",
+        report.files, report.remotes
+    );
+    for (path, why) in &report.skipped {
+        println!("  skipped {path}: {why}");
+    }
+    println!("the files' content is still on the remotes: `mbr pull <remote>` downloads it");
     Ok(())
 }
