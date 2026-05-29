@@ -91,8 +91,8 @@ A remote named `drive` becomes three rclone sections, which are never shown:
 ```
 
 and the mbr remote `drive` targets `_crypt-mbr-drive:`, so blobs and
-their names are encrypted. `mbr remote setup --unencrypted` (or "Don't
-encrypt" in the GUI) instead makes `_dangerouslyplain-mbr-drive`, an alias
+their names are encrypted. `mbr remote setup --unencrypted` (CLI only;
+the GUI always encrypts) instead makes `_dangerouslyplain-mbr-drive`, an alias
 like `_plain-mbr-drive`, and stores through it in the clear. Wrapper
 backends (alias, chunker, crypt, union, …) are not offered.
 

@@ -26,8 +26,9 @@ Give the remote a name, pick the kind of storage, and fill in the form. Fields m
 the others can usually be left alone. The **?** next to each field opens rclone's documentation for it. Storage that
 holds buckets or shares asks which one to use; a local disk asks for the folder.
 
-**Don't encrypt** stores files as they are, readable by anyone with access to the remote. It is meant for disks you
-keep yourself, and is off unless you tick it.
+Remotes set up in the app are always encrypted. An unencrypted remote, storing files as they are and readable by
+anyone with access to it, can only be made from the [command line](../cli/) with `mbr remote setup --unencrypted`.
+It is meant for disks you keep yourself.
 
 Services that sign in through the browser (Google Drive, Dropbox, OneDrive, …) open a browser window once you save.
 If one doesn't open, the link is shown in the app. If rclone needs anything else, it asks in a box below the form.

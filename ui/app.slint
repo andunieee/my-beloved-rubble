@@ -478,8 +478,6 @@ export component AppWindow inherits Window {
 
     // Name for the guided remote setup.
     in-out property <string> new-remote-name: "";
-    // Set up the new remote without encryption.
-    in-out property <bool> new-remote-plain: false;
 
     // ── guided remote setup ──
     in-out property <[string]> backend-titles: [];
@@ -537,7 +535,7 @@ export component AppWindow inherits Window {
     callback cancel-remote-edit();
     callback remove-remote(name: string);
     callback select-backend(name: string);
-    callback submit-form(name: string, backend: string, values: [string], plain: bool);
+    callback submit-form(name: string, backend: string, values: [string]);
     callback submit-remote-setup(backend: string, state: string, answer: string);
     callback cancel-remote-setup();
     // keeping copies safe
@@ -1549,11 +1547,6 @@ width: Side.text-width;
                                 }
                                 if root.setup-active && root.setup-state == "": VerticalLayout {
                                     spacing: 8px;
-                                    CheckBox {
-                                        text: "Don't encrypt (anyone with access to the remote can read your files)";
-                                        checked <=> root.new-remote-plain;
-                                        enabled: !root.busy;
-                                    }
                                     HorizontalLayout {
                                         spacing: 6px;
                                         Button {
@@ -1564,7 +1557,7 @@ width: Side.text-width;
                                                 && root.new-remote-name != ""
                                                 && root.setup-backend != "";
                                             clicked => {
-                                                root.submit-form(root.new-remote-name, root.setup-backend, root.form-values, root.new-remote-plain);
+                                                root.submit-form(root.new-remote-name, root.setup-backend, root.form-values);
                                             }
                                         }
                                         Button {

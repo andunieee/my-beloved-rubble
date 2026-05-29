@@ -3,8 +3,8 @@
 use clap::{Parser, Subcommand};
 use mbr::db::Remote;
 use mbr::metadata;
-use mbr::repo::{LocalHealth, RemoteHealth, Repo};
 use mbr::rclone::SetupOutcome;
+use mbr::repo::{LocalHealth, RemoteHealth, Repo};
 use mbr::state::{AppState, BackupRecord, RepoState};
 use mbr::util;
 use std::path::{Path, PathBuf};
@@ -437,7 +437,9 @@ fn remote_setup(repo: &mut Repo, name: &str, backend: &str, encrypt: bool) -> Re
     println!("Setting up remote '{name}' ({})", backend.title);
     println!("{}", backend.description);
     if !encrypt {
-        println!("WARNING: files will be stored unencrypted; whoever runs the remote can read them");
+        println!(
+            "WARNING: files will be stored unencrypted; whoever runs the remote can read them"
+        );
     }
 
     let values = ask_backend_form(backend)?;
@@ -641,7 +643,8 @@ fn remote_edit(
         println!("updated the settings of '{name}'");
     }
     if new_name != remote.name {
-        repo.db.update_remote(&remote.name, &new_name, &remote.target)?;
+        repo.db
+            .update_remote(&remote.name, &new_name, &remote.target)?;
         println!("renamed remote {name} to {new_name}");
     }
     Ok(())

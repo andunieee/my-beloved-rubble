@@ -524,9 +524,9 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let app = app.clone();
-        w.on_submit_form(move |name, backend, values, plain| {
+        w.on_submit_form(move |name, backend, values| {
             let values: Vec<SharedString> = values.iter().collect();
-            app.submit_form(&name, &backend, &values, plain);
+            app.submit_form(&name, &backend, &values);
         });
     }
     {
@@ -1835,12 +1835,13 @@ impl App {
 
     /// Submit the filled form: hand every answer to rclone in one call,
     /// then add the layers mbr stores through (see [`mbr::remotes`]).
-    fn submit_form(&self, name: &str, backend_name: &str, values: &[SharedString], plain: bool) {
+    /// Always encrypted; unencrypted remotes are CLI-only.
+    fn submit_form(&self, name: &str, backend_name: &str, values: &[SharedString]) {
         let Some(password) = self.password.borrow().clone() else {
             self.status("Set a master password in the Settings tab first");
             return;
         };
-        let layout = match mbr::remotes::Layout::new(name.trim(), !plain) {
+        let layout = match mbr::remotes::Layout::new(name.trim(), true) {
             Ok(layout) => layout,
             Err(e) => {
                 self.status(format!("Error: {e}"));
@@ -1978,7 +1979,6 @@ impl App {
         self.window.set_form_fields(ModelRc::default());
         self.window.set_form_values(ModelRc::default());
         self.window.set_new_remote_name(SharedString::default());
-        self.window.set_new_remote_plain(false);
         // Offer a fresh form for the backend still selected in the picker.
         let backend = self.window.get_setup_backend();
         if !backend.is_empty() {
