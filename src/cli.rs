@@ -144,7 +144,7 @@ enum MetadataCommand {
 enum ConfigCommand {
     /// copies of each file to keep (local + remotes); shows it without N
     MinCopies { n: Option<u32> },
-    /// set or change the master password (needed before adding remotes)
+    /// set the master password once (needed before adding remotes)
     Password,
 }
 
@@ -1046,23 +1046,15 @@ fn master_password(repo: &Repo, state: &mut AppState) -> Result<String, String> 
     if !metadata::password_matches(&check, &password) {
         return Err("wrong master password".to_owned());
     }
-    state.repo_mut(&repo.root).set_password(&password)?;
+    state.repo_mut(&repo.root).remember_password(&password)?;
     state.save()?;
     Ok(password)
 }
 
 fn config_password(repo: &mut Repo) -> Result<(), String> {
     let mut state = AppState::load();
-    let had_one = state.repo(&repo.root).password_check.is_some();
-    if had_one {
-        let encrypted = repo.encrypted_remotes()?;
-        if !encrypted.is_empty() {
-            return Err(format!(
-                "the master password can't change: remotes {} are encrypted with it",
-                encrypted.join(", ")
-            ));
-        }
-        master_password(repo, &mut state)?;
+    if state.repo(&repo.root).password_check.is_some() {
+        return Err("the master password is already set and cannot be changed".to_owned());
     }
     let password = prompt_new_password()?;
     let repo_state = state.repo_mut(&repo.root);

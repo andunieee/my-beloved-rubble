@@ -102,9 +102,9 @@ folders can share one storage account. The only location asked is the
 bucket, container or share (or, for `local`, the folder). Metadata backups
 go there too, next to `mbr-<id>`, through `_root-mbr-drive`.
 
-Since remotes are encrypted with it, the master password can't change
-once one exists. It is saved, with a check, in the per-machine
-`state.json` (mode 0600), so it is asked for once.
+The master password is chosen when creating a folder or restoring from
+plain database/config files, then can't change. It is saved, with a check,
+in the per-machine `state.json` (mode 0600).
 
 ### Scanning remotes
 
@@ -255,10 +255,9 @@ usually OAuth — the question is shown inline. Edit renames a remote and,
 for backends mbr has a form for, changes its settings (secrets stay
 hidden; blank keeps them).
 
-**Settings** holds the master password (set once, then saved on this
-computer) and chooses which remotes receive metadata backups, showing
-when each was last backed up and whether that is up to date. The sidebar
-sets, unlocks or changes the password and backs up.
+**Settings** says the master password is locked and offers **Test** to
+check whether you remember it. It also chooses which remotes receive
+metadata backups and shows whether each backup is up to date.
 
 Opening a folder that isn't an mbr folder yet offers to start a new one
 there or to restore a lost one into it, from a remote (the password and

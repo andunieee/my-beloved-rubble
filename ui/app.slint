@@ -448,13 +448,12 @@ export component AppWindow inherits Window {
     in-out property <int> metadata-chosen: 0;
     in-out property <string> metadata-summary: "";
     in-out property <bool> password-set: false;
-    // The master password is known (saved on this computer).
-    in-out property <bool> unlocked: false;
-    // Some remote is encrypted with the master password, so it can't change.
-    in-out property <bool> has-encrypted-remotes: false;
+    // The password is available on this computer for normal operations.
+    in-out property <bool> password-available: false;
     in-out property <string> pw-new: "";
     in-out property <string> pw-repeat: "";
-    in-out property <string> pw-entry: "";
+    in-out property <bool> testing-password: false;
+    in-out property <string> test-password-entry: "";
 
     // ── a folder that isn't an mbr folder yet: start anew or restore ──
     in-out property <string> pending-folder: "";
@@ -551,7 +550,7 @@ export component AppWindow inherits Window {
     // metadata backup
     callback toggle-metadata-remote(name: string, enabled: bool);
     callback set-password(password: string, repeat: string);
-    callback unlock(password: string);
+    callback test-password(password: string);
     callback backup-metadata();
     // a folder that isn't an mbr folder yet
     callback start-new();
@@ -756,7 +755,7 @@ export component AppWindow inherits Window {
                                         pick => { root.pick-restore-file(2); }
                                     }
                                     Hint {
-                                        text: "Afterwards, set the master password the folder's remotes were made with, in the Settings tab.";
+                                        text: "After restoring, choose the master password used by this folder's remotes in the Settings tab.";
                                         width: root.column-width;
                                     }
                                     HorizontalLayout {
@@ -1378,7 +1377,7 @@ width: Side.text-width;
                         // ════ Settings tab ════
                         if root.active-tab == 2 && root.folder != "" && !root.password-set: VerticalLayout {
                             spacing: 6px;
-                            SectionTitle { text: "SET A MASTER PASSWORD"; help: "settings/#the-master-password"; }
+                            SectionTitle { text: "CHOOSE A MASTER PASSWORD"; help: "settings/#the-master-password"; }
                             Hint {
                                 text: "Remotes and metadata backups are encrypted with it. Write it down: it can't be recovered.";
                             }
@@ -1398,36 +1397,54 @@ width: Side.text-width;
                                 Button {
                                     text: "Set password";
                                     primary: true;
-                                    enabled: root.pw-new != "" && root.pw-repeat != "";
+                                    enabled: !root.busy && root.pw-new != "" && root.pw-repeat != "";
                                     clicked => { root.set-password(root.pw-new, root.pw-repeat); }
                                 }
                             }
                             Rectangle { height: 1px; background: Palette.border; }
                         }
 
-                        if root.active-tab == 2 && root.folder != "" && root.password-set && !root.unlocked: VerticalLayout {
+                        if root.active-tab == 2 && root.folder != "" && root.password-set: VerticalLayout {
                             spacing: 6px;
-                            SectionTitle { text: "UNLOCK"; help: "settings/#the-master-password"; }
-                            Hint { text: "Enter the master password once; it is then saved on this computer."; }
-                            LineEdit {
-                                input-type: InputType.password;
-                                placeholder-text: "master password";
-                                text <=> root.pw-entry;
-                                accepted => { root.unlock(root.pw-entry); }
-                            }
+                            Hint { text: "master password is locked"; }
                             HorizontalLayout {
                                 alignment: start;
                                 Button {
-                                    text: "Unlock";
+                                    text: "Test";
                                     primary: true;
-                                    enabled: root.pw-entry != "";
-                                    clicked => { root.unlock(root.pw-entry); }
+                                    clicked => { root.testing-password = true; }
+                                }
+                            }
+                            if root.testing-password: VerticalLayout {
+                                spacing: 6px;
+                                LineEdit {
+                                    input-type: InputType.password;
+                                    placeholder-text: "enter master password to test";
+                                    text <=> root.test-password-entry;
+                                    accepted => { root.test-password(root.test-password-entry); }
+                                }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    alignment: start;
+                                    Button {
+                                        text: "Test";
+                                        primary: true;
+                                        enabled: root.test-password-entry != "";
+                                        clicked => { root.test-password(root.test-password-entry); }
+                                    }
+                                    Button {
+                                        text: "Cancel";
+                                        clicked => {
+                                            root.testing-password = false;
+                                            root.test-password-entry = "";
+                                        }
+                                    }
                                 }
                             }
                             Rectangle { height: 1px; background: Palette.border; }
                         }
 
-                        if root.active-tab == 2 && root.folder != "" && root.unlocked: VerticalLayout {
+                        if root.active-tab == 2 && root.folder != "" && root.password-available: VerticalLayout {
                             spacing: 6px;
                             SectionTitle { text: "BACK UP METADATA"; help: "metadata/#backing-up"; }
                             if root.metadata-chosen == 0: Hint {
@@ -1440,36 +1457,6 @@ width: Side.text-width;
                                     primary: true;
                                     enabled: !root.busy && root.metadata-chosen > 0;
                                     clicked => { root.backup-metadata(); }
-                                }
-                            }
-                        }
-
-                        if root.active-tab == 2 && root.folder != "" && root.unlocked: VerticalLayout {
-                            spacing: 6px;
-                            Rectangle { height: 1px; background: Palette.border; }
-                            SectionTitle { text: "CHANGE THE MASTER PASSWORD"; help: "settings/#changing-the-password"; }
-                            if root.has-encrypted-remotes: Hint {
-                                text: "It can't change while remotes are encrypted with it.";
-                            }
-                            if !root.has-encrypted-remotes: VerticalLayout {
-                                spacing: 6px;
-                                LineEdit {
-                                    input-type: InputType.password;
-                                    placeholder-text: "new master password";
-                                    text <=> root.pw-new;
-                                }
-                                LineEdit {
-                                    input-type: InputType.password;
-                                    placeholder-text: "repeat it";
-                                    text <=> root.pw-repeat;
-                                }
-                                HorizontalLayout {
-                                    alignment: start;
-                                    Button {
-                                        text: "Change password";
-                                        enabled: !root.busy && root.pw-new != "" && root.pw-repeat != "";
-                                        clicked => { root.set-password(root.pw-new, root.pw-repeat); }
-                                    }
                                 }
                             }
                         }
@@ -1517,12 +1504,12 @@ width: Side.text-width;
                             spacing: 14px;
 
                             // ── guided setup for a new remote ──
-                            if !root.unlocked: VerticalLayout {
+                            if !root.password-available: VerticalLayout {
                                 spacing: 6px;
                                 SectionTitle { text: "SET UP A NEW REMOTE"; help: "remotes/#setting-up-a-new-remote"; }
                                 Hint {
                                     text: root.password-set
-                                        ? "Unlock the master password in the Settings tab first: remotes are encrypted with it."
+                                        ? "Test the master password in the Settings tab first: remotes are encrypted with it."
                                         : "Set a master password in the Settings tab first: remotes are encrypted with it.";
                                 }
                                 HorizontalLayout {
@@ -1533,7 +1520,7 @@ width: Side.text-width;
                                     }
                                 }
                             }
-                            if root.unlocked: VerticalLayout {
+                            if root.password-available: VerticalLayout {
                                 spacing: 6px;
                                 SectionTitle { text: "SET UP A NEW REMOTE"; help: "remotes/#setting-up-a-new-remote"; }
 

@@ -44,7 +44,23 @@ pub struct BackupRecord {
 impl RepoState {
     /// Make `password` the folder's master password, saved on this machine.
     pub fn set_password(&mut self, password: &str) -> Result<(), String> {
+        if self.password_check.is_some() {
+            return Err("the master password is already set and cannot be changed".to_owned());
+        }
         self.password_check = Some(crate::metadata::password_check(password)?);
+        self.password = Some(password.to_owned());
+        Ok(())
+    }
+
+    /// Remember a password after verifying it against an existing check.
+    pub fn remember_password(&mut self, password: &str) -> Result<(), String> {
+        let check = self
+            .password_check
+            .as_deref()
+            .ok_or_else(|| "the master password is not set".to_owned())?;
+        if !crate::metadata::password_matches(check, password) {
+            return Err("wrong master password".to_owned());
+        }
         self.password = Some(password.to_owned());
         Ok(())
     }
@@ -151,5 +167,16 @@ mod tests {
         std::fs::write(&path, "{not json").unwrap();
         assert!(AppState::load_from(&path).repos.is_empty());
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn master_password_can_only_be_set_once() {
+        let mut repo = RepoState::default();
+        repo.set_password("first password").unwrap();
+        assert!(repo.set_password("second password").is_err());
+        assert_eq!(repo.password.as_deref(), Some("first password"));
+        assert!(repo.remember_password("wrong password").is_err());
+        repo.remember_password("first password").unwrap();
+        assert_eq!(repo.password.as_deref(), Some("first password"));
     }
 }

@@ -636,7 +636,7 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let app = app.clone();
-        w.on_unlock(move |password| app.unlock(&password));
+        w.on_test_password(move |password| app.test_password(&password));
     }
     {
         let app = app.clone();
@@ -780,6 +780,7 @@ impl App {
         match Repo::init(&dir) {
             Ok(repo) => {
                 self.open_repo(repo);
+                self.window.set_active_tab(2);
                 self.status(format!("{} is now an mbr folder", dir.display()));
             }
             Err(e) => self.status(format!("Error: {e}")),
@@ -880,6 +881,9 @@ impl App {
             }
         }
         self.open_repo(repo);
+        if password.is_none() {
+            self.window.set_active_tab(2);
+        }
         let mut text = format!("Restored {} file(s)", report.files);
         if report.files > 0 {
             text += "; download them from the Remotes tab";
@@ -894,7 +898,7 @@ impl App {
             text += &format!("; {} skipped", report.skipped.len());
         }
         if password.is_none() {
-            text += "; set the master password in the Settings tab";
+            text += "; choose the master password in the Settings tab";
         }
         self.status(text);
     }
@@ -1239,35 +1243,12 @@ impl App {
         self.repo.borrow().as_ref().map(|r| r.root.clone())
     }
 
-    /// Set the master password, or change it once unlocked.
+    /// Set the folder's master password once.
     fn set_password(&self, password: &str, repeat: &str) {
         let Some(root) = self.root() else { return };
-        let had_one = self.state.borrow().repo(&root).password_check.is_some();
-        if had_one && self.password.borrow().is_none() {
-            self.status("Unlock with the current master password first");
+        if self.state.borrow().repo(&root).password_check.is_some() {
+            self.status("The master password is already set and cannot be changed");
             return;
-        }
-        if had_one {
-            let encrypted = self
-                .repo
-                .borrow_mut()
-                .as_mut()
-                .map(|repo| repo.encrypted_remotes())
-                .unwrap_or(Ok(Vec::new()));
-            match encrypted {
-                Ok(names) if !names.is_empty() => {
-                    self.status(format!(
-                        "The master password can't change: remotes {} are encrypted with it",
-                        names.join(", ")
-                    ));
-                    return;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    self.status(format!("Error: {e}"));
-                    return;
-                }
-            }
         }
         if let Err(e) = metadata::check_new_password(password) {
             self.status(format!("Error: {e}"));
@@ -1292,15 +1273,11 @@ impl App {
         *self.password.borrow_mut() = Some(SecretString::from(password.to_owned()));
         self.window.set_pw_new(SharedString::default());
         self.window.set_pw_repeat(SharedString::default());
-        self.status(if had_one {
-            "Master password changed; back up again to re-encrypt the backups with it"
-        } else {
-            "Master password set"
-        });
+        self.status("Master password set and saved on this computer");
         self.refresh();
     }
 
-    fn unlock(&self, password: &str) {
+    fn test_password(&self, password: &str) {
         let Some(root) = self.root() else { return };
         let Some(check) = self.state.borrow().repo(&root).password_check else {
             return;
@@ -1309,11 +1286,22 @@ impl App {
             self.status("Wrong master password");
             return;
         }
-        self.state.borrow_mut().repo_mut(&root).password = Some(password.to_owned());
-        self.save_state();
-        *self.password.borrow_mut() = Some(SecretString::from(password.to_owned()));
-        self.window.set_pw_entry(SharedString::default());
-        self.status("Unlocked; the master password is saved on this computer");
+        if self.password.borrow().is_none() {
+            if let Err(e) = self
+                .state
+                .borrow_mut()
+                .repo_mut(&root)
+                .remember_password(password)
+            {
+                self.status(format!("Error: {e}"));
+                return;
+            }
+            self.save_state();
+            *self.password.borrow_mut() = Some(SecretString::from(password.to_owned()));
+        }
+        self.window.set_testing_password(false);
+        self.window.set_test_password_entry(SharedString::default());
+        self.status("Master password is correct");
         self.refresh();
     }
 
@@ -1321,7 +1309,7 @@ impl App {
     /// chosen remote in the background.
     fn backup_metadata(&self) {
         let Some(password) = self.password.borrow().clone() else {
-            self.status("Set or unlock the master password in the Settings tab first");
+            self.status("Set the master password in the Settings tab first");
             return;
         };
         let (remotes, snapshot, root, scratch) = {
@@ -2331,10 +2319,7 @@ impl App {
         let w = &self.window;
         let state = self.state.borrow().repo(&repo.root);
         w.set_password_set(state.password_check.is_some());
-        w.set_unlocked(self.password.borrow().is_some());
-        w.set_has_encrypted_remotes(
-            repo.encrypted_remotes().is_ok_and(|names| !names.is_empty()),
-        );
+        w.set_password_available(self.password.borrow().is_some());
 
         let (remotes, chosen) = match repo.db.list_remotes().and_then(|all| {
             let chosen: HashSet<String> =

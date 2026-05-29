@@ -37,7 +37,7 @@ app asks whether to start a new one there or to restore a lost one, and restores
 - **a remote**: enter the master password and fill in the remote's settings as when it was set up: the same kind of
   storage, account and bucket or folder. The app looks for the backup made with that password there.
 - **a backup file**: a `mbr-metadata-….tar.gz.encrypted` file you downloaded, and the master password.
-- **database files**: a copy of the old folder's `.mbr/mbr.db` and `.mbr/rclone.conf`, as they are. Afterwards, set
+- **database files**: a copy of the old folder's `.mbr/mbr.db` and `.mbr/rclone.conf`, as they are. Afterwards, choose
   the old folder's master password in the **Settings** tab.
 
 Every file reappears with its name, history and records of where it is stored, and the remotes come back with their
@@ -46,8 +46,3 @@ only the files you need. A file already in the folder under a restored name is k
 new version.
 
 A backup is only ever restored into a folder that isn't an mbr folder yet, never merged into one in use.
-
-## Changing the password
-
-Unlock with the current password, then enter the new one twice. The backup's name comes from the password, so the
-next backup is stored under a new name; the old one, still under the old password, stays until you delete it.
