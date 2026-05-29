@@ -1112,7 +1112,7 @@ fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
 
 /// Ensure the repository-local rclone config exists, with restrictive
 /// permissions since it holds OAuth tokens and other secrets.
-pub(crate) fn ensure_rclone_config(path: &Path) -> Result<(), String> {
+pub fn ensure_rclone_config(path: &Path) -> Result<(), String> {
     if path.is_file() {
         restrict_config_permissions(path)?;
         return Ok(());

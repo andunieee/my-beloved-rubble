@@ -4,7 +4,8 @@ use clap::{Parser, Subcommand};
 use mbr::db::Remote;
 use mbr::metadata;
 use mbr::repo::{LocalHealth, RemoteHealth, Repo};
-use mbr::state::{AppState, BackupRecord};
+use mbr::rclone::SetupOutcome;
+use mbr::state::{AppState, BackupRecord, RepoState};
 use mbr::util;
 use std::path::{Path, PathBuf};
 
@@ -12,7 +13,7 @@ use std::path::{Path, PathBuf};
 #[command(
     name = "mbr",
     about = "my beloved rubble: content-addressed folders with rclone remotes",
-    after_help = "Commands other than `init` run inside an attached folder (or below one)."
+    after_help = "Commands other than `init` and `restore` run inside an attached folder (or below one)."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -25,6 +26,25 @@ enum Command {
     Init {
         /// folder to attach (defaults to the current directory)
         dir: Option<PathBuf>,
+    },
+    /// make a folder the one a metadata backup describes, instead of `init`
+    #[command(group(clap::ArgGroup::new("source").required(true).args(["db", "backup", "from"])))]
+    Restore {
+        /// folder to restore into (defaults to the current directory)
+        dir: Option<PathBuf>,
+        /// a database file (mbr.db), restored along with --rclone-conf
+        #[arg(long, value_name = "FILE", requires = "rclone_conf")]
+        db: Option<PathBuf>,
+        /// the rclone config file (rclone.conf) that goes with --db
+        #[arg(long, value_name = "FILE", requires = "db")]
+        rclone_conf: Option<PathBuf>,
+        /// an encrypted backup file (mbr-metadata-….tar.gz.encrypted)
+        #[arg(long, value_name = "FILE")]
+        backup: Option<PathBuf>,
+        /// download the backup from a remote of this backend (see `mbr
+        /// remote types`), asking for its settings
+        #[arg(long, value_name = "BACKEND")]
+        from: Option<String>,
     },
     /// ingest new files, record removals
     Scan,
@@ -118,8 +138,6 @@ enum MetadataCommand {
     },
     /// encrypt the metadata and upload it to every chosen remote
     Backup,
-    /// merge the metadata backup on a remote into this folder
-    Restore { remote: String },
 }
 
 #[derive(Subcommand)]
@@ -175,6 +193,22 @@ fn main() {
 fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Init { dir } => init(&dir.unwrap_or_else(|| PathBuf::from("."))),
+        Command::Restore {
+            dir,
+            db,
+            rclone_conf,
+            backup,
+            from,
+        } => {
+            let dir = dir.unwrap_or_else(|| PathBuf::from("."));
+            let source = match (db, rclone_conf, backup, from) {
+                (Some(db), Some(conf), _, _) => Source::Files(db, conf),
+                (_, _, Some(file), _) => Source::Backup(file),
+                (_, _, _, Some(backend)) => Source::Remote(backend),
+                _ => unreachable!("clap requires one source"),
+            };
+            restore(&dir, source)
+        }
         Command::Scan => scan(&mut open()?),
         Command::Ls => ls(&mut open()?),
         Command::Info { spec } => info(&mut open()?, &spec),
@@ -212,7 +246,6 @@ fn run(cli: Cli) -> Result<(), String> {
             MetadataCommand::Add { remotes } => metadata_use(&mut open()?, &remotes, true),
             MetadataCommand::Rm { remotes } => metadata_use(&mut open()?, &remotes, false),
             MetadataCommand::Backup => metadata_backup(&mut open()?),
-            MetadataCommand::Restore { remote } => metadata_restore(&mut open()?, &remote),
         },
         Command::Config { command } => match command {
             ConfigCommand::MinCopies { n } => config_min_copies(&mut open()?, n),
@@ -407,7 +440,25 @@ fn remote_setup(repo: &mut Repo, name: &str, backend: &str, encrypt: bool) -> Re
         println!("WARNING: files will be stored unencrypted; whoever runs the remote can read them");
     }
 
-    // Ask the hardcoded form fields, then hand everything to rclone in one go.
+    let values = ask_backend_form(backend)?;
+    let spec = mbr::backends::target_spec(backend, &values);
+    mbr::backends::check_target_spec(backend, &spec)?;
+    let folder_id = repo.folder_id()?;
+    let parameters = mbr::backends::form_parameters(backend, &values);
+    let section = layout.root_section();
+    let begun = mbr::rclone::begin_setup(&section, backend.name, parameters.clone());
+    answer_questions(&section, begun, &parameters, |outcome| {
+        layout.finish(outcome, &spec, &folder_id, &password)
+    })?;
+
+    let target = layout.target();
+    repo.db.add_remote(name, &target)?;
+    println!("added remote {name} ({})", mbr::remotes::describe(&target));
+    Ok(())
+}
+
+/// Ask the hardcoded form fields of `backend`, in order.
+fn ask_backend_form(backend: &mbr::backends::Backend) -> Result<Vec<String>, String> {
     let mut values: Vec<String> = Vec::new();
     for field in backend.fields {
         let label = match field.kind {
@@ -426,18 +477,20 @@ fn remote_setup(repo: &mut Repo, name: &str, backend: &str, encrypt: bool) -> Re
         }
         values.push(answer);
     }
-    let spec = mbr::backends::target_spec(backend, &values);
-    mbr::backends::check_target_spec(backend, &spec)?;
-    let location = mbr::remotes::location(&spec, &repo.folder_id()?);
-    let target = layout.target(&location);
-    let section = layout.backend_section();
+    Ok(values)
+}
 
-    let parameters = mbr::backends::form_parameters(backend, &values);
-    let begun = mbr::rclone::begin_setup(&section, backend.name, parameters.clone());
-    let mut outcome = layout.finish(begun, &location, &password)?;
-    // Anything rclone still asks (OAuth, verification) goes through the
-    // generic question protocol.
-    while let mbr::rclone::SetupOutcome::Question(question) = outcome {
+/// Answer what rclone still asks to finish setting up `section` (OAuth,
+/// verification) through the generic question protocol, passing each
+/// step's outcome through `finish`.
+fn answer_questions(
+    section: &str,
+    begun: Result<SetupOutcome, String>,
+    parameters: &serde_json::Value,
+    finish: impl Fn(Result<SetupOutcome, String>) -> Result<SetupOutcome, String>,
+) -> Result<(), String> {
+    let mut outcome = finish(begun)?;
+    while let SetupOutcome::Question(question) = outcome {
         println!("{}", question.help);
         let answer = if question.password {
             rpassword::prompt_password(format!("{}: ", question.name)).map_err(|e| e.to_string())
@@ -447,22 +500,19 @@ fn remote_setup(repo: &mut Repo, name: &str, backend: &str, encrypt: bool) -> Re
         let answer = match answer {
             Ok(answer) => answer,
             Err(e) => {
-                mbr::rclone::cancel_setup(&section, &question.state).ok();
+                mbr::rclone::cancel_setup(section, &question.state).ok();
                 return Err(e);
             }
         };
         let step = mbr::rclone::continue_setup_watching(
-            &section,
+            section,
             &question.state,
             &answer,
             parameters.clone(),
             &mut |url| println!("\nIf your browser didn't open, open this link:\n  {url}\n"),
         );
-        outcome = layout.finish(step, &location, &password)?;
+        outcome = finish(step)?;
     }
-
-    repo.db.add_remote(name, &target)?;
-    println!("added remote {name} ({})", mbr::remotes::describe(&target));
     Ok(())
 }
 
@@ -1038,13 +1088,18 @@ fn metadata_backup(repo: &mut Repo) -> Result<(), String> {
     let snapshot = repo.metadata_snapshot()?;
     println!("encrypting…");
     let sealed = metadata::seal(&snapshot, &password)?;
+    let name = metadata::backup_name(&password)?;
     let scratch = repo.scratch_dir();
     let mut failed = 0;
     for remote in &remotes {
         print!("uploading to {}... ", remote.name);
         use std::io::Write;
         std::io::stdout().flush().ok();
-        match repo.with_rclone(|| metadata::upload(&remote.target, &sealed, &scratch)) {
+        let uploaded = repo.with_rclone(|| {
+            let location = mbr::remotes::backup_location(&remote.target)?;
+            metadata::upload(&location, &name, &sealed, &scratch)
+        });
+        match uploaded {
             Ok(()) => {
                 println!("ok");
                 state.repo_mut(&repo.root).metadata_backups.insert(
@@ -1068,51 +1123,108 @@ fn metadata_backup(repo: &mut Repo) -> Result<(), String> {
     Ok(())
 }
 
-fn metadata_restore(repo: &mut Repo, remote_name: &str) -> Result<(), String> {
-    let remote = lookup_remote(repo, remote_name)?;
-    let scratch = repo.scratch_dir();
-    let sealed = repo.with_rclone(|| metadata::download(&remote.target, &scratch))?;
-    let saved = AppState::load().repo(&repo.root).password;
-    println!("decrypting…");
-    let unsealed = saved
-        .as_deref()
-        .map(|password| (password.to_owned(), metadata::unseal(&sealed, password)));
-    let (password, (db, conf)) = match unsealed {
-        Some((password, Ok(plain))) => (password, plain),
-        _ => {
-            let password = rpassword::prompt_password("the backup's master password: ")
-                .map_err(|e| e.to_string())?;
-            let plain = metadata::unseal(&sealed, &password)?;
-            (password, plain)
+/// Where `mbr restore` gets the backup from.
+enum Source {
+    /// The database and rclone config, as plain files.
+    Files(PathBuf, PathBuf),
+    /// An encrypted backup file.
+    Backup(PathBuf),
+    /// A remote of this backend, whose settings are asked for.
+    Remote(String),
+}
+
+fn restore(dir: &Path, source: Source) -> Result<(), String> {
+    let read = |path: &Path| {
+        std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))
+    };
+    let (db, conf, password) = match source {
+        Source::Files(db, conf) => (read(&db)?, read(&conf)?, None),
+        Source::Backup(file) => {
+            let sealed = read(&file)?;
+            let password =
+                rpassword::prompt_password("master password: ").map_err(|e| e.to_string())?;
+            println!("decrypting…");
+            let (db, conf) = metadata::unseal(&sealed, &password)?;
+            (db, conf, Some(password))
+        }
+        Source::Remote(backend) => {
+            let (db, conf, password) = download_backup(dir, &backend)?;
+            (db, conf, Some(password))
         }
     };
-    let report = repo.restore_metadata(&db, &conf)?;
+    let (repo, report) = metadata::restore(dir, &db, &conf)?;
 
-    // A folder without a password adopts the backup's; one with its own
-    // keeps it (the backup may predate a password change).
+    // Nothing this machine knew about the folder at that path still holds.
     let mut state = AppState::load();
     let repo_state = state.repo_mut(&repo.root);
-    if repo_state.password_check.is_none() {
-        repo_state.set_password(&password)?;
-        state.save()?;
+    *repo_state = RepoState::default();
+    if let Some(password) = &password {
+        repo_state.set_password(password)?;
     }
+    state.save()?;
 
     println!(
-        "restored {} file name(s) and {} remote(s); {} older version(s) added to the history",
-        report.files, report.remotes, report.history
+        "restored {} into {}",
+        plural(report.files, "file name"),
+        repo.root.display()
     );
-    for name in &report.conflicts {
-        println!("  kept this folder's settings for remote '{name}' (the backup's differ)");
+    for path in &report.kept {
+        println!("  kept the {path} already there (`mbr scan` records it as a new version)");
     }
     for (path, why) in &report.skipped {
         println!("  skipped {path}: {why}");
     }
-    println!(
-        "the previous database is in {}",
-        metadata::BEFORE_RESTORE_FILE
-    );
+    if password.is_none() {
+        println!("set the master password the remotes were made with: `mbr config password`");
+    }
     if report.files > 0 {
         println!("the files' content is still on the remotes: `mbr pull <remote>` downloads it");
     }
     Ok(())
+}
+
+fn plural(n: usize, what: &str) -> String {
+    format!("{n} {what}{}", if n == 1 { "" } else { "s" })
+}
+
+/// Ask for the master password and the settings of a remote of `backend`,
+/// and download the backup made with that password from it:
+/// `(database, rclone config, password)`. The remote is set up in a
+/// throwaway rclone config, since the backup brings the folder's own.
+fn download_backup(dir: &Path, backend: &str) -> Result<(Vec<u8>, Vec<u8>, String), String> {
+    let Some(backend) = mbr::backends::offered().find(|b| b.name == backend) else {
+        return Err(format!(
+            "unknown backend '{backend}' (see `mbr remote types`)"
+        ));
+    };
+    if dir.join(mbr::repo::DB_FILE).exists() {
+        return Err(format!(
+            "{} is already an mbr folder: restore into a new one",
+            dir.display()
+        ));
+    }
+    let password = rpassword::prompt_password("master password: ").map_err(|e| e.to_string())?;
+    println!("Where the backup is ({})", backend.title);
+    let values = ask_backend_form(backend)?;
+    let spec = mbr::backends::target_spec(backend, &values);
+    mbr::backends::check_target_spec(backend, &spec)?;
+    let parameters = mbr::backends::form_parameters(backend, &values);
+
+    let scratch = dir.join(mbr::repo::TMP_DIR);
+    let config = scratch.join("restore-rclone.conf");
+    std::fs::remove_file(&config).ok();
+    mbr::repo::ensure_rclone_config(&config)?;
+    let section = format!("{}restore", mbr::remotes::ROOT_PREFIX);
+    let sealed = mbr::rclone::with_config(&config, || {
+        let begun = mbr::rclone::begin_setup(&section, backend.name, parameters.clone());
+        answer_questions(&section, begun, &parameters, |outcome| outcome)?;
+        let name = metadata::backup_name(&password)?;
+        println!("downloading {name}…");
+        let location = mbr::remotes::root_location(&section, &spec);
+        metadata::download(&location, &name, &scratch)
+    });
+    std::fs::remove_file(&config).ok();
+    println!("decrypting…");
+    let (db, conf) = metadata::unseal(&sealed?, &password)?;
+    Ok((db, conf, password))
 }

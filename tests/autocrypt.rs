@@ -1,7 +1,7 @@
 //! Remotes set up the mbr way: a backend wrapped in an rclone crypt layer
 //! keyed with the master password, storing under the folder's own
-//! `mbr-<id>` directory. Backends are plain local directories driven
-//! through the embedded rclone.
+//! `mbr-<id>` directory, with metadata backups next to it. Backends are
+//! plain local directories driven through the embedded rclone.
 
 #![cfg(unix)]
 
@@ -43,17 +43,18 @@ impl Drop for TempDir {
 /// Set up remote `name` on the local folder `store`, as the frontends do.
 fn set_up(repo: &mut Repo, name: &str, store: &Path, encrypt: bool) -> Remote {
     let layout = Layout::new(name, encrypt).unwrap();
-    let location = remotes::location(&store.display().to_string(), &repo.folder_id().unwrap());
+    let folder_id = repo.folder_id().unwrap();
+    let spec = store.display().to_string();
     repo.with_rclone(|| {
         layout.check_unused()?;
-        let begun = rclone::begin_setup(&layout.backend_section(), "local", json!({}));
-        match layout.finish(begun, &location, PASSWORD)? {
+        let begun = rclone::begin_setup(&layout.root_section(), "local", json!({}));
+        match layout.finish(begun, &spec, &folder_id, PASSWORD)? {
             SetupOutcome::Done => Ok(()),
             SetupOutcome::Question(q) => Err(format!("unexpected question {}", q.name)),
         }
     })
     .unwrap();
-    repo.db.add_remote(name, &layout.target(&location)).unwrap();
+    repo.db.add_remote(name, &layout.target()).unwrap();
     repo.db.remote(name).unwrap().unwrap()
 }
 
@@ -85,24 +86,30 @@ fn encrypted_remotes_hide_content_and_names() {
     let hash = repo.db.active_path("cat.txt").unwrap().unwrap().hash;
 
     let remote = set_up(&mut repo, "disk", &store, true);
-    assert_eq!(remote.target, "_autocrypt-mbr-disk:");
+    assert_eq!(remote.target, "_crypt-mbr-disk:");
     assert_eq!(repo.encrypted_remotes().unwrap(), ["disk"]);
     let config = fs::read_to_string(repo.rclone_config_path()).unwrap();
-    assert!(config.contains("[_plain-mbr-disk]"), "{config}");
-    assert!(config.contains("[_autocrypt-mbr-disk]"), "{config}");
+    for section in ["[_root-mbr-disk]", "[_plain-mbr-disk]", "[_crypt-mbr-disk]"] {
+        assert!(config.contains(section), "{config}");
+    }
     assert!(!config.contains(PASSWORD), "the password is stored obscured");
 
     repo.push_blob(&remote, &hash).unwrap();
-    let id = repo.folder_id().unwrap();
-    let stored = files_under(&store.join(remotes::folder_dir(&id)));
+    let dir = store.join(remotes::folder_dir(&repo.folder_id().unwrap()));
+    let stored = files_under(&dir);
     assert_eq!(stored.len(), 1, "{stored:?}");
     assert!(!stored[0].contains(&hash[..8]), "names are encrypted: {stored:?}");
-    let raw = fs::read(store.join(remotes::folder_dir(&id)).join(&stored[0])).unwrap();
+    let raw = fs::read(dir.join(&stored[0])).unwrap();
     assert!(!raw.windows(4).any(|w| w == b"meow"), "content is encrypted");
 
     // It reads back through the crypt layer.
     assert!(repo.verify_on_remote(&remote, &hash).is_ok());
     assert_eq!(repo.scan_remote(&remote).unwrap().present, [hash]);
+    // Metadata backups go next to the folder's directory.
+    assert_eq!(
+        repo.with_rclone(|| remotes::backup_location(&remote.target)).unwrap(),
+        format!("_root-mbr-disk:{}", store.display())
+    );
 
     // Removing the remote deletes its rclone settings, not what it stores.
     repo.remove_remote("disk").unwrap();
@@ -122,22 +129,22 @@ fn unencrypted_remotes_store_in_the_clear() {
     let hash = repo.db.active_path("cat.txt").unwrap().unwrap().hash;
 
     let remote = set_up(&mut repo, "usb", &store, false);
-    let dir = remotes::folder_dir(&repo.folder_id().unwrap());
-    assert_eq!(
-        remote.target,
-        format!("_dangerouslyplain-mbr-usb:{}/{dir}", store.display())
-    );
+    assert_eq!(remote.target, "_dangerouslyplain-mbr-usb:");
     assert!(repo.encrypted_remotes().unwrap().is_empty());
     repo.push_blob(&remote, &hash).unwrap();
+    let dir = store.join(remotes::folder_dir(&repo.folder_id().unwrap()));
     assert_eq!(
-        files_under(&store.join(&dir)),
+        files_under(&dir),
         [rclone::blob_path(&hash)],
         "stored by hash, readable by anyone"
     );
+    repo.remove_remote("usb").unwrap();
+    let config = fs::read_to_string(repo.rclone_config_path()).unwrap();
+    assert!(!config.contains("mbr-usb"), "{config}");
 }
 
 #[test]
-fn a_lost_folder_is_found_again_through_its_encrypted_remote() {
+fn a_lost_folder_is_found_again_from_the_remote_and_the_password() {
     let tmp = TempDir::new("autocrypt-restore");
     let folder = tmp.sub("folder");
     let store = tmp.sub("store");
@@ -148,33 +155,42 @@ fn a_lost_folder_is_found_again_through_its_encrypted_remote() {
     for hash in repo.blobs_missing_on_remote("disk").unwrap() {
         repo.push_blob(&remote, &hash).unwrap();
     }
-    repo.db.set_metadata_remote("disk", true).unwrap();
-    let old_id = repo.folder_id().unwrap();
+    let folder_id = repo.folder_id().unwrap();
     let sealed = metadata::seal(&repo.metadata_snapshot().unwrap(), PASSWORD).unwrap();
+    let name = metadata::backup_name(PASSWORD).unwrap();
     let scratch = repo.scratch_dir();
-    repo.with_rclone(|| metadata::upload(&remote.target, &sealed, &scratch))
-        .unwrap();
+    repo.with_rclone(|| {
+        let location = remotes::backup_location(&remote.target)?;
+        metadata::upload(&location, &name, &sealed, &scratch)
+    })
+    .unwrap();
+    assert!(store.join(&name).is_file());
     drop(repo);
     fs::remove_dir_all(&folder).unwrap();
 
-    // A new folder, with the same remote set up again: it gets its own id,
-    // so its remote points next to the lost folder's directory.
+    // A new folder: the remote's settings go in a throwaway rclone config,
+    // and the backup is found by the password's backup name alone.
     let fresh = tmp.sub("fresh");
-    let mut repo = Repo::init(&fresh).unwrap();
-    let remote = set_up(&mut repo, "disk", &store, true);
-    assert_ne!(repo.folder_id().unwrap(), old_id);
-
-    let scratch = repo.scratch_dir();
-    let sealed = repo
-        .with_rclone(|| metadata::download(&remote.target, &scratch))
-        .unwrap();
+    let scratch = fresh.join(mbr::repo::TMP_DIR);
+    let config = scratch.join("restore-rclone.conf");
+    mbr::repo::ensure_rclone_config(&config).unwrap();
+    let section = format!("{}restore", remotes::ROOT_PREFIX);
+    let sealed = rclone::with_config(&config, || {
+        match rclone::begin_setup(&section, "local", json!({}))? {
+            SetupOutcome::Done => {}
+            SetupOutcome::Question(q) => return Err(format!("unexpected question {}", q.name)),
+        }
+        let location = remotes::root_location(&section, &store.display().to_string());
+        assert!(metadata::download(&location, "mbr-metadata-0.tar.gz.encrypted", &scratch).is_err());
+        metadata::download(&location, &metadata::backup_name(PASSWORD)?, &scratch)
+    })
+    .unwrap();
     let (db, conf) = metadata::unseal(&sealed, PASSWORD).unwrap();
-    let report = repo.restore_metadata(&db, &conf).unwrap();
+    let (mut repo, report) = metadata::restore(&fresh, &db, &conf).unwrap();
     assert_eq!(report.files, 1, "{:?}", report.skipped);
-    assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
 
-    // The new folder took on the old id, and its remote moved with it.
-    assert_eq!(repo.folder_id().unwrap(), old_id);
+    // It is the lost folder again, remotes and all.
+    assert_eq!(repo.folder_id().unwrap(), folder_id);
     let disk = repo.db.remote("disk").unwrap().unwrap();
     for hash in repo.blobs_missing_locally("disk").unwrap() {
         repo.fetch_blob_from(&disk, &hash).unwrap();

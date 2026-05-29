@@ -5,12 +5,17 @@ weight = 6
 nav = "command line"
 +++
 
-Everything the app does is also available from the `mbr` command. Every command except `init` works from anywhere
-inside an attached folder. Files can be named by path, by full hash, or by the first few characters of their hash (at
+Everything the app does is also available from the `mbr` command. Every command except `init` and `restore` works
+from anywhere inside an attached folder. Files can be named by path, by full hash, or by the first few characters of their hash (at
 least 6).
 
 ```
 mbr init [dir]                    attach mbr to a folder
+mbr restore [dir] (--from <type> | --backup FILE | --db FILE --rclone-conf FILE)
+                                  make a folder the one a metadata backup
+                                  describes: from a remote (asking for the
+                                  password and its settings), a backup file,
+                                  or the database and rclone config
 mbr scan                          take in new files, record removals
 mbr ls                            list tracked files
 mbr info <path|hash>              full details of one file
@@ -40,7 +45,6 @@ mbr config password               set the master password (before any remote)
 mbr metadata status               where metadata is backed up, and when
 mbr metadata add|rm <remote>...   choose the remotes for metadata backups
 mbr metadata backup               encrypt and upload the metadata
-mbr metadata restore <remote>     merge the backup on a remote into this folder
 ```
 
 `mbr gc --purge` deletes old versions and deleted files everywhere, remotes included, after asking you to confirm.

@@ -2,9 +2,10 @@
 //!
 //! Three tabs: **Blobs** (the annotated file listing, with multi-selection
 //! and a sidebar acting on the selected blobs), **Remotes** (listing,
-//! scanning, downloading from, adding, setting up and editing remotes) and
-//! **Metadata backup** (the master password, which remotes receive the
-//! encrypted database, and restoring a lost folder from one of them).
+//! scanning, downloading from, setting up and editing remotes) and
+//! **Settings** (the master password, and which remotes receive the
+//! encrypted metadata backups). A folder that isn't an mbr folder yet
+//! first asks whether to start anew there or restore a lost folder into it.
 //!
 //! Slow work — rclone operations (push / fetch / list / stat / config) and
 //! the filesystem half of a scan (hashing, moving files into the store) —
@@ -18,12 +19,12 @@ use mbr::db::Remote;
 use mbr::metadata;
 use mbr::rclone::RemoteBlob;
 use mbr::repo::{self, DropOutcome, LocalHealth, RemoteHealth, Repo};
-use mbr::state::{AppState, BackupRecord};
+use mbr::state::{AppState, BackupRecord, RepoState};
 use mbr::util;
 use slint::{Model, ModelRc, SharedString, VecModel};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc;
 
@@ -65,10 +66,7 @@ enum Msg {
     Done,
     /// A remote configuration step returned from librclone.
     Setup {
-        /// The mbr remote's name.
-        name: String,
-        /// mbr target to record once configuration completes.
-        target: String,
+        pending: PendingSetup,
         result: Result<mbr::rclone::SetupOutcome, String>,
     },
     /// The OAuth auth URL rclone logged while the browser flow runs.
@@ -83,10 +81,10 @@ enum Msg {
         db_hash: String,
         result: Result<(), String>,
     },
-    /// A metadata backup was downloaded and decrypted; on success, restore
-    /// it into the folder at `root`.
-    MetadataFetched {
-        root: PathBuf,
+    /// A metadata backup was read and decrypted (database, rclone config);
+    /// on success, restore it into `dir`.
+    BackupOpened {
+        dir: PathBuf,
         password: SecretString,
         result: Result<(Vec<u8>, Vec<u8>), String>,
     },
@@ -241,17 +239,108 @@ struct App {
     password: RefCell<Option<SecretString>>,
     /// The remote being set up, while rclone still asks questions.
     setup: RefCell<Option<PendingSetup>>,
+    /// A folder that isn't an mbr folder yet, while the user chooses to
+    /// start anew there or to restore into it.
+    pending_folder: RefCell<Option<PathBuf>>,
 }
 
 /// A remote in the middle of its setup.
 #[derive(Clone)]
 struct PendingSetup {
-    layout: mbr::remotes::Layout,
-    /// Where in the backend it stores, and the resulting mbr target.
-    location: String,
-    target: String,
-    /// The master password, to key the crypt layer with.
+    /// The rclone config it is set up in.
+    config_path: PathBuf,
+    /// The section rclone asks questions about: the backend itself.
+    section: String,
+    /// The bucket, share or folder named in the form.
+    spec: String,
+    /// The master password: keys the crypt layer, or names the backup.
     password: SecretString,
+    purpose: Purpose,
+}
+
+#[derive(Clone)]
+enum Purpose {
+    /// A new remote of the open folder.
+    Remote {
+        layout: mbr::remotes::Layout,
+        folder_id: String,
+    },
+    /// Reaching the remote holding the backup to restore `dir` from, in a
+    /// throwaway rclone config.
+    Restore { dir: PathBuf },
+}
+
+/// A step of a remote's setup.
+enum SetupStep {
+    Begin {
+        backend: &'static str,
+        parameters: serde_json::Value,
+    },
+    /// Answer rclone's pending question.
+    Continue {
+        state: String,
+        answer: String,
+        parameters: serde_json::Value,
+    },
+}
+
+/// Where a setup step got to.
+enum Reached {
+    Step(mbr::rclone::SetupOutcome),
+    /// The backup to restore from, downloaded.
+    Backup(Vec<u8>),
+}
+
+impl PendingSetup {
+    /// Run `step` (on a background thread): finish the remote's layers once
+    /// rclone is done with its backend, or for a restore, download the
+    /// backup made with the password from the place named.
+    fn run(&self, step: SetupStep, on_url: &mut dyn FnMut(String)) -> Result<Reached, String> {
+        mbr::rclone::with_config(&self.config_path, || {
+            let outcome = match step {
+                SetupStep::Begin {
+                    backend,
+                    parameters,
+                } => {
+                    if let Purpose::Remote { layout, .. } = &self.purpose {
+                        layout.check_unused()?;
+                    }
+                    mbr::rclone::begin_setup(&self.section, backend, parameters)
+                }
+                SetupStep::Continue {
+                    state,
+                    answer,
+                    parameters,
+                } => mbr::rclone::continue_setup_watching(
+                    &self.section,
+                    &state,
+                    &answer,
+                    parameters,
+                    on_url,
+                ),
+            };
+            let password = self.password.expose_secret();
+            match &self.purpose {
+                Purpose::Remote { layout, folder_id } => layout
+                    .finish(outcome, &self.spec, folder_id, password)
+                    .map(Reached::Step),
+                Purpose::Restore { dir } => match outcome? {
+                    mbr::rclone::SetupOutcome::Done => {
+                        let location = mbr::remotes::root_location(&self.section, &self.spec);
+                        let name = metadata::backup_name(password)?;
+                        metadata::download(&location, &name, &dir.join(repo::TMP_DIR))
+                            .map(Reached::Backup)
+                    }
+                    question => Ok(Reached::Step(question)),
+                },
+            }
+        })
+    }
+
+    /// The throwaway rclone config of a restore, to delete when done.
+    fn throwaway_config(&self) -> Option<&PathBuf> {
+        matches!(self.purpose, Purpose::Restore { .. }).then_some(&self.config_path)
+    }
 }
 
 /// The user guide, built from `docs/` and published to GitHub Pages.
@@ -292,6 +381,7 @@ fn main() -> Result<(), slint::PlatformError> {
         state: RefCell::new(AppState::load()),
         password: RefCell::new(None),
         setup: RefCell::new(None),
+        pending_folder: RefCell::new(None),
     });
 
     // ── message pump for background tasks ──
@@ -552,9 +642,34 @@ fn main() -> Result<(), slint::PlatformError> {
         let app = app.clone();
         w.on_backup_metadata(move || app.backup_metadata());
     }
+
+    // a folder that isn't an mbr folder yet
     {
         let app = app.clone();
-        w.on_restore_metadata(move |remote, password| app.restore_metadata(&remote, &password));
+        w.on_start_new(move || app.start_new());
+    }
+    {
+        let app = app.clone();
+        w.on_pick_restore_file(move |which| app.pick_restore_file(which));
+    }
+    {
+        let app = app.clone();
+        w.on_restore_from_files(move || app.restore_from_files());
+    }
+    {
+        let app = app.clone();
+        w.on_restore_from_backup(move |password| app.restore_from_backup(&password));
+    }
+    {
+        let app = app.clone();
+        w.on_restore_from_remote(move |backend, values, password| {
+            let values: Vec<SharedString> = values.iter().collect();
+            app.restore_from_remote(&backend, &values, &password);
+        });
+    }
+    {
+        let app = app.clone();
+        w.on_cancel_restore(move || app.cancel_restore());
     }
 
     // ── backend picker + initial form ──
@@ -614,27 +729,187 @@ impl App {
         self.repo.borrow().as_ref().map(Repo::rclone_config_path)
     }
 
-    /// Attach `dir`, initializing it first if it is not an mbr folder.
+    /// Open the mbr folder `dir`; for a folder that isn't one yet, offer to
+    /// start anew there or to restore a lost folder into it.
     fn attach(&self, dir: PathBuf) {
-        if !Repo::is_initialized(&dir) && !confirm_init(&dir) {
-            self.status(format!("Did not attach {}", dir.display()));
+        self.cancel_restore();
+        if Repo::is_initialized(&dir) {
+            match Repo::init(&dir) {
+                Ok(repo) => self.open_repo(repo),
+                Err(e) => self.status(format!("Error: {e}")),
+            }
             return;
         }
+        let dir = dir.canonicalize().unwrap_or(dir);
+        self.close_repo();
+        self.window
+            .set_pending_folder(dir.display().to_string().into());
+        self.status("Start a new mbr folder here, or restore a lost one into it");
+        *self.pending_folder.borrow_mut() = Some(dir);
+    }
+
+    /// Show `repo` as the open folder.
+    fn open_repo(&self, repo: Repo) {
+        *self.pending_folder.borrow_mut() = None;
+        self.window.set_pending_folder(SharedString::default());
+        self.state.borrow_mut().last_folder = Some(repo.root.clone());
+        self.save_state();
+        let saved = self.state.borrow().repo(&repo.root).password;
+        *self.password.borrow_mut() = saved.map(SecretString::from);
+        self.reset_setup_ui();
+        *self.repo.borrow_mut() = Some(repo);
+        *self.selection.borrow_mut() = Selection::default();
+        self.close_editor();
+        self.refresh();
+        self.rescan();
+    }
+
+    fn close_repo(&self) {
+        *self.repo.borrow_mut() = None;
+        *self.password.borrow_mut() = None;
+        *self.selection.borrow_mut() = Selection::default();
+        self.close_editor();
+        self.reset_setup_ui();
+        self.refresh();
+    }
+
+    // ── a folder that isn't an mbr folder yet ──
+
+    fn start_new(&self) {
+        let Some(dir) = self.pending_folder.borrow().clone() else { return };
         match Repo::init(&dir) {
             Ok(repo) => {
-                self.state.borrow_mut().last_folder = Some(repo.root.clone());
-                self.save_state();
-                let saved = self.state.borrow().repo(&repo.root).password;
-                *self.password.borrow_mut() = saved.map(SecretString::from);
-                *self.setup.borrow_mut() = None;
-                *self.repo.borrow_mut() = Some(repo);
-                *self.selection.borrow_mut() = Selection::default();
-                self.close_editor();
-                self.refresh();
-                self.rescan();
+                self.open_repo(repo);
+                self.status(format!("{} is now an mbr folder", dir.display()));
             }
             Err(e) => self.status(format!("Error: {e}")),
         }
+    }
+
+    /// Pick a file to restore from: 1 = the database, 2 = the rclone
+    /// config, 3 = an encrypted backup.
+    fn pick_restore_file(&self, which: i32) {
+        let Some(file) = rfd::FileDialog::new().pick_file() else { return };
+        let path = SharedString::from(file.display().to_string());
+        match which {
+            1 => self.window.set_restore_db_file(path),
+            2 => self.window.set_restore_conf_file(path),
+            _ => self.window.set_restore_backup_file(path),
+        }
+    }
+
+    fn restore_from_files(&self) {
+        let Some(dir) = self.pending_folder.borrow().clone() else { return };
+        let read = |path: SharedString| {
+            std::fs::read(path.as_str()).map_err(|e| format!("cannot read {path}: {e}"))
+        };
+        let files = read(self.window.get_restore_db_file())
+            .and_then(|db| Ok((db, read(self.window.get_restore_conf_file())?)));
+        match files {
+            Ok((db, conf)) => self.finish_restore(&dir, &db, &conf, None),
+            Err(e) => self.status(format!("Restore failed: {e}")),
+        }
+    }
+
+    /// Decrypt the chosen backup file in the background; it is restored
+    /// when it arrives (see [`Msg::BackupOpened`]).
+    fn restore_from_backup(&self, password: &str) {
+        let Some(dir) = self.pending_folder.borrow().clone() else { return };
+        let file = PathBuf::from(self.window.get_restore_backup_file().as_str());
+        let password = SecretString::from(password.to_owned());
+        self.status("Decrypting the backup…");
+        self.spawn(move |tx| {
+            let result = std::fs::read(&file)
+                .map_err(|e| format!("cannot read {}: {e}", file.display()))
+                .and_then(|sealed| metadata::unseal(&sealed, password.expose_secret()));
+            tx.send(Msg::BackupOpened {
+                dir,
+                password,
+                result,
+            })
+            .ok();
+        });
+    }
+
+    /// Set up the remote described by the form in a throwaway rclone config
+    /// and download the backup made with `password` from it.
+    fn restore_from_remote(&self, backend_name: &str, values: &[SharedString], password: &str) {
+        let Some(dir) = self.pending_folder.borrow().clone() else { return };
+        let Some((backend, spec)) = self.check_form(backend_name, values) else { return };
+        let config_path = dir.join(repo::TMP_DIR).join("restore-rclone.conf");
+        std::fs::remove_file(&config_path).ok();
+        if let Err(e) = repo::ensure_rclone_config(&config_path) {
+            self.status(format!("Error: {e}"));
+            return;
+        }
+        let pending = PendingSetup {
+            config_path,
+            section: format!("{}restore", mbr::remotes::ROOT_PREFIX),
+            spec,
+            password: SecretString::from(password.to_owned()),
+            purpose: Purpose::Restore { dir },
+        };
+        let parameters = backends::form_parameters(backend, values);
+        self.run_setup_step(
+            pending,
+            SetupStep::Begin {
+                backend: backend.name,
+                parameters,
+            },
+        );
+    }
+
+    /// Make the pending folder the one a decrypted backup describes.
+    fn finish_restore(&self, dir: &Path, db: &[u8], conf: &[u8], password: Option<SecretString>) {
+        let (repo, report) = match metadata::restore(dir, db, conf) {
+            Ok(restored) => restored,
+            Err(e) => {
+                self.status(format!("Restore failed: {e}"));
+                return;
+            }
+        };
+        {
+            // Nothing this machine knew about a folder at that path holds.
+            let mut state = self.state.borrow_mut();
+            let repo_state = state.repo_mut(&repo.root);
+            *repo_state = RepoState::default();
+            if let Some(password) = &password
+                && let Err(e) = repo_state.set_password(password.expose_secret())
+            {
+                log::warn!("cannot save the master password: {e}");
+            }
+        }
+        self.open_repo(repo);
+        let mut text = format!("Restored {} file(s)", report.files);
+        if report.files > 0 {
+            text += "; download them from the Remotes tab";
+        }
+        if !report.kept.is_empty() {
+            text += &format!(
+                "; {} already there kept as new versions",
+                report.kept.len()
+            );
+        }
+        if !report.skipped.is_empty() {
+            text += &format!("; {} skipped", report.skipped.len());
+        }
+        if password.is_none() {
+            text += "; set the master password in the Settings tab";
+        }
+        self.status(text);
+    }
+
+    /// Back to choosing how to start in the pending folder.
+    fn cancel_restore(&self) {
+        if self.setup.borrow().as_ref().is_some_and(|p| p.throwaway_config().is_some()) {
+            self.cancel_remote_setup();
+        }
+        let w = &self.window;
+        w.set_restore_mode(0);
+        w.set_restore_db_file(SharedString::default());
+        w.set_restore_conf_file(SharedString::default());
+        w.set_restore_backup_file(SharedString::default());
+        w.set_pw_restore(SharedString::default());
     }
 
     /// Start a scan: ingest on a background thread, then record the result
@@ -1073,7 +1348,9 @@ impl App {
         }
         self.status("Encrypting metadata…");
         self.spawn(move |tx| {
-            let sealed = match metadata::seal(&snapshot, password.expose_secret()) {
+            let sealed = metadata::seal(&snapshot, password.expose_secret())
+                .and_then(|sealed| Ok((sealed, metadata::backup_name(password.expose_secret())?)));
+            let (sealed, name) = match sealed {
                 Ok(sealed) => sealed,
                 Err(e) => {
                     tx.send(Msg::Status(format!("Metadata backup failed: {e}"))).ok();
@@ -1084,7 +1361,9 @@ impl App {
             let mut done = 0;
             let configured = mbr::rclone::with_config(&config_path, || {
                 for remote in remotes {
-                    let result = metadata::upload(&remote.target, &sealed, &scratch);
+                    let result = mbr::remotes::backup_location(&remote.target).and_then(
+                        |location| metadata::upload(&location, &name, &sealed, &scratch),
+                    );
                     if result.is_ok() {
                         done += 1;
                     }
@@ -1103,46 +1382,6 @@ impl App {
                 text += &format!("; error: {e}");
             }
             tx.send(Msg::Status(text)).ok();
-        });
-    }
-
-    /// Download and decrypt the backup on `remote_name` in the background;
-    /// it is merged in when it arrives (see [`Msg::MetadataFetched`]). An
-    /// empty `password` means the one this folder is unlocked with.
-    fn restore_metadata(&self, remote_name: &str, password: &str) {
-        let Some(remote) = self.remote(remote_name) else { return };
-        let Some((root, scratch)) = self
-            .repo
-            .borrow()
-            .as_ref()
-            .map(|repo| (repo.root.clone(), repo.scratch_dir()))
-        else {
-            return;
-        };
-        let Some(config_path) = self.config_path() else { return };
-        let password = if password.is_empty() {
-            match self.password.borrow().clone() {
-                Some(unlocked) => unlocked,
-                None => {
-                    self.status("Enter the backup's master password");
-                    return;
-                }
-            }
-        } else {
-            SecretString::from(password.to_owned())
-        };
-        self.status(format!("Fetching the metadata backup from '{remote_name}'…"));
-        self.spawn(move |tx| {
-            let result = mbr::rclone::with_config(&config_path, || {
-                metadata::download(&remote.target, &scratch)
-            })
-            .and_then(|sealed| metadata::unseal(&sealed, password.expose_secret()));
-            tx.send(Msg::MetadataFetched {
-                root,
-                password,
-                result,
-            })
-            .ok();
         });
     }
 
@@ -1543,11 +1782,14 @@ impl App {
 
     /// Show the hardcoded form for the backend picked by `title`.
     fn select_backend(&self, title: &str) {
-        let Some(backend) = backends::offered().find(|b| b.title == title) else {
+        let Some((index, backend)) = backends::offered().enumerate().find(|(_, b)| b.title == title)
+        else {
             return;
         };
         self.window
             .set_setup_backend(SharedString::from(backend.name));
+        // The picker is made anew each time it is shown: it starts here.
+        self.window.set_setup_backend_index(index as i32);
         if self.window.get_setup_state().is_empty() {
             self.show_form(backend.name);
         }
@@ -1578,8 +1820,33 @@ impl App {
         self.window.set_setup_active(true);
     }
 
+    /// The backend picked and the bucket/path named in its form, if the
+    /// form is filled in well enough to submit.
+    fn check_form(
+        &self,
+        backend_name: &str,
+        values: &[SharedString],
+    ) -> Option<(&'static Backend, String)> {
+        let Some(backend) = backends::offered().find(|b| b.name == backend_name) else {
+            self.status(format!("Unknown backend '{backend_name}'"));
+            return None;
+        };
+        for (field, value) in backend.fields.iter().zip(values.iter()) {
+            if field.required && value.trim().is_empty() {
+                self.status(format!("Error: '{}' is required", field.label));
+                return None;
+            }
+        }
+        let spec = backends::target_spec(backend, values);
+        if let Err(e) = backends::check_target_spec(backend, &spec) {
+            self.status(format!("Error: {e}"));
+            return None;
+        }
+        Some((backend, spec))
+    }
+
     /// Submit the filled form: hand every answer to rclone in one call,
-    /// then wrap the backend in a crypt layer (unless `plain`).
+    /// then add the layers mbr stores through (see [`mbr::remotes`]).
     fn submit_form(&self, name: &str, backend_name: &str, values: &[SharedString], plain: bool) {
         let Some(password) = self.password.borrow().clone() else {
             self.status("Set a master password in the Settings tab first");
@@ -1592,62 +1859,40 @@ impl App {
                 return;
             }
         };
-        let Some(backend) = backends::offered().find(|b| b.name == backend_name) else {
-            self.status(format!("Unknown backend '{backend_name}'"));
-            return;
-        };
-        for (field, value) in backend.fields.iter().zip(values.iter()) {
-            if field.required && value.trim().is_empty() {
-                self.status(format!("Error: '{}' is required", field.label));
-                return;
+        let Some((backend, spec)) = self.check_form(backend_name, values) else { return };
+        let prepared = {
+            let mut repo = self.repo.borrow_mut();
+            let Some(repo) = repo.as_mut() else { return };
+            match repo.db.remote(&layout.name) {
+                Ok(Some(_)) => Err(format!("remote '{}' already exists", layout.name)),
+                Ok(None) => repo
+                    .folder_id()
+                    .map(|folder_id| (folder_id, repo.rclone_config_path())),
+                Err(e) => Err(e),
             }
-        }
-        let spec = backends::target_spec(backend, values);
-        if let Err(e) = backends::check_target_spec(backend, &spec) {
-            self.status(format!("Error: {e}"));
-            return;
-        }
-        let folder_id = match self.repo.borrow_mut().as_mut().map(Repo::folder_id) {
-            Some(Ok(id)) => id,
-            Some(Err(e)) => {
+        };
+        let (folder_id, config_path) = match prepared {
+            Ok(prepared) => prepared,
+            Err(e) => {
                 self.status(format!("Error: {e}"));
                 return;
             }
-            None => return,
         };
-        let location = mbr::remotes::location(&spec, &folder_id);
         let pending = PendingSetup {
-            target: layout.target(&location),
-            layout,
-            location,
+            config_path,
+            section: layout.root_section(),
+            spec,
             password,
+            purpose: Purpose::Remote { layout, folder_id },
         };
-        *self.setup.borrow_mut() = Some(pending.clone());
         let parameters = backends::form_parameters(backend, values);
-        let backend_name = backend.name;
-        let name = pending.layout.name.clone();
-        self.run_setup_step(&name, |tx, config_path| {
-            Box::new(move || {
-                let PendingSetup {
-                    layout,
-                    location,
-                    target,
-                    password,
-                } = pending;
-                let result = mbr::rclone::with_config(&config_path, || {
-                    layout.check_unused()?;
-                    let begun =
-                        mbr::rclone::begin_setup(&layout.backend_section(), backend_name, parameters);
-                    layout.finish(begun, &location, password.expose_secret())
-                });
-                tx.send(Msg::Setup {
-                    name: layout.name,
-                    target,
-                    result,
-                })
-                .ok();
-            })
-        });
+        self.run_setup_step(
+            pending,
+            SetupStep::Begin {
+                backend: backend.name,
+                parameters,
+            },
+        );
     }
 
     /// Continue after answering a fallback question.
@@ -1658,84 +1903,78 @@ impl App {
             Some(b) => backends::form_parameters(b, &values),
             None => serde_json::json!({}),
         };
-        let state = state.to_owned();
-        let answer = answer.to_owned();
-        let name = pending.layout.name.clone();
-        self.run_setup_step(&name, |tx, config_path| {
-            Box::new(move || {
-                let mut on_url = |url| {
-                    let _ = tx.send(Msg::OAuthUrl(url));
-                };
-                let PendingSetup {
-                    layout,
-                    location,
-                    target,
-                    password,
-                } = pending;
-                let result = mbr::rclone::with_config(&config_path, || {
-                    let step = mbr::rclone::continue_setup_watching(
-                        &layout.backend_section(),
-                        &state,
-                        &answer,
-                        parameters,
-                        &mut on_url,
-                    );
-                    layout.finish(step, &location, password.expose_secret())
-                });
-                tx.send(Msg::Setup {
-                    name: layout.name,
-                    target,
-                    result,
-                })
-                .ok();
-            })
-        });
+        self.run_setup_step(
+            pending,
+            SetupStep::Continue {
+                state: state.to_owned(),
+                answer: answer.to_owned(),
+                parameters,
+            },
+        );
     }
 
-    /// Run one config-protocol step for remote `name` on a background thread.
-    fn run_setup_step(
-        &self,
-        name: &str,
-        step: impl FnOnce(mpsc::Sender<Msg>, PathBuf) -> Box<dyn FnOnce() + Send>,
-    ) {
-        let config_path = {
-            let mut repo = self.repo.borrow_mut();
-            let Some(repo) = repo.as_mut() else {
-                self.status("Cannot configure remote: no folder open");
-                return;
+    /// Run one config-protocol step on a background thread.
+    fn run_setup_step(&self, pending: PendingSetup, step: SetupStep) {
+        *self.setup.borrow_mut() = Some(pending.clone());
+        self.status(match pending.purpose {
+            Purpose::Remote { .. } => "Talking to rclone…",
+            Purpose::Restore { .. } => "Looking for the backup…",
+        });
+        self.spawn(move |tx| {
+            let mut on_url = |url| {
+                let _ = tx.send(Msg::OAuthUrl(url));
             };
-            if repo.db.remote(name).ok().flatten().is_some() {
-                self.status(format!("Error: remote '{name}' already exists"));
-                return;
+            let reached = pending.run(step, &mut on_url);
+            let finished = !matches!(
+                reached,
+                Ok(Reached::Step(mbr::rclone::SetupOutcome::Question(_)))
+            );
+            if finished && let Some(config) = pending.throwaway_config() {
+                std::fs::remove_file(config).ok();
             }
-            repo.rclone_config_path()
-        };
-        self.begin_task();
-        self.status("Talking to rclone…");
-        let tx = self.tx.clone();
-        let step = step(tx.clone(), config_path);
-        std::thread::spawn(move || {
-            step();
-            tx.send(Msg::Done).ok();
+            match (reached, &pending.purpose) {
+                (Ok(Reached::Backup(sealed)), Purpose::Restore { dir }) => {
+                    tx.send(Msg::Status("Decrypting the backup…".to_owned())).ok();
+                    let result = metadata::unseal(&sealed, pending.password.expose_secret());
+                    tx.send(Msg::BackupOpened {
+                        dir: dir.clone(),
+                        password: pending.password.clone(),
+                        result,
+                    })
+                    .ok();
+                }
+                (reached, _) => {
+                    let result = reached.and_then(|reached| match reached {
+                        Reached::Step(outcome) => Ok(outcome),
+                        Reached::Backup(_) => Err("unexpected backup".to_owned()),
+                    });
+                    tx.send(Msg::Setup { pending, result }).ok();
+                }
+            }
         });
     }
 
     fn cancel_remote_setup(&self) {
         let state = self.window.get_setup_state().to_string();
-        let section = self.setup.borrow().as_ref().map(|p| p.layout.backend_section());
-        let config_path = self.repo.borrow().as_ref().map(Repo::rclone_config_path);
+        let pending = self.setup.borrow().clone();
         self.reset_setup_ui();
-        if let (false, Some(section), Some(config_path)) = (state.is_empty(), section, config_path) {
-            self.begin_task();
-            let tx = self.tx.clone();
-            std::thread::spawn(move || {
-                let result = mbr::rclone::with_config(&config_path, || {
-                    mbr::rclone::cancel_setup(&section, &state)
-                });
-                tx.send(Msg::Cancelled { result }).ok();
-                tx.send(Msg::Done).ok();
-            });
+        let Some(pending) = pending else { return };
+        if state.is_empty() && pending.throwaway_config().is_none() {
+            return;
         }
+        self.spawn(move |tx| {
+            let result = if state.is_empty() {
+                Ok(())
+            } else {
+                mbr::rclone::with_config(&pending.config_path, || {
+                    mbr::rclone::cancel_setup(&pending.section, &state)
+                })
+            };
+            if let Some(config) = pending.throwaway_config() {
+                std::fs::remove_file(config).ok();
+            }
+            tx.send(Msg::Cancelled { result }).ok();
+        });
     }
 
     /// Clear the form and question panels.
@@ -1843,27 +2082,29 @@ impl App {
                 Ok(()) => self.finish_remote_edit(&old, &name, &target),
                 Err(e) => self.status(format!("Saving rclone settings failed: {e}")),
             },
-            Msg::Setup {
-                name,
-                target,
-                result,
-            } => match result {
+            Msg::Setup { pending, result } => match result {
                 Err(e) => {
                     self.window
                         .set_setup_help(SharedString::from(format!("Error: {e}")));
                     self.window.set_setup_state(SharedString::default());
-                    self.status(format!("Remote setup failed: {e}"));
+                    self.status(match pending.purpose {
+                        Purpose::Remote { .. } => format!("Remote setup failed: {e}"),
+                        Purpose::Restore { .. } => format!("Restore failed: {e}"),
+                    });
                 }
                 Ok(mbr::rclone::SetupOutcome::Done) => {
-                    self.with_repo("save remote", |repo| {
-                        repo.db.add_remote(&name, &target)?;
-                        Ok(format!(
-                            "Added remote {name} ({})",
-                            mbr::remotes::describe(&target)
-                        ))
-                    });
-                    self.reset_setup_ui();
-                    self.refresh();
+                    if let Purpose::Remote { layout, .. } = pending.purpose {
+                        let (name, target) = (layout.name.clone(), layout.target());
+                        self.with_repo("save remote", |repo| {
+                            repo.db.add_remote(&name, &target)?;
+                            Ok(format!(
+                                "Added remote {name} ({})",
+                                mbr::remotes::describe(&target)
+                            ))
+                        });
+                        self.reset_setup_ui();
+                        self.refresh();
+                    }
                 }
                 Ok(mbr::rclone::SetupOutcome::Question(q)) => {
                     self.window.set_setup_state(SharedString::from(q.state));
@@ -1905,63 +2146,17 @@ impl App {
                 }
                 Err(e) => self.status(format!("Metadata backup to {remote} failed: {e}")),
             },
-            Msg::MetadataFetched {
-                root,
+            Msg::BackupOpened {
+                dir,
                 password,
                 result,
             } => {
-                if self.root().as_ref() != Some(&root) {
+                if self.pending_folder.borrow().as_ref() != Some(&dir) {
                     return; // another folder was opened meanwhile
                 }
-                let (db, conf) = match result {
-                    Ok(plain) => plain,
-                    Err(e) => {
-                        self.status(format!("Restore failed: {e}"));
-                        return;
-                    }
-                };
-                let mut restored = false;
-                self.with_repo("restore", |repo| {
-                    let report = repo.restore_metadata(&db, &conf)?;
-                    restored = true;
-                    let mut text = format!(
-                        "Restored {} file(s) and {} remote(s), {} older version(s)",
-                        report.files, report.remotes, report.history
-                    );
-                    if report.files > 0 {
-                        text += "; download the files from the Remotes tab";
-                    }
-                    if !report.conflicts.is_empty() {
-                        text += &format!(
-                            "; kept this folder's settings for {}",
-                            report.conflicts.join(", ")
-                        );
-                    }
-                    if !report.skipped.is_empty() {
-                        text += &format!("; {} skipped", report.skipped.len());
-                    }
-                    Ok(text)
-                });
-                if restored {
-                    // A folder without a password adopts the backup's; one
-                    // with its own keeps it (the backup may predate a change).
-                    let check = self.state.borrow().repo(&root).password_check;
-                    let adopt = match check {
-                        None => true,
-                        Some(check) => metadata::password_matches(&check, password.expose_secret()),
-                    };
-                    if adopt
-                        && self
-                            .state
-                            .borrow_mut()
-                            .repo_mut(&root)
-                            .set_password(password.expose_secret())
-                            .is_ok()
-                    {
-                        self.save_state();
-                        *self.password.borrow_mut() = Some(password);
-                    }
-                    self.window.set_pw_restore(SharedString::default());
+                match result {
+                    Ok((db, conf)) => self.finish_restore(&dir, &db, &conf, Some(password)),
+                    Err(e) => self.status(format!("Restore failed: {e}")),
                 }
             }
             Msg::Dropped { size, result } => match result {
@@ -2055,7 +2250,13 @@ impl App {
     fn refresh(&self) {
         let mut repo = self.repo.borrow_mut();
         let Some(repo) = repo.as_mut() else {
-            self.window.set_folder(SharedString::default());
+            let w = &self.window;
+            w.set_folder(SharedString::default());
+            self.files.set_vec(Vec::new());
+            self.statuses.borrow_mut().clear();
+            w.set_remotes(ModelRc::default());
+            w.set_remote_names(ModelRc::default());
+            w.set_metadata_rows(ModelRc::default());
             return;
         };
         self.window
@@ -2134,7 +2335,6 @@ impl App {
         w.set_has_encrypted_remotes(
             repo.encrypted_remotes().is_ok_and(|names| !names.is_empty()),
         );
-        w.set_folder_empty(repo.is_empty_folder().unwrap_or(false));
 
         let (remotes, chosen) = match repo.db.list_remotes().and_then(|all| {
             let chosen: HashSet<String> =
@@ -2266,20 +2466,6 @@ fn file_row(s: &repo::FileStatus, selected: bool, min_copies: u32) -> FileRow {
         copies: s.copies() as i32,
         at_risk: s.copies() < min_copies as usize,
     }
-}
-
-fn confirm_init(dir: &std::path::Path) -> bool {
-    use rfd::MessageButtons;
-    rfd::MessageDialog::new()
-        .set_title("Attach to mbr?")
-        .set_description(format!(
-            "{} is not an mbr folder.\n\nAttaching it will move its files into a hidden .mbr/blob store and replace them with symlinks.\n\nInitialize it?",
-            dir.display()
-        ))
-        .set_level(rfd::MessageLevel::Warning)
-        .set_buttons(MessageButtons::YesNo)
-        .show()
-        == rfd::MessageDialogResult::Yes
 }
 
 #[cfg(test)]

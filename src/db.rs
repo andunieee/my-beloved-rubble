@@ -202,28 +202,6 @@ impl Db {
         self.conn.execute(&sql).map_err(|e| e.to_string())
     }
 
-    /// Insert a path row as-is, history included (used to merge backups).
-    pub fn insert_path_record(
-        &mut self,
-        path: &str,
-        hash: &str,
-        added_at: i64,
-        removed_at: Option<i64>,
-    ) -> Result<(), String> {
-        let removed_at = removed_at.map_or("NULL".to_owned(), |t| t.to_string());
-        let sql = format!(
-            "INSERT INTO paths (path, hash, added_at, removed_at) VALUES ({}, {}, {added_at}, {removed_at})",
-            quote(path),
-            quote(hash)
-        );
-        self.conn.execute(&sql).map_err(|e| e.to_string())
-    }
-
-    pub fn set_path_added_at(&mut self, id: i64, added_at: i64) -> Result<(), String> {
-        let sql = format!("UPDATE paths SET added_at = {added_at} WHERE id = {id}");
-        self.conn.execute(&sql).map_err(|e| e.to_string())
-    }
-
     pub fn mark_path_removed(&mut self, id: i64, removed_at: i64) -> Result<(), String> {
         let sql = format!("UPDATE paths SET removed_at = {removed_at} WHERE id = {id}");
         self.conn.execute(&sql).map_err(|e| e.to_string())
@@ -451,18 +429,6 @@ impl Db {
         let sql = format!("SELECT value FROM settings WHERE key = {}", quote(key));
         let r = self.conn.query(&sql).map_err(|e| e.to_string())?;
         Ok(r.rows.first().and_then(|row| as_text(&row[0])))
-    }
-
-    /// Every `(key, value)` setting.
-    pub fn list_settings(&mut self) -> Result<Vec<(String, String)>, String> {
-        let r = self
-            .conn
-            .query("SELECT key, value FROM settings ORDER BY key")
-            .map_err(|e| e.to_string())?;
-        Ok(r.rows
-            .iter()
-            .filter_map(|row| Some((as_text(&row[0])?, as_text(&row[1])?)))
-            .collect())
     }
 
     pub fn set_setting(&mut self, key: &str, value: &str) -> Result<(), String> {

@@ -4,27 +4,32 @@
 //! never shown by name:
 //!
 //! ```text
-//! [_plain-mbr-drive]       the backend itself (Google Drive, S3, …)
-//! [_autocrypt-mbr-drive]   type = crypt
-//!                          remote = _plain-mbr-drive:<bucket/>mbr-<folder id>
-//!                          password = the master password (obscured)
+//! [_root-mbr-drive]    the backend itself (Google Drive, S3, …), at its root
+//! [_plain-mbr-drive]   type = alias
+//!                      remote = _root-mbr-drive:<bucket/>mbr-<folder id>
+//! [_crypt-mbr-drive]   type = crypt
+//!                      remote = _plain-mbr-drive:
+//!                      password = the master password (obscured)
 //! ```
 //!
-//! and the mbr remote `drive` targets `_autocrypt-mbr-drive:`, so every blob
-//! and metadata backup is encrypted, names included. A remote deliberately
-//! created without encryption is the single section
-//! `_dangerouslyplain-mbr-drive`, targeted at
-//! `_dangerouslyplain-mbr-drive:<bucket/>mbr-<folder id>`.
+//! The mbr remote `drive` targets `_crypt-mbr-drive:`, so every blob is
+//! encrypted, names included. A remote deliberately created without
+//! encryption has `_dangerouslyplain-mbr-drive` (an alias like
+//! `_plain-mbr-drive`) in place of the last two, and targets that.
 //!
 //! The folder id ([`Repo::folder_id`]) is random and kept in the database,
-//! so several folders can share one storage account without mixing.
+//! so several folders can share one storage account without mixing. Metadata
+//! backups don't go in the folder's directory but next to it, in the
+//! bucket or folder the user named (see [`backup_location`]): a lost folder
+//! is found again from the remote's settings and the master password alone.
 
 use crate::rclone::{self, SetupOutcome};
-use crate::repo::{self, Repo};
-use serde_json::json;
+use crate::repo::Repo;
+use serde_json::{Value, json};
 
+pub const ROOT_PREFIX: &str = "_root-mbr-";
 pub const PLAIN_PREFIX: &str = "_plain-mbr-";
-pub const CRYPT_PREFIX: &str = "_autocrypt-mbr-";
+pub const CRYPT_PREFIX: &str = "_crypt-mbr-";
 pub const DANGEROUS_PREFIX: &str = "_dangerouslyplain-mbr-";
 /// Database setting holding the folder id.
 pub const FOLDER_ID_SETTING: &str = "folder_id";
@@ -64,7 +69,12 @@ impl Layout {
     }
 
     /// The section holding the backend (credentials, endpoint, …).
-    pub fn backend_section(&self) -> String {
+    pub fn root_section(&self) -> String {
+        format!("{ROOT_PREFIX}{}", self.name)
+    }
+
+    /// The alias for the folder's own directory in the backend.
+    pub fn store_section(&self) -> String {
         let prefix = if self.encrypt { PLAIN_PREFIX } else { DANGEROUS_PREFIX };
         format!("{prefix}{}", self.name)
     }
@@ -73,22 +83,23 @@ impl Layout {
         format!("{CRYPT_PREFIX}{}", self.name)
     }
 
-    /// Every section this remote is made of.
+    /// Every section this remote is made of, in creation order.
     pub fn sections(&self) -> Vec<String> {
-        let mut sections = vec![self.backend_section()];
+        let mut sections = vec![self.root_section(), self.store_section()];
         if self.encrypt {
             sections.push(self.crypt_section());
         }
         sections
     }
 
-    /// The mbr target of the remote, given where in the backend it stores.
-    pub fn target(&self, location: &str) -> String {
-        if self.encrypt {
-            format!("{}:", self.crypt_section())
+    /// The mbr target of the remote.
+    pub fn target(&self) -> String {
+        let section = if self.encrypt {
+            self.crypt_section()
         } else {
-            format!("{}:{location}", self.backend_section())
-        }
+            self.store_section()
+        };
+        format!("{section}:")
     }
 
     /// Refuse to set up a remote whose sections exist already. Run with
@@ -105,20 +116,25 @@ impl Layout {
         Ok(())
     }
 
-    /// Complete a setup step of the backend section: once rclone is done
-    /// with it, add the crypt layer keyed with `password`. If that fails,
-    /// the backend section is deleted again, so no half-made remote stays.
+    /// Complete a setup step of the root section: once rclone is done with
+    /// it, add the alias for the folder's directory (inside `spec`, the
+    /// bucket or folder the user named) and the crypt layer keyed with
+    /// `password`. If that fails, every section made so far is deleted
+    /// again, so no half-made remote stays.
     pub fn finish(
         &self,
         outcome: Result<SetupOutcome, String>,
-        location: &str,
+        spec: &str,
+        folder_id: &str,
         password: &str,
     ) -> Result<SetupOutcome, String> {
         match outcome {
-            Ok(SetupOutcome::Done) if self.encrypt => {
-                let created = self.create_crypt(location, password);
+            Ok(SetupOutcome::Done) => {
+                let created = self.create_layers(spec, folder_id, password);
                 if created.is_err() {
-                    rclone::delete_remote(&self.backend_section()).ok();
+                    for section in self.sections() {
+                        rclone::delete_remote(&section).ok();
+                    }
                 }
                 created.map(|()| SetupOutcome::Done)
             }
@@ -126,19 +142,32 @@ impl Layout {
         }
     }
 
-    fn create_crypt(&self, location: &str, password: &str) -> Result<(), String> {
-        let parameters = json!({
-            "remote": format!("{}:{location}", self.backend_section()),
-            "password": password,
-            "filename_encryption": "standard",
-            "directory_name_encryption": "true",
-        });
-        match rclone::begin_setup(&self.crypt_section(), "crypt", parameters)? {
-            SetupOutcome::Done => Ok(()),
-            SetupOutcome::Question(q) => {
-                rclone::cancel_setup(&self.crypt_section(), &q.state).ok();
-                Err(format!("rclone asked '{}' while setting up encryption", q.name))
-            }
+    fn create_layers(&self, spec: &str, folder_id: &str, password: &str) -> Result<(), String> {
+        let store = format!("{}:{}", self.root_section(), location(spec, folder_id));
+        create(&self.store_section(), "alias", json!({ "remote": store }))?;
+        if self.encrypt {
+            create(
+                &self.crypt_section(),
+                "crypt",
+                json!({
+                    "remote": format!("{}:", self.store_section()),
+                    "password": password,
+                    "filename_encryption": "standard",
+                    "directory_name_encryption": "true",
+                }),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Create a section that needs no questions answered.
+fn create(section: &str, backend: &str, parameters: Value) -> Result<(), String> {
+    match rclone::begin_setup(section, backend, parameters)? {
+        SetupOutcome::Done => Ok(()),
+        SetupOutcome::Question(q) => {
+            rclone::cancel_setup(section, &q.state).ok();
+            Err(format!("rclone asked '{}' while setting up {backend}", q.name))
         }
     }
 }
@@ -148,15 +177,13 @@ pub fn folder_dir(folder_id: &str) -> String {
     format!("mbr-{folder_id}")
 }
 
-/// The folder id in a directory name made by [`folder_dir`].
-pub fn parse_folder_dir(dir: &str) -> Option<&str> {
-    let id = dir.strip_prefix("mbr-")?;
-    let valid = id.len() == 12 && id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'));
-    valid.then_some(id)
+/// Whether `id` looks like a folder id: 12 lowercase hex digits.
+pub fn is_folder_id(id: &str) -> bool {
+    id.len() == 12 && id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
 }
 
-/// Where in a backend mbr stores: the folder's directory, inside the
-/// bucket, share or local folder the user named, if any.
+/// Where in a backend the folder's directory is: inside the bucket, share
+/// or local folder the user named, if any.
 pub fn location(spec: &str, folder_id: &str) -> String {
     let dir = folder_dir(folder_id);
     let spec = spec.trim();
@@ -167,10 +194,51 @@ pub fn location(spec: &str, folder_id: &str) -> String {
     }
 }
 
+/// The rclone path of the place the user named (bucket, share, local
+/// folder or nothing) in root section `section`: where metadata backups go.
+pub fn root_location(section: &str, spec: &str) -> String {
+    format!("{section}:{}", spec.trim())
+}
+
+/// `value` (an alias's `remote`) without its folder directory: the
+/// [`root_location`] it was made from.
+fn parent_location(value: &str) -> Option<String> {
+    let cut = value.rfind(['/', ':'])?;
+    let (head, own) = (&value[..cut], &value[cut + 1..]);
+    if !own.strip_prefix("mbr-").is_some_and(is_folder_id) {
+        return None;
+    }
+    Some(if value[cut..].starts_with(':') {
+        format!("{head}:")
+    } else if head.ends_with(':') {
+        format!("{head}/")
+    } else {
+        head.to_owned()
+    })
+}
+
+/// Where metadata backups go for a remote targeted at `target`: the root
+/// of its backend, next to the folder's directory. Remotes not set up by
+/// mbr this way keep them in the target itself. Run with the folder's
+/// rclone config selected.
+pub fn backup_location(target: &str) -> Result<String, String> {
+    let Some(store) = store_section(target) else {
+        return Ok(target.to_owned());
+    };
+    let config = rclone::remote_config(&store)?
+        .ok_or_else(|| format!("the rclone settings '{store}' are missing"))?;
+    let value = config
+        .get("remote")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    parent_location(value)
+        .ok_or_else(|| format!("the rclone settings '{store}' point at an unexpected '{value}'"))
+}
+
 /// How a remote's target protects what it stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protection {
-    /// Through an `_autocrypt-mbr-` section.
+    /// Through a `_crypt-mbr-` section.
     Encrypted,
     /// A `_dangerouslyplain-mbr-` section, by the user's choice.
     Plain,
@@ -178,12 +246,19 @@ pub enum Protection {
     Unknown,
 }
 
-pub fn protection(target: &str) -> Protection {
-    match rclone::target_section(target) {
-        Some(s) if s.starts_with(CRYPT_PREFIX) => Protection::Encrypted,
-        Some(s) if s.starts_with(DANGEROUS_PREFIX) => Protection::Plain,
-        _ => Protection::Unknown,
+/// How `target` protects what it stores, and the user's name for the
+/// remote behind it, if mbr laid it out.
+fn base_name(target: &str) -> Option<(Protection, &str)> {
+    let section = rclone::target_section(target)?;
+    if let Some(name) = section.strip_prefix(CRYPT_PREFIX) {
+        Some((Protection::Encrypted, name))
+    } else {
+        Some((Protection::Plain, section.strip_prefix(DANGEROUS_PREFIX)?))
     }
+}
+
+pub fn protection(target: &str) -> Protection {
+    base_name(target).map_or(Protection::Unknown, |(protection, _)| protection)
 }
 
 /// A short description of a target, for listings: mbr's own sections are
@@ -196,64 +271,42 @@ pub fn describe(target: &str) -> String {
     }
 }
 
-/// The section holding the backend settings behind a target: for an
-/// encrypted remote, the one under the crypt layer.
-pub fn settings_section(target: &str) -> Option<String> {
-    let section = rclone::target_section(target)?;
-    Some(match section.strip_prefix(CRYPT_PREFIX) {
-        Some(name) => format!("{PLAIN_PREFIX}{name}"),
-        None => section.to_owned(),
+/// The alias section for the folder's directory behind a target.
+fn store_section(target: &str) -> Option<String> {
+    let (protection, name) = base_name(target)?;
+    Some(match protection {
+        Protection::Encrypted => format!("{PLAIN_PREFIX}{name}"),
+        _ => format!("{DANGEROUS_PREFIX}{name}"),
     })
+}
+
+/// The section holding the backend settings behind a target.
+pub fn settings_section(target: &str) -> Option<String> {
+    match base_name(target) {
+        Some((_, name)) => Some(format!("{ROOT_PREFIX}{name}")),
+        None => rclone::target_section(target).map(str::to_owned),
+    }
 }
 
 /// The sections mbr made for a target, to delete along with the remote.
 pub fn owned_sections(target: &str) -> Vec<String> {
-    let Some(section) = rclone::target_section(target) else {
+    let Some((protection, name)) = base_name(target) else {
         return Vec::new();
     };
-    if let Some(name) = section.strip_prefix(CRYPT_PREFIX) {
-        vec![section.to_owned(), format!("{PLAIN_PREFIX}{name}")]
-    } else if section.starts_with(DANGEROUS_PREFIX) {
-        vec![section.to_owned()]
-    } else {
-        Vec::new()
+    let mut sections = Vec::new();
+    if protection == Protection::Encrypted {
+        sections.push(format!("{CRYPT_PREFIX}{name}"));
     }
-}
-
-/// `value` with its last path component `old_dir` replaced by `new_dir`,
-/// if it ends with it.
-fn retarget(value: &str, old_dir: &str, new_dir: &str) -> Option<String> {
-    let head = value.strip_suffix(old_dir)?;
-    (head.ends_with(':') || head.ends_with('/')).then(|| format!("{head}{new_dir}"))
-}
-
-/// An rclone config with the `remote` of every crypt section mbr made
-/// moved from `old_dir` to `new_dir`.
-fn retarget_crypt_sections(config: &str, old_dir: &str, new_dir: &str) -> String {
-    let mut out = String::with_capacity(config.len());
-    let mut in_crypt = false;
-    for line in config.split_inclusive('\n') {
-        let trimmed = line.trim();
-        if let Some(name) = trimmed.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            in_crypt = name.starts_with(CRYPT_PREFIX);
-        } else if in_crypt
-            && let Some((key, value)) = trimmed.split_once('=')
-            && key.trim() == "remote"
-            && let Some(value) = retarget(value.trim(), old_dir, new_dir)
-        {
-            out.push_str(&format!("remote = {value}\n"));
-            continue;
-        }
-        out.push_str(line);
-    }
-    out
+    sections.extend(store_section(target));
+    sections.push(format!("{ROOT_PREFIX}{name}"));
+    sections
 }
 
 impl Repo {
     /// This folder's id (12 hex digits), made on first use.
     pub fn folder_id(&mut self) -> Result<String, String> {
         if let Some(id) = self.db.setting(FOLDER_ID_SETTING)?
-            && parse_folder_dir(&folder_dir(&id)).is_some()
+            && is_folder_id(&id)
         {
             return Ok(id);
         }
@@ -263,37 +316,6 @@ impl Repo {
         let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         self.db.set_setting(FOLDER_ID_SETTING, &id)?;
         Ok(id)
-    }
-
-    /// Take on `id` as this folder's id, moving the remotes set up for the
-    /// old one over to it. Used when restoring a lost folder into a new
-    /// one: its remotes were set up before the old id was known.
-    pub fn adopt_folder_id(&mut self, id: &str) -> Result<(), String> {
-        if parse_folder_dir(&folder_dir(id)).is_none() {
-            return Err(format!("'{id}' is not a folder id"));
-        }
-        let old = match self.db.setting(FOLDER_ID_SETTING)? {
-            Some(old) if old == id => return Ok(()),
-            Some(old) => old,
-            None => return self.db.set_setting(FOLDER_ID_SETTING, id),
-        };
-        let (old_dir, new_dir) = (folder_dir(&old), folder_dir(id));
-
-        let path = self.rclone_config_path();
-        let config = std::fs::read_to_string(&path).unwrap_or_default();
-        std::fs::write(&path, retarget_crypt_sections(&config, &old_dir, &new_dir))
-            .map_err(|e| format!("cannot write {}: {e}", repo::RCLONE_CONFIG_FILE))?;
-        repo::ensure_rclone_config(&path)?;
-        rclone::forget_cached_remotes()?;
-
-        self.db.transaction(|db| {
-            for remote in db.list_remotes()? {
-                if let Some(target) = retarget(&remote.target, &old_dir, &new_dir) {
-                    db.update_remote(&remote.name, &remote.name, &target)?;
-                }
-            }
-            db.set_setting(FOLDER_ID_SETTING, id)
-        })
     }
 
     /// Remotes encrypted with the master password, which therefore can't
@@ -338,15 +360,33 @@ mod tests {
     #[test]
     fn names_and_sections() {
         let encrypted = Layout::new("drive", true).unwrap();
-        assert_eq!(encrypted.sections(), ["_plain-mbr-drive", "_autocrypt-mbr-drive"]);
-        assert_eq!(encrypted.target("x/mbr-0123456789ab"), "_autocrypt-mbr-drive:");
+        assert_eq!(
+            encrypted.sections(),
+            ["_root-mbr-drive", "_plain-mbr-drive", "_crypt-mbr-drive"]
+        );
+        assert_eq!(encrypted.target(), "_crypt-mbr-drive:");
         let plain = Layout::new("usb", false).unwrap();
-        assert_eq!(plain.sections(), ["_dangerouslyplain-mbr-usb"]);
-        assert_eq!(plain.target("/mnt/mbr-0"), "_dangerouslyplain-mbr-usb:/mnt/mbr-0");
+        assert_eq!(plain.sections(), ["_root-mbr-usb", "_dangerouslyplain-mbr-usb"]);
+        assert_eq!(plain.target(), "_dangerouslyplain-mbr-usb:");
         for bad in ["", "_x", "-x", "a b", "a:b", "a/b"] {
             assert!(check_name(bad).is_err(), "{bad}");
         }
         assert!(check_name("my.drive_2-b").is_ok());
+
+        assert_eq!(
+            owned_sections("_crypt-mbr-drive:"),
+            ["_crypt-mbr-drive", "_plain-mbr-drive", "_root-mbr-drive"]
+        );
+        assert_eq!(
+            owned_sections("_dangerouslyplain-mbr-usb:"),
+            ["_dangerouslyplain-mbr-usb", "_root-mbr-usb"]
+        );
+        assert_eq!(owned_sections("old:bucket"), Vec::<String>::new());
+        assert_eq!(
+            settings_section("_crypt-mbr-drive:").as_deref(),
+            Some("_root-mbr-drive")
+        );
+        assert_eq!(settings_section("old:bucket").as_deref(), Some("old"));
     }
 
     #[test]
@@ -356,32 +396,22 @@ mod tests {
         assert_eq!(location("bucket/", id), "bucket/mbr-0123456789ab");
         assert_eq!(location("/mnt/disk", id), "/mnt/disk/mbr-0123456789ab");
         assert_eq!(location("/", id), "/mbr-0123456789ab");
-        assert_eq!(parse_folder_dir("mbr-0123456789ab"), Some(id));
-        assert_eq!(parse_folder_dir("mbr-0123456789AB"), None);
-        assert_eq!(parse_folder_dir("mbr-metadata"), None);
+        assert!(is_folder_id(id));
+        assert!(!is_folder_id("0123456789AB"));
 
-        assert_eq!(describe("_autocrypt-mbr-drive:"), "encrypted");
-        assert_eq!(describe("_dangerouslyplain-mbr-usb:mbr-x"), "NOT encrypted");
+        // Backups go where the folder directory was made from.
+        for spec in ["", "bucket", "/mnt/disk", "/"] {
+            let alias = format!("_root-mbr-d:{}", location(spec, id));
+            assert_eq!(
+                parent_location(&alias).unwrap(),
+                root_location("_root-mbr-d", spec),
+                "{spec}"
+            );
+        }
+        assert_eq!(parent_location("_root-mbr-d:bucket/other"), None);
+
+        assert_eq!(describe("_crypt-mbr-drive:"), "encrypted");
+        assert_eq!(describe("_dangerouslyplain-mbr-usb:"), "NOT encrypted");
         assert_eq!(describe("old:bucket"), "old:bucket");
-        assert_eq!(
-            settings_section("_autocrypt-mbr-drive:").as_deref(),
-            Some("_plain-mbr-drive")
-        );
-        assert_eq!(owned_sections("old:bucket"), Vec::<String>::new());
-    }
-
-    #[test]
-    fn retargeting_moves_only_the_folder_directory() {
-        let (old, new) = ("mbr-000000000000", "mbr-111111111111");
-        assert_eq!(retarget("s:b/mbr-000000000000", old, new).unwrap(), "s:b/mbr-111111111111");
-        assert_eq!(retarget("s:mbr-000000000000", old, new).unwrap(), "s:mbr-111111111111");
-        assert_eq!(retarget("s:xmbr-000000000000", old, new), None);
-        let config = "[_autocrypt-mbr-d]\ntype = crypt\nremote = _plain-mbr-d:b/mbr-000000000000\n\n\
-                      [other]\nremote = x:mbr-000000000000\n";
-        assert_eq!(
-            retarget_crypt_sections(config, old, new),
-            "[_autocrypt-mbr-d]\ntype = crypt\nremote = _plain-mbr-d:b/mbr-111111111111\n\n\
-             [other]\nremote = x:mbr-000000000000\n"
-        );
     }
 }
