@@ -30,8 +30,10 @@ Remotes set up in the app are always encrypted. An unencrypted remote, storing f
 anyone with access to it, can only be made from the [command line](../cli/) with `mbr remote setup --unencrypted`.
 It is meant for disks you keep yourself.
 
-Services that sign in through the browser (Google Drive, Dropbox, OneDrive, …) open a browser window once you save.
-If one doesn't open, the link is shown in the app. If rclone needs anything else, it asks in a box below the form.
+Services that sign in through the browser (Google Drive, Dropbox, OneDrive, …) have little or nothing to fill in, and
+open a browser window once you save. If one doesn't open, the link is shown in the app. Their less common settings
+(your own OAuth client id, a service account, …) can be given from the [command line](../cli/) with
+`mbr remote setup <name> <type> --set KEY=VALUE`. If rclone needs anything else, it asks in a box below the form.
 
 Each folder keeps its own rclone settings in `.mbr/rclone.conf`, separate from any other rclone configuration on the
 computer. The remotes there have names starting with `_root-mbr-` (the storage itself), `_plain-mbr-` (the folder's

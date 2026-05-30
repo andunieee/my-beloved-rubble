@@ -11,7 +11,10 @@
 //!
 //! Backends whose setup needs an interactive browser flow (OAuth) still
 //! appear here; `rclone` handles their extra prompts through the question
-//! fallback in [`crate::rclone`].
+//! fallback in [`crate::rclone`]. Their forms leave out what the sign-in
+//! makes unnecessary (OAuth client ids, service accounts, tuning), as do
+//! the others for fields rclone says to leave blank: those are set with
+//! `mbr remote setup --set KEY=VALUE` instead.
 
 /// How a field's value is sent to rclone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,23 +96,13 @@ pub const BACKENDS: &[Backend] = &[
         Field { name: "hard_delete", label: "Hard Delete", help: "Permanently delete files on remote removal, otherwise hide files.", kind: Kind::Text, default: "false", examples: &[], required: false, to_target: false },
         Field { name: "bucket", label: "Bucket", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: true, to_target: true },
     ] },
-    Backend { name: "box", title: "Box", description: "Box", fields: &[
-        Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "box_config_file", label: "Box Config File", help: "Box App config.json location Leave blank normally. Leading `~` will be expanded in the file name as will environment variables such as `${RCLONE_CONFIG_DIR}`.", kind: Kind::Text, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "access_token", label: "Access Token", help: "Box App Primary Access Token Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "box_sub_type", label: "Box Sub Type", help: "Box Sub Type", kind: Kind::Choice, default: "user", examples: &["user", "enterprise"], required: false, to_target: false },
-    ] },
+    Backend { name: "box", title: "Box", description: "Box", fields: &[] },
     Backend { name: "chunker", title: "Chunker", description: "Transparently chunk/split large files", fields: &[
         Field { name: "remote", label: "Remote", help: "Remote to chunk/unchunk. Normally should contain a ':' and a path, e.g. \"myremote:path/to/dir\", \"myremote:bucket\" or maybe \"myremote:\" (not recommended).", kind: Kind::Text, default: "", examples: &[], required: true, to_target: false },
         Field { name: "chunk_size", label: "Chunk Size", help: "Files larger than chunk size will be split in chunks.", kind: Kind::Text, default: "2Gi", examples: &[], required: false, to_target: false },
         Field { name: "hash_type", label: "Hash Type", help: "Choose how chunker handles hash sums. All modes but \"none\" require metadata.", kind: Kind::Choice, default: "md5", examples: &["none", "md5", "sha1", "md5all", "sha1all", "md5quick", "sha1quick"], required: false, to_target: false },
     ] },
-    Backend { name: "sharefile", title: "Citrix ShareFile", description: "Citrix Sharefile", fields: &[
-        Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "root_folder_id", label: "Root Folder ID", help: "ID of the root folder. Leave blank to access \"Personal Folders\". You can use one of the standard values here or any folder ID (long hex number ID).", kind: Kind::Secret, default: "", examples: &["", "favorites", "allshared", "connectors", "top"], required: false, to_target: false },
-    ] },
+    Backend { name: "sharefile", title: "Citrix ShareFile", description: "Citrix Sharefile", fields: &[] },
     Backend { name: "cloudinary", title: "Cloudinary", description: "Cloudinary", fields: &[
         Field { name: "cloud_name", label: "Cloud Name", help: "Cloudinary Environment Name", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "api_key", label: "API Key", help: "Cloudinary API Key", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
@@ -131,14 +124,9 @@ pub const BACKENDS: &[Backend] = &[
         Field { name: "password", label: "Password", help: "Password or pass phrase for encryption.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "password2", label: "Password2", help: "Password or pass phrase for salt. Optional but recommended. Should be different to the previous password.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
     ] },
-    Backend { name: "dropbox", title: "Dropbox", description: "Dropbox", fields: &[
-        Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-    ] },
+    Backend { name: "dropbox", title: "Dropbox", description: "Dropbox", fields: &[] },
     Backend { name: "filefabric", title: "Enterprise File Fabric", description: "Enterprise File Fabric", fields: &[
         Field { name: "url", label: "URL", help: "URL of the Enterprise File Fabric to connect to.", kind: Kind::Choice, default: "", examples: &["https://storagemadeeasy.com", "https://eu.storagemadeeasy.com", "https://yourfabric.smestorage.com"], required: true, to_target: false },
-        Field { name: "root_folder_id", label: "Root Folder ID", help: "ID of the root folder. Leave blank normally. Fill in to make rclone start with directory of a given ID.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "permanent_token", label: "Permanent Token", help: "Permanent Authentication Token. A Permanent Authentication Token can be created in the Enterprise File Fabric, on the users Dashboard under Security, there is an entry you'll see called \"My Authentication Tokens\". Click the Manage button to create one. These tokens are normally valid for several yea…", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
     ] },
     Backend { name: "ftp", title: "FTP", description: "FTP", fields: &[
         Field { name: "host", label: "Host", help: "FTP host to connect to. E.g. \"ftp.example.com\".", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
@@ -157,31 +145,11 @@ pub const BACKENDS: &[Backend] = &[
         Field { name: "access_token", label: "Access Token", help: "API Access token You can get this from the web control panel.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
     ] },
     Backend { name: "gcs", title: "Google Cloud Storage", description: "GCS buckets (uses the embedded rclone's OAuth client)", fields: &[
-        Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "project_number", label: "Project Number", help: "Project number. Optional - needed only for list/create/delete buckets - see your developer console.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "user_project", label: "User Project", help: "User project. Optional - needed only for requester pays.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "service_account_file", label: "Service Account File", help: "Service Account Credentials JSON file path. Leave blank normally. Needed only if you want use SA instead of interactive login. Leading `~` will be expanded in the file name as will environment variables such as `${RCLONE_CONFIG_DIR}`.", kind: Kind::Text, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "anonymous", label: "Anonymous", help: "Access public buckets and objects without credentials. Set to 'true' if you just want to download files and don't configure credentials.", kind: Kind::Text, default: "false", examples: &[], required: false, to_target: false },
-        Field { name: "object_acl", label: "Object ACL", help: "Access Control List for new objects.", kind: Kind::Choice, default: "", examples: &["authenticatedRead", "bucketOwnerFullControl", "bucketOwnerRead", "private", "projectPrivate", "publicRead"], required: false, to_target: false },
-        Field { name: "bucket_acl", label: "Bucket ACL", help: "Access Control List for new buckets.", kind: Kind::Choice, default: "", examples: &["authenticatedRead", "private", "projectPrivate", "publicRead", "publicReadWrite"], required: false, to_target: false },
-        Field { name: "bucket_policy_only", label: "Bucket Policy Only", help: "Access checks should use bucket-level IAM policies. If you want to upload objects to a bucket with Bucket Policy Only set then you will need to set this. When it is set, rclone: - ignores ACLs set on buckets - ignores ACLs set on objects - creates buckets with Bucket Policy Only set Docs: https://cl…", kind: Kind::Text, default: "false", examples: &[], required: false, to_target: false },
-        Field { name: "location", label: "Location", help: "Location for the newly created buckets.", kind: Kind::Choice, default: "", examples: &["", "asia", "eu", "us", "asia-east1", "asia-east2", "asia-northeast1", "asia-northeast2", "asia-northeast3", "asia-south1", "asia-south2", "asia-southeast1", "asia-southeast2", "australia-southeast1", "australia-southeast2", "europe-north1", "europe-west1", "europe-west2", "europe-west3", "europe-west4", "europe-west6", "europe-central2", "us-central1", "us-east1", "us-east4", "us-west1", "us-west2", "us-west3", "us-west4", "northamerica-northeast1", "northamerica-northeast2", "southamerica-east1", "southamerica-west1", "asia1", "eur4", "nam4"], required: false, to_target: false },
-        Field { name: "storage_class", label: "Storage Class", help: "The storage class to use when storing objects in Google Cloud Storage.", kind: Kind::Choice, default: "", examples: &["", "MULTI_REGIONAL", "REGIONAL", "NEARLINE", "COLDLINE", "ARCHIVE", "DURABLE_REDUCED_AVAILABILITY"], required: false, to_target: false },
-        Field { name: "env_auth", label: "Env Auth", help: "Get GCP IAM credentials from runtime (environment variables or instance meta data if no env vars). Only applies if service_account_file and service_account_credentials is blank.", kind: Kind::Choice, default: "false", examples: &["false", "true"], required: false, to_target: false },
         Field { name: "bucket", label: "Bucket", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: true, to_target: true },
     ] },
-    Backend { name: "drive", title: "Google Drive", description: "Google Drive", fields: &[
-        Field { name: "client_id", label: "Client ID", help: "Google Application Client Id Setting your own is recommended. See https://rclone.org/drive/#making-your-own-client-id for how to create your own. If you leave this blank, it will use an internal key which is low performance.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "scope", label: "Scope", help: "Comma separated list of scopes that rclone should use when requesting access from drive.", kind: Kind::Choice, default: "", examples: &["drive", "drive.readonly", "drive.file", "drive.appfolder", "drive.metadata.readonly"], required: false, to_target: false },
-        Field { name: "service_account_file", label: "Service Account File", help: "Service Account Credentials JSON file path. Leave blank normally. Needed only if you want use SA instead of interactive login. Leading `~` will be expanded in the file name as will environment variables such as `${RCLONE_CONFIG_DIR}`.", kind: Kind::Text, default: "", examples: &[], required: false, to_target: false },
-    ] },
-    Backend { name: "gphotos", title: "Google Photos", description: "Google Photos", fields: &[
-        Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "read_only", label: "Read Only", help: "Set to make the Google Photos backend read only. If you choose read only then rclone will only request read only access to your photos, otherwise rclone will request full access.", kind: Kind::Text, default: "false", examples: &[], required: false, to_target: false },
-    ] },
+    Backend { name: "drive", title: "Google Drive", description: "Google Drive", fields: &[] },
+    Backend { name: "gphotos", title: "Google Photos", description: "Google Photos", fields: &[] },
     Backend { name: "hdfs", title: "HDFS", description: "Hadoop distributed file system", fields: &[
         Field { name: "namenode", label: "Namenode", help: "Hadoop name nodes and ports. E.g. \"namenode-1:8020,namenode-2:8020,...\" to connect to host namenodes at port 8020.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "username", label: "Username", help: "Hadoop user name.", kind: Kind::Secret, default: "", examples: &["root"], required: false, to_target: false },
@@ -195,11 +163,7 @@ pub const BACKENDS: &[Backend] = &[
         Field { name: "hashes", label: "Hashes", help: "Comma separated list of supported checksum types.", kind: Kind::Text, default: "md5,sha1", examples: &[], required: false, to_target: false },
         Field { name: "max_age", label: "Max Age", help: "Maximum time to keep checksums in cache (0 = no cache, off = cache forever).", kind: Kind::Text, default: "off", examples: &[], required: false, to_target: false },
     ] },
-    Backend { name: "hidrive", title: "HiDrive", description: "HiDrive", fields: &[
-        Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "scope_access", label: "Scope Access", help: "Access permissions that rclone should use when requesting access from HiDrive.", kind: Kind::Choice, default: "rw", examples: &["rw", "ro"], required: false, to_target: false },
-    ] },
+    Backend { name: "hidrive", title: "HiDrive", description: "HiDrive", fields: &[] },
     Backend { name: "imagekit", title: "ImageKit", description: "ImageKit.io", fields: &[
         Field { name: "endpoint", label: "Endpoint", help: "You can find your ImageKit.io URL endpoint in your [dashboard](https://imagekit.io/dashboard/developer/api-keys)", kind: Kind::Text, default: "", examples: &[], required: true, to_target: false },
         Field { name: "public_key", label: "Public Key", help: "You can find your ImageKit.io public key in your [dashboard](https://imagekit.io/dashboard/developer/api-keys)", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
@@ -210,10 +174,7 @@ pub const BACKENDS: &[Backend] = &[
         Field { name: "secret_access_key", label: "Secret Access Key", help: "IAS3 Secret Key (password). Leave blank for anonymous access.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "bucket", label: "Bucket", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "jottacloud", title: "Jottacloud", description: "Jottacloud", fields: &[
-        Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-    ] },
+    Backend { name: "jottacloud", title: "Jottacloud", description: "Jottacloud", fields: &[] },
     Backend { name: "koofr", title: "Koofr", description: "Koofr, Digi Storage and other Koofr-compatible storage providers", fields: &[
         Field { name: "provider", label: "Provider", help: "Choose your storage provider.", kind: Kind::Choice, default: "", examples: &["koofr", "digistorage", "other"], required: false, to_target: false },
         Field { name: "endpoint", label: "Endpoint", help: "The Koofr API endpoint to use.", kind: Kind::Text, default: "", examples: &[], required: true, to_target: false },
@@ -224,8 +185,6 @@ pub const BACKENDS: &[Backend] = &[
         Field { name: "token", label: "Token", help: "Token from https://www.linkbox.to/admin/account", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
     ] },
     Backend { name: "mailru", title: "Mail.ru Cloud", description: "Mail.ru Cloud", fields: &[
-        Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "user", label: "User", help: "User name (usually email).", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "pass", label: "Pass", help: "Password. This must be an app password - rclone will not work with your normal password. See the Configuration section in the docs for how to make an app password.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "speedup_enable", label: "Speedup Enable", help: "Skip full upload if there is another file with same data hash. This feature is called \"speedup\" or \"put by hash\". It is especially efficient in case of generally available files like popular books, video or audio clips, because files are searched by hash in all accounts of all mailru users. It is me…", kind: Kind::Choice, default: "true", examples: &["true", "false"], required: false, to_target: false },
@@ -259,12 +218,7 @@ pub const BACKENDS: &[Backend] = &[
         Field { name: "client_certificate_path", label: "Client Certificate Path", help: "Path to a PEM or PKCS12 certificate file including the private key. Set this if using - Service principal with certificate", kind: Kind::Text, default: "", examples: &[], required: false, to_target: false },
         Field { name: "client_certificate_password", label: "Client Certificate Password", help: "Password for the certificate file (optional). Optionally set this if using - Service principal with certificate And the certificate has a password.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
     ] },
-    Backend { name: "onedrive", title: "Microsoft OneDrive", description: "Microsoft OneDrive", fields: &[
-        Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "region", label: "Region", help: "Choose national cloud region for OneDrive.", kind: Kind::Choice, default: "global", examples: &["global", "us", "de", "cn"], required: false, to_target: false },
-        Field { name: "tenant", label: "Tenant", help: "ID of the service principal's tenant. Also called its directory ID. Set this if using - Client Credential flow", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-    ] },
+    Backend { name: "onedrive", title: "Microsoft OneDrive", description: "Microsoft OneDrive", fields: &[] },
     Backend { name: "opendrive", title: "OpenDrive", description: "OpenDrive", fields: &[
         Field { name: "username", label: "Username", help: "Username.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "password", label: "Password", help: "Password.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
@@ -338,7 +292,6 @@ pub const BACKENDS: &[Backend] = &[
         Field { name: "key_use_agent", label: "Key Use Agent", help: "When set forces the usage of the ssh-agent. When key-file is also set, the \".pub\" file of the specified key-file is read and only the associated key is requested from the ssh-agent. This allows to avoid `Too many authentication failures for *username*` errors when the ssh-agent contains many keys.", kind: Kind::Text, default: "false", examples: &[], required: false, to_target: false },
         Field { name: "use_insecure_cipher", label: "Use Insecure Cipher", help: "Enable the use of insecure ciphers and key exchange methods. This enables the use of the following insecure ciphers and key exchange methods: - aes128-cbc - aes192-cbc - aes256-cbc - 3des-cbc - diffie-hellman-group-exchange-sha256 - diffie-hellman-group-exchange-sha1 Those algorithms are insecure an…", kind: Kind::Choice, default: "false", examples: &["false", "true"], required: false, to_target: false },
         Field { name: "disable_hashcheck", label: "Disable Hashcheck", help: "Disable the execution of SSH commands to determine if remote file hashing is available. Leave blank or set to false to enable hashing (recommended), set to true to disable hashing.", kind: Kind::Text, default: "false", examples: &[], required: false, to_target: false },
-        Field { name: "ssh", label: "SSH", help: "Path and arguments to external ssh binary. Normally rclone will use its internal ssh library to connect to the SFTP server. However it does not implement all possible ssh options so it may be desirable to use an external ssh binary. Rclone ignores all the internal config if you use this option and e…", kind: Kind::Text, default: "", examples: &[], required: false, to_target: false },
     ] },
     Backend { name: "smb", title: "SMB / CIFS", description: "Windows shares and Samba servers", fields: &[
         Field { name: "host", label: "Host", help: "SMB server hostname to connect to. E.g. \"example.com\".", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
@@ -397,31 +350,17 @@ pub const BACKENDS: &[Backend] = &[
         Field { name: "pass", label: "Pass", help: "Password.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "bearer_token", label: "Bearer Token", help: "Bearer token instead of user/pass (e.g. a Macaroon).", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
     ] },
-    Backend { name: "yandex", title: "Yandex Disk", description: "Yandex Disk", fields: &[
-        Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-    ] },
+    Backend { name: "yandex", title: "Yandex Disk", description: "Yandex Disk", fields: &[] },
     Backend { name: "zoho", title: "Zoho WorkDrive", description: "Zoho", fields: &[
-        Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "region", label: "Region", help: "Zoho region to connect to. You'll have to use the region your organization is registered in. If not sure use the same top level domain as you connect to in your browser.", kind: Kind::Choice, default: "", examples: &["com", "eu", "in", "jp", "com.cn", "com.au"], required: false, to_target: false },
     ] },
     Backend { name: "iclouddrive", title: "iCloud Drive", description: "iCloud Drive", fields: &[
         Field { name: "apple_id", label: "Apple ID", help: "Apple ID.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "password", label: "Password", help: "Password.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
     ] },
-    Backend { name: "pcloud", title: "pCloud", description: "pCloud account: sign in via rclone's browser flow after saving", fields: &[
-        Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-    ] },
-    Backend { name: "premiumizeme", title: "premiumize.me", description: "premiumize.me", fields: &[
-        Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-    ] },
-    Backend { name: "putio", title: "put.io", description: "Put.io", fields: &[
-        Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-    ] },
+    Backend { name: "pcloud", title: "pCloud", description: "pCloud account: sign in via rclone's browser flow after saving", fields: &[] },
+    Backend { name: "premiumizeme", title: "premiumize.me", description: "premiumize.me", fields: &[] },
+    Backend { name: "putio", title: "put.io", description: "Put.io", fields: &[] },
 ];
 
 /// The backend with `name`, if any.
@@ -624,6 +563,18 @@ mod tests {
                     b.name,
                     f.name
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn browser_sign_ins_ask_nothing_needless() {
+        for name in ["dropbox", "drive", "onedrive", "box", "pcloud"] {
+            assert!(backend(name).unwrap().fields.is_empty(), "{name}");
+        }
+        for b in BACKENDS {
+            for f in b.fields {
+                assert!(!f.help.contains("Leave blank normally"), "{}.{}", b.name, f.name);
             }
         }
     }

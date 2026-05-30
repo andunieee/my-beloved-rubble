@@ -20,8 +20,9 @@ mbr scan                          take in new files, record removals
 mbr ls                            list tracked files
 mbr info <path|hash>              full details of one file
 mbr remote types                  list the kinds of storage mbr can set up
-mbr remote setup <name> <type> [--unencrypted]
+mbr remote setup <name> <type> [--unencrypted] [--set KEY=VALUE...]
                                   set up a new remote, asking for each field
+                                  not given with --set (any rclone option)
 mbr remote ls                     list remotes
 mbr remote show <name>            a remote's settings (secrets hidden)
 mbr remote edit <name> [--rename NEW] [--set KEY=VALUE...]

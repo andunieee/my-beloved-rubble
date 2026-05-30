@@ -292,6 +292,8 @@ component SetupForm inherits VerticalLayout {
     in property <string> question;
     in property <string> help;
     in property <string> default;
+    // The question is yes/no: asked with a checkbox.
+    in property <bool> boolean;
     in property <string> url;
     in-out property <string> answer;
     in property <bool> busy;
@@ -325,7 +327,7 @@ component SetupForm inherits VerticalLayout {
             padding: 10px;
             spacing: 6px;
             Text {
-                text: root.question + (root.default == "" ? "" : " [" + root.default + "]");
+                text: root.question + (root.default == "" || root.boolean ? "" : " [" + root.default + "]");
                 font-size: 12px;
                 font-weight: 600;
                 wrap: word-wrap;
@@ -345,7 +347,12 @@ component SetupForm inherits VerticalLayout {
                 width: root.text-width - 20px;
                 color: Palette.accent-background;
             }
-            LineEdit {
+            if root.boolean: CheckBox {
+                text: "Yes";
+                checked: root.answer == "true";
+                toggled => { root.answer = self.checked ? "true" : "false"; }
+            }
+            if !root.boolean: LineEdit {
                 text <=> root.answer;
             }
             HorizontalLayout {
@@ -491,6 +498,9 @@ export component AppWindow inherits Window {
     in-out property <string> setup-question: "";
     in-out property <string> setup-help: "";
     in-out property <string> setup-answer: "";
+    in-out property <bool> setup-boolean: false;
+    // A remote setup step is running (e.g. waiting for the browser sign-in).
+    in-out property <bool> setup-connecting: false;
     in-out property <string> setup-default: "";
     in-out property <string> setup-url: "";
 
@@ -828,6 +838,7 @@ export component AppWindow inherits Window {
                                         question: root.setup-question;
                                         help: root.setup-help;
                                         default: root.setup-default;
+                                        boolean: root.setup-boolean;
                                         url: root.setup-url;
                                         answer <=> root.setup-answer;
                                         busy: root.busy;
@@ -1537,6 +1548,7 @@ width: Side.text-width;
                                     question: root.setup-question;
                                     help: root.setup-help;
                                     default: root.setup-default;
+                                    boolean: root.setup-boolean;
                                     url: root.setup-url;
                                     answer <=> root.setup-answer;
                                     busy: root.busy;
@@ -1550,7 +1562,10 @@ width: Side.text-width;
                                     HorizontalLayout {
                                         spacing: 6px;
                                         Button {
-                                            text: "Save Remote";
+                                            // Nothing to fill in: the sign-in is all there is.
+                                            text: root.form-fields.length > 0 ? "Save Remote"
+                                                : root.setup-connecting ? "Continue in browser"
+                                                : "Connect";
                                             primary: true;
                                             enabled: root.folder != ""
                                                 && !root.busy

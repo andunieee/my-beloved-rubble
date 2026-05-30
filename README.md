@@ -72,9 +72,15 @@ rclone still needs afterwards — typically a browser sign-in for OAuth
 backends — comes back as a single question the frontends relay.
 
 For OAuth backends (Google Drive, Dropbox, OneDrive, …) the form is
-mostly optional client credentials; the sign-in itself happens in the
-browser, and the auth link is also printed (CLI) or shown inline (GUI) in
-case no browser opens.
+empty, or nearly (a GCS project number, a Zoho region): the sign-in
+happens in the browser, and the auth link is also printed (CLI) or shown
+inline (GUI) in case no browser opens. The GUI answers rclone's "use a
+web browser?" question yes by itself, since it runs on the user's
+desktop; the CLI asks it, as it may run on a machine without one. Fields
+rclone says to leave blank (OAuth client ids, service accounts, …) are
+left off the forms too; any rclone option, on the form or not, can be
+given with `mbr remote setup --set KEY=VALUE` (repeatable; form fields
+given this way aren't asked) or changed later with `mbr remote edit --set`.
 
 ### Encryption and layout
 

@@ -124,6 +124,8 @@ pub struct SetupQuestion {
     pub default: String,
     /// Whether the answer should be hidden while typing.
     pub password: bool,
+    /// Whether the answer is `true` or `false`.
+    pub boolean: bool,
 }
 
 /// Result of a setup step: either the next question or completion.
@@ -183,6 +185,8 @@ fn parse_setup_response(response: Value) -> Result<SetupOutcome, String> {
             .get("IsPassword")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        boolean: option.get("Type").and_then(Value::as_str) == Some("bool")
+            || option.get("Default").is_some_and(Value::is_boolean),
     }))
 }
 

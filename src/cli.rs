@@ -159,6 +159,10 @@ enum RemoteCommand {
         /// store files unencrypted (whoever runs the remote can read them)
         #[arg(long)]
         unencrypted: bool,
+        /// set an rclone config key of the backend (repeatable); form
+        /// fields given this way aren't asked
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
     },
     /// remove a remote
     Rm { name: String },
@@ -218,7 +222,8 @@ fn run(cli: Cli) -> Result<(), String> {
                 name,
                 backend,
                 unencrypted,
-            } => remote_setup(&mut open()?, &name, &backend, !unencrypted),
+                set,
+            } => remote_setup(&mut open()?, &name, &backend, !unencrypted, &set),
             RemoteCommand::Rm { name } => remote_rm(&mut open()?, &name),
             RemoteCommand::Ls => remote_ls(&mut open()?),
             RemoteCommand::Show { name } => remote_show(&mut open()?, &name),
@@ -419,8 +424,15 @@ fn remote_types() -> Result<(), String> {
     Ok(())
 }
 
-fn remote_setup(repo: &mut Repo, name: &str, backend: &str, encrypt: bool) -> Result<(), String> {
+fn remote_setup(
+    repo: &mut Repo,
+    name: &str,
+    backend: &str,
+    encrypt: bool,
+    set: &[String],
+) -> Result<(), String> {
     let layout = mbr::remotes::Layout::new(name, encrypt)?;
+    let mut given = parse_set(set)?;
     if repo.db.remote(name)?.is_some() {
         return Err(format!("remote '{name}' already exists"));
     }
@@ -442,11 +454,13 @@ fn remote_setup(repo: &mut Repo, name: &str, backend: &str, encrypt: bool) -> Re
         );
     }
 
-    let values = ask_backend_form(backend)?;
+    let values = ask_backend_form(backend, &mut given)?;
     let spec = mbr::backends::target_spec(backend, &values);
     mbr::backends::check_target_spec(backend, &spec)?;
     let folder_id = repo.folder_id()?;
-    let parameters = mbr::backends::form_parameters(backend, &values);
+    let mut parameters = mbr::backends::form_parameters(backend, &values);
+    // What --set gave beyond the form goes to rclone as is.
+    parameters.as_object_mut().expect("an object").extend(given);
     let section = layout.root_section();
     let begun = mbr::rclone::begin_setup(&section, backend.name, parameters.clone());
     answer_questions(&section, begun, &parameters, |outcome| {
@@ -459,10 +473,18 @@ fn remote_setup(repo: &mut Repo, name: &str, backend: &str, encrypt: bool) -> Re
     Ok(())
 }
 
-/// Ask the hardcoded form fields of `backend`, in order.
-fn ask_backend_form(backend: &mbr::backends::Backend) -> Result<Vec<String>, String> {
+/// Ask the hardcoded form fields of `backend`, in order, except those in
+/// `given` (taken out of it and used as is).
+fn ask_backend_form(
+    backend: &mbr::backends::Backend,
+    given: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<String>, String> {
     let mut values: Vec<String> = Vec::new();
     for field in backend.fields {
+        if let Some(value) = given.remove(field.name) {
+            values.push(value.as_str().unwrap_or_default().to_owned());
+            continue;
+        }
         let label = match field.kind {
             mbr::backends::Kind::Choice => {
                 format!("{} [{}]", field.label, field.examples.join("/"))
@@ -496,6 +518,8 @@ fn answer_questions(
         println!("{}", question.help);
         let answer = if question.password {
             rpassword::prompt_password(format!("{}: ", question.name)).map_err(|e| e.to_string())
+        } else if question.boolean {
+            prompt_yes_no(&question.name, &question.default)
         } else {
             prompt(&question.name, &question.default)
         };
@@ -511,11 +535,28 @@ fn answer_questions(
             &question.state,
             &answer,
             parameters.clone(),
-            &mut |url| println!("\nIf your browser didn't open, open this link:\n  {url}\n"),
+            &mut print_auth_url,
         );
         outcome = finish(step)?;
     }
     Ok(())
+}
+
+fn print_auth_url(url: String) {
+    println!("\nIf your browser didn't open, open this link:\n  {url}\n");
+}
+
+/// Ask a yes/no question; the answer is `true` or `false`, as rclone
+/// expects.
+fn prompt_yes_no(label: &str, default: &str) -> Result<String, String> {
+    let default = if default == "true" { "y" } else { "n" };
+    loop {
+        match prompt(&format!("{label} (y/n)"), default)?.to_lowercase().as_str() {
+            "y" | "yes" | "true" => return Ok("true".to_owned()),
+            "n" | "no" | "false" => return Ok("false".to_owned()),
+            _ => println!("answer y or n"),
+        }
+    }
 }
 
 fn prompt(label: &str, default: &str) -> Result<String, String> {
@@ -612,6 +653,18 @@ fn remote_show(repo: &mut Repo, name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The rclone config keys and values of `--set KEY=VALUE` arguments.
+fn parse_set(set: &[String]) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let mut parameters = serde_json::Map::new();
+    for pair in set {
+        let Some((key, value)) = pair.split_once('=') else {
+            return Err(format!("--set expects KEY=VALUE, got '{pair}'"));
+        };
+        parameters.insert(key.trim().to_owned(), value.into());
+    }
+    Ok(parameters)
+}
+
 fn remote_edit(
     repo: &mut Repo,
     name: &str,
@@ -628,13 +681,7 @@ fn remote_edit(
     }
 
     if !set.is_empty() {
-        let mut parameters = serde_json::Map::new();
-        for pair in set {
-            let Some((key, value)) = pair.split_once('=') else {
-                return Err(format!("--set expects KEY=VALUE, got '{pair}'"));
-            };
-            parameters.insert(key.trim().to_owned(), value.into());
-        }
+        let parameters = parse_set(set)?;
         let section = mbr::remotes::settings_section(&remote.target)
             .ok_or_else(|| format!("remote '{name}' has no rclone settings"))?;
         repo.with_rclone(|| {
@@ -1200,7 +1247,7 @@ fn download_backup(dir: &Path, backend: &str) -> Result<(Vec<u8>, Vec<u8>, Strin
     }
     let password = rpassword::prompt_password("master password: ").map_err(|e| e.to_string())?;
     println!("Where the backup is ({})", backend.title);
-    let values = ask_backend_form(backend)?;
+    let values = ask_backend_form(backend, &mut serde_json::Map::new())?;
     let spec = mbr::backends::target_spec(backend, &values);
     mbr::backends::check_target_spec(backend, &spec)?;
     let parameters = mbr::backends::form_parameters(backend, &values);

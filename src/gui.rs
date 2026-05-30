@@ -284,6 +284,34 @@ enum SetupStep {
     },
 }
 
+/// The answer the GUI gives rclone's `question` itself, if any: the GUI
+/// runs on the user's own desktop, so OAuth sign-in always happens in a
+/// browser here (rclone's "Use web browser to automatically authenticate?").
+fn automatic_answer(question: &mbr::rclone::SetupQuestion) -> Option<&'static str> {
+    (question.name == "config_is_local").then_some("true")
+}
+
+/// Keep answering `outcome`'s question while [`automatic_answer`] knows
+/// the answer.
+fn answer_automatically(
+    section: &str,
+    mut outcome: Result<mbr::rclone::SetupOutcome, String>,
+    parameters: serde_json::Value,
+    on_url: &mut dyn FnMut(String),
+) -> Result<mbr::rclone::SetupOutcome, String> {
+    loop {
+        let (state, answer) = match &outcome {
+            Ok(mbr::rclone::SetupOutcome::Question(q)) => match automatic_answer(q) {
+                Some(answer) => (q.state.clone(), answer),
+                None => return outcome,
+            },
+            _ => return outcome,
+        };
+        outcome =
+            mbr::rclone::continue_setup_watching(section, &state, answer, parameters.clone(), on_url);
+    }
+}
+
 /// Where a setup step got to.
 enum Reached {
     Step(mbr::rclone::SetupOutcome),
@@ -305,19 +333,23 @@ impl PendingSetup {
                     if let Purpose::Remote { layout, .. } = &self.purpose {
                         layout.check_unused()?;
                     }
-                    mbr::rclone::begin_setup(&self.section, backend, parameters)
+                    let begun = mbr::rclone::begin_setup(&self.section, backend, parameters.clone());
+                    answer_automatically(&self.section, begun, parameters, on_url)
                 }
                 SetupStep::Continue {
                     state,
                     answer,
                     parameters,
-                } => mbr::rclone::continue_setup_watching(
-                    &self.section,
-                    &state,
-                    &answer,
-                    parameters,
-                    on_url,
-                ),
+                } => {
+                    let step = mbr::rclone::continue_setup_watching(
+                        &self.section,
+                        &state,
+                        &answer,
+                        parameters.clone(),
+                        on_url,
+                    );
+                    answer_automatically(&self.section, step, parameters, on_url)
+                }
             };
             let password = self.password.expose_secret();
             match &self.purpose {
@@ -1905,6 +1937,7 @@ impl App {
     /// Run one config-protocol step on a background thread.
     fn run_setup_step(&self, pending: PendingSetup, step: SetupStep) {
         *self.setup.borrow_mut() = Some(pending.clone());
+        self.window.set_setup_connecting(true);
         self.status(match pending.purpose {
             Purpose::Remote { .. } => "Talking to rclone…",
             Purpose::Restore { .. } => "Looking for the backup…",
@@ -1969,6 +2002,7 @@ impl App {
     /// Clear the form and question panels.
     fn reset_setup_ui(&self) {
         *self.setup.borrow_mut() = None;
+        self.window.set_setup_connecting(false);
         self.window.set_setup_active(false);
         self.window.set_setup_state(SharedString::default());
         self.window.set_setup_question(SharedString::default());
@@ -2070,40 +2104,49 @@ impl App {
                 Ok(()) => self.finish_remote_edit(&old, &name, &target),
                 Err(e) => self.status(format!("Saving rclone settings failed: {e}")),
             },
-            Msg::Setup { pending, result } => match result {
-                Err(e) => {
-                    self.window
-                        .set_setup_help(SharedString::from(format!("Error: {e}")));
-                    self.window.set_setup_state(SharedString::default());
-                    self.status(match pending.purpose {
-                        Purpose::Remote { .. } => format!("Remote setup failed: {e}"),
-                        Purpose::Restore { .. } => format!("Restore failed: {e}"),
-                    });
-                }
-                Ok(mbr::rclone::SetupOutcome::Done) => {
-                    if let Purpose::Remote { layout, .. } = pending.purpose {
-                        let (name, target) = (layout.name.clone(), layout.target());
-                        self.with_repo("save remote", |repo| {
-                            repo.db.add_remote(&name, &target)?;
-                            Ok(format!(
-                                "Added remote {name} ({})",
-                                mbr::remotes::describe(&target)
-                            ))
+            Msg::Setup { pending, result } => {
+                self.window.set_setup_connecting(false);
+                match result {
+                    Err(e) => {
+                        self.window
+                            .set_setup_help(SharedString::from(format!("Error: {e}")));
+                        self.window.set_setup_state(SharedString::default());
+                        self.status(match pending.purpose {
+                            Purpose::Remote { .. } => format!("Remote setup failed: {e}"),
+                            Purpose::Restore { .. } => format!("Restore failed: {e}"),
                         });
-                        self.reset_setup_ui();
-                        self.refresh();
+                    }
+                    Ok(mbr::rclone::SetupOutcome::Done) => {
+                        if let Purpose::Remote { layout, .. } = pending.purpose {
+                            let (name, target) = (layout.name.clone(), layout.target());
+                            self.with_repo("save remote", |repo| {
+                                repo.db.add_remote(&name, &target)?;
+                                Ok(format!(
+                                    "Added remote {name} ({})",
+                                    mbr::remotes::describe(&target)
+                                ))
+                            });
+                            self.reset_setup_ui();
+                            self.refresh();
+                        }
+                    }
+                    Ok(mbr::rclone::SetupOutcome::Question(q)) => {
+                        self.window.set_setup_state(SharedString::from(q.state));
+                        self.window.set_setup_question(SharedString::from(q.name));
+                        self.window.set_setup_help(SharedString::from(q.help));
+                        self.window.set_setup_boolean(q.boolean);
+                        // A checkbox shows its answer, so start from the default.
+                        self.window.set_setup_answer(if q.boolean {
+                            SharedString::from(q.default.as_str())
+                        } else {
+                            SharedString::default()
+                        });
+                        self.window.set_setup_default(SharedString::from(q.default));
+                        self.window.set_setup_url(SharedString::default());
+                        self.status("rclone needs one more answer to finish this remote");
                     }
                 }
-                Ok(mbr::rclone::SetupOutcome::Question(q)) => {
-                    self.window.set_setup_state(SharedString::from(q.state));
-                    self.window.set_setup_question(SharedString::from(q.name));
-                    self.window.set_setup_help(SharedString::from(q.help));
-                    self.window.set_setup_default(SharedString::from(q.default));
-                    self.window.set_setup_answer(SharedString::default());
-                    self.window.set_setup_url(SharedString::default());
-                    self.status("rclone needs one more answer to finish this remote");
-                }
-            },
+            }
             Msg::OAuthUrl(url) => {
                 self.window.set_setup_url(SharedString::from(url.as_str()));
                 self.status(

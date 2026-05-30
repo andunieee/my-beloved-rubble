@@ -34,6 +34,9 @@ fn setup_never_leaves_half_configured_remotes() {
         let SetupOutcome::Question(question) = rclone::begin_setup("gd", "drive", json!({}))? else {
             panic!("drive setup asked no OAuth question");
         };
+        // The one the GUI answers itself: a yes/no.
+        assert_eq!(question.name, "config_is_local");
+        assert!(question.boolean);
         assert!(rclone::remote_exists("gd")?);
         rclone::cancel_setup("gd", &question.state).ok();
         assert!(!rclone::remote_exists("gd")?);
