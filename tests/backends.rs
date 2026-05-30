@@ -6,7 +6,7 @@
 //! Runs as an integration test (`cargo test`) since librclone keeps
 //! process-global state; the RPC lock serializes the calls.
 
-use mbr::backends::{Kind, BACKENDS};
+use mbr::backends::{BACKENDS, Kind};
 use serde_json::Value;
 
 /// Fetch the `Options` array for one backend from `config/providers`.
@@ -22,7 +22,11 @@ fn provider_options(backend: &str) -> Result<Vec<Value>, String> {
         // `Name` is the display name it usually equals, lowercased.
         .find(|p| {
             p.get("Prefix").and_then(Value::as_str) == Some(backend)
-                || p.get("Name").and_then(Value::as_str).map(str::to_lowercase).as_deref() == Some(backend)
+                || p.get("Name")
+                    .and_then(Value::as_str)
+                    .map(str::to_lowercase)
+                    .as_deref()
+                    == Some(backend)
         })
         .ok_or_else(|| format!("rclone knows no backend '{backend}'"))?;
     Ok(provider
@@ -102,9 +106,7 @@ fn registry_matches_rclone_providers() {
                             items
                                 .iter()
                                 .filter_map(|item| {
-                                    item.get("Value")
-                                        .and_then(Value::as_str)
-                                        .map(str::to_owned)
+                                    item.get("Value").and_then(Value::as_str).map(str::to_owned)
                                 })
                                 .collect()
                         })

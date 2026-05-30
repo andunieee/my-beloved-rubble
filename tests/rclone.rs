@@ -31,7 +31,8 @@ fn setup_never_leaves_half_configured_remotes() {
 
         // OAuth backends still get their sign-in questions; cancelling one
         // removes the half-configured remote.
-        let SetupOutcome::Question(question) = rclone::begin_setup("gd", "drive", json!({}))? else {
+        let SetupOutcome::Question(question) = rclone::begin_setup("gd", "drive", json!({}))?
+        else {
             panic!("drive setup asked no OAuth question");
         };
         // The one the GUI answers itself: a yes/no.

@@ -307,8 +307,13 @@ fn answer_automatically(
             },
             _ => return outcome,
         };
-        outcome =
-            mbr::rclone::continue_setup_watching(section, &state, answer, parameters.clone(), on_url);
+        outcome = mbr::rclone::continue_setup_watching(
+            section,
+            &state,
+            answer,
+            parameters.clone(),
+            on_url,
+        );
     }
 }
 
@@ -333,7 +338,8 @@ impl PendingSetup {
                     if let Purpose::Remote { layout, .. } = &self.purpose {
                         layout.check_unused()?;
                     }
-                    let begun = mbr::rclone::begin_setup(&self.section, backend, parameters.clone());
+                    let begun =
+                        mbr::rclone::begin_setup(&self.section, backend, parameters.clone());
                     answer_automatically(&self.section, begun, parameters, on_url)
                 }
                 SetupStep::Continue {
@@ -808,7 +814,9 @@ impl App {
     // ── a folder that isn't an mbr folder yet ──
 
     fn start_new(&self) {
-        let Some(dir) = self.pending_folder.borrow().clone() else { return };
+        let Some(dir) = self.pending_folder.borrow().clone() else {
+            return;
+        };
         match Repo::init(&dir) {
             Ok(repo) => {
                 self.open_repo(repo);
@@ -822,7 +830,9 @@ impl App {
     /// Pick a file to restore from: 1 = the database, 2 = the rclone
     /// config, 3 = an encrypted backup.
     fn pick_restore_file(&self, which: i32) {
-        let Some(file) = rfd::FileDialog::new().pick_file() else { return };
+        let Some(file) = rfd::FileDialog::new().pick_file() else {
+            return;
+        };
         let path = SharedString::from(file.display().to_string());
         match which {
             1 => self.window.set_restore_db_file(path),
@@ -832,7 +842,9 @@ impl App {
     }
 
     fn restore_from_files(&self) {
-        let Some(dir) = self.pending_folder.borrow().clone() else { return };
+        let Some(dir) = self.pending_folder.borrow().clone() else {
+            return;
+        };
         let read = |path: SharedString| {
             std::fs::read(path.as_str()).map_err(|e| format!("cannot read {path}: {e}"))
         };
@@ -847,7 +859,9 @@ impl App {
     /// Decrypt the chosen backup file in the background; it is restored
     /// when it arrives (see [`Msg::BackupOpened`]).
     fn restore_from_backup(&self, password: &str) {
-        let Some(dir) = self.pending_folder.borrow().clone() else { return };
+        let Some(dir) = self.pending_folder.borrow().clone() else {
+            return;
+        };
         let file = PathBuf::from(self.window.get_restore_backup_file().as_str());
         let password = SecretString::from(password.to_owned());
         self.status("Decrypting the backup…");
@@ -867,8 +881,12 @@ impl App {
     /// Set up the remote described by the form in a throwaway rclone config
     /// and download the backup made with `password` from it.
     fn restore_from_remote(&self, backend_name: &str, values: &[SharedString], password: &str) {
-        let Some(dir) = self.pending_folder.borrow().clone() else { return };
-        let Some((backend, spec)) = self.check_form(backend_name, values) else { return };
+        let Some(dir) = self.pending_folder.borrow().clone() else {
+            return;
+        };
+        let Some((backend, spec)) = self.check_form(backend_name, values) else {
+            return;
+        };
         let config_path = dir.join(repo::TMP_DIR).join("restore-rclone.conf");
         std::fs::remove_file(&config_path).ok();
         if let Err(e) = repo::ensure_rclone_config(&config_path) {
@@ -921,10 +939,7 @@ impl App {
             text += "; download them from the Remotes tab";
         }
         if !report.kept.is_empty() {
-            text += &format!(
-                "; {} already there kept as new versions",
-                report.kept.len()
-            );
+            text += &format!("; {} already there kept as new versions", report.kept.len());
         }
         if !report.skipped.is_empty() {
             text += &format!("; {} skipped", report.skipped.len());
@@ -937,7 +952,12 @@ impl App {
 
     /// Back to choosing how to start in the pending folder.
     fn cancel_restore(&self) {
-        if self.setup.borrow().as_ref().is_some_and(|p| p.throwaway_config().is_some()) {
+        if self
+            .setup
+            .borrow()
+            .as_ref()
+            .is_some_and(|p| p.throwaway_config().is_some())
+        {
             self.cancel_remote_setup();
         }
         let w = &self.window;
@@ -970,7 +990,11 @@ impl App {
 
     /// Paths of the listed rows, in display order.
     fn row_paths(&self) -> Vec<String> {
-        self.statuses.borrow().iter().map(|s| s.path.clone()).collect()
+        self.statuses
+            .borrow()
+            .iter()
+            .map(|s| s.path.clone())
+            .collect()
     }
 
     /// Distinct hashes of the selected rows, in display order.
@@ -990,7 +1014,9 @@ impl App {
     fn show_selection(&self) {
         let selection = self.selection.borrow();
         for i in 0..self.files.row_count() {
-            let Some(mut row) = self.files.row_data(i) else { continue };
+            let Some(mut row) = self.files.row_data(i) else {
+                continue;
+            };
             let selected = selection.paths.contains(row.path.as_str());
             if row.selected != selected {
                 row.selected = selected;
@@ -1103,8 +1129,10 @@ impl App {
         let jobs = {
             let mut repo = self.repo.borrow_mut();
             let Some(repo) = repo.as_mut() else { return };
-            let missing: Vec<String> =
-                hashes.into_iter().filter(|h| !repo.blob_present(h)).collect();
+            let missing: Vec<String> = hashes
+                .into_iter()
+                .filter(|h| !repo.blob_present(h))
+                .collect();
             let mut jobs = Vec::new();
             for hash in missing {
                 let mut names = repo.db.remotes_for_blob(&hash).unwrap_or_default();
@@ -1147,7 +1175,9 @@ impl App {
                 .collect();
             (jobs, min_copies, repo.root.clone())
         };
-        let Some(config_path) = self.config_path() else { return };
+        let Some(config_path) = self.config_path() else {
+            return;
+        };
         if jobs.is_empty() {
             self.status("None of these blobs is present locally; nothing to free");
             return;
@@ -1361,7 +1391,9 @@ impl App {
                 }
             }
         };
-        let Some(config_path) = self.config_path() else { return };
+        let Some(config_path) = self.config_path() else {
+            return;
+        };
         if remotes.is_empty() {
             self.status("Tick at least one remote to back up to");
             return;
@@ -1373,7 +1405,8 @@ impl App {
             let (sealed, name) = match sealed {
                 Ok(sealed) => sealed,
                 Err(e) => {
-                    tx.send(Msg::Status(format!("Metadata backup failed: {e}"))).ok();
+                    tx.send(Msg::Status(format!("Metadata backup failed: {e}")))
+                        .ok();
                     return;
                 }
             };
@@ -1381,9 +1414,8 @@ impl App {
             let mut done = 0;
             let configured = mbr::rclone::with_config(&config_path, || {
                 for remote in remotes {
-                    let result = mbr::remotes::backup_location(&remote.target).and_then(
-                        |location| metadata::upload(&location, &name, &sealed, &scratch),
-                    );
+                    let result = mbr::remotes::backup_location(&remote.target)
+                        .and_then(|location| metadata::upload(&location, &name, &sealed, &scratch));
                     if result.is_ok() {
                         done += 1;
                     }
@@ -1437,7 +1469,10 @@ impl App {
                 .collect()
         };
 
-        self.status(format!("Uploading {} blob(s) to {remote_name}…", blobs.len()));
+        self.status(format!(
+            "Uploading {} blob(s) to {remote_name}…",
+            blobs.len()
+        ));
         self.spawn(move |tx| {
             let total = blobs.len();
             let mut done = 0;
@@ -1476,7 +1511,10 @@ impl App {
         ) else {
             return;
         };
-        let unheld = jobs.iter().filter(|(_, holders)| holders.is_empty()).count();
+        let unheld = jobs
+            .iter()
+            .filter(|(_, holders)| holders.is_empty())
+            .count();
         let jobs: Vec<(String, Vec<Remote>)> = jobs
             .into_iter()
             .filter(|(_, holders)| !holders.is_empty())
@@ -1518,7 +1556,9 @@ impl App {
 
     /// Download everything recorded on remote `name` that is missing here.
     fn download_all(&self, name: &str) {
-        let Some(remote) = self.remote(name) else { return };
+        let Some(remote) = self.remote(name) else {
+            return;
+        };
         let missing = {
             let mut repo = self.repo.borrow_mut();
             let Some(repo) = repo.as_mut() else { return };
@@ -1562,7 +1602,9 @@ impl App {
             .into_iter()
             .filter(|r| only.is_none_or(|name| r.name == name))
             .collect();
-        let Some(config_path) = self.config_path() else { return };
+        let Some(config_path) = self.config_path() else {
+            return;
+        };
         if remotes.is_empty() {
             self.status("No remotes to scan");
             return;
@@ -1608,7 +1650,10 @@ impl App {
                     mbr::remotes::delete_sections(&remote.target)
                 });
                 if let Err(e) = deleted {
-                    let text = format!("Removed remote {}; its rclone settings stay: {e}", remote.name);
+                    let text = format!(
+                        "Removed remote {}; its rclone settings stay: {e}",
+                        remote.name
+                    );
                     tx.send(Msg::Status(text)).ok();
                 }
             });
@@ -1619,7 +1664,9 @@ impl App {
 
     /// Open the editor for remote `name` and read its rclone settings.
     fn edit_remote(&self, name: &str) {
-        let Some(remote) = self.remote(name) else { return };
+        let Some(remote) = self.remote(name) else {
+            return;
+        };
         let section = mbr::remotes::settings_section(&remote.target);
         *self.edit.borrow_mut() = Some(EditState {
             original: remote.name.clone(),
@@ -1643,9 +1690,8 @@ impl App {
         };
         w.set_edit_note("Reading rclone settings…".into());
         self.spawn(move |tx| {
-            let result = mbr::rclone::with_config(&config_path, || {
-                mbr::rclone::remote_config(&section)
-            });
+            let result =
+                mbr::rclone::with_config(&config_path, || mbr::rclone::remote_config(&section));
             tx.send(Msg::RemoteConfig {
                 remote: remote.name,
                 result,
@@ -1655,10 +1701,7 @@ impl App {
     }
 
     /// Show the settings read for the remote being edited.
-    fn show_remote_config(
-        &self,
-        config: Option<serde_json::Map<String, serde_json::Value>>,
-    ) {
+    fn show_remote_config(&self, config: Option<serde_json::Map<String, serde_json::Value>>) {
         let mut edit = self.edit.borrow_mut();
         let Some(edit) = edit.as_mut() else { return };
         let w = &self.window;
@@ -1730,7 +1773,11 @@ impl App {
     fn save_remote_edit(&self) {
         let w = &self.window;
         let name = w.get_edit_name().trim().to_owned();
-        let renamed = self.edit.borrow().as_ref().is_some_and(|e| e.original != name);
+        let renamed = self
+            .edit
+            .borrow()
+            .as_ref()
+            .is_some_and(|e| e.original != name);
         if renamed && let Err(e) = mbr::remotes::check_name(&name) {
             self.status(format!("Error: {e}"));
             return;
@@ -1748,19 +1795,23 @@ impl App {
                     parameters.insert(field.name.to_owned(), value.into());
                 }
             }
-            (edit.original.clone(), edit.target.clone(), edit.section.clone(), parameters)
+            (
+                edit.original.clone(),
+                edit.target.clone(),
+                edit.section.clone(),
+                parameters,
+            )
         };
 
         match section {
             Some(section) if !parameters.is_empty() => {
-                let Some(config_path) = self.config_path() else { return };
+                let Some(config_path) = self.config_path() else {
+                    return;
+                };
                 self.status(format!("Saving the settings of '{old}'…"));
                 self.spawn(move |tx| {
                     let result = mbr::rclone::with_config(&config_path, || {
-                        mbr::rclone::update_remote(
-                            &section,
-                            serde_json::Value::Object(parameters),
-                        )
+                        mbr::rclone::update_remote(&section, serde_json::Value::Object(parameters))
                     });
                     tx.send(Msg::RemoteEdited {
                         old,
@@ -1802,7 +1853,9 @@ impl App {
 
     /// Show the hardcoded form for the backend picked by `title`.
     fn select_backend(&self, title: &str) {
-        let Some((index, backend)) = backends::offered().enumerate().find(|(_, b)| b.title == title)
+        let Some((index, backend)) = backends::offered()
+            .enumerate()
+            .find(|(_, b)| b.title == title)
         else {
             return;
         };
@@ -1880,7 +1933,9 @@ impl App {
                 return;
             }
         };
-        let Some((backend, spec)) = self.check_form(backend_name, values) else { return };
+        let Some((backend, spec)) = self.check_form(backend_name, values) else {
+            return;
+        };
         let prepared = {
             let mut repo = self.repo.borrow_mut();
             let Some(repo) = repo.as_mut() else { return };
@@ -1918,7 +1973,9 @@ impl App {
 
     /// Continue after answering a fallback question.
     fn submit_remote_setup(&self, backend_name: &str, state: &str, answer: &str) {
-        let Some(pending) = self.setup.borrow().clone() else { return };
+        let Some(pending) = self.setup.borrow().clone() else {
+            return;
+        };
         let values: Vec<SharedString> = self.window.get_form_values().iter().collect();
         let parameters = match backends::backend(backend_name) {
             Some(b) => backends::form_parameters(b, &values),
@@ -1956,7 +2013,8 @@ impl App {
             }
             match (reached, &pending.purpose) {
                 (Ok(Reached::Backup(sealed)), Purpose::Restore { dir }) => {
-                    tx.send(Msg::Status("Decrypting the backup…".to_owned())).ok();
+                    tx.send(Msg::Status("Decrypting the backup…".to_owned()))
+                        .ok();
                     let result = metadata::unseal(&sealed, pending.password.expose_secret());
                     tx.send(Msg::BackupOpened {
                         dir: dir.clone(),
@@ -2035,9 +2093,10 @@ impl App {
                 Err(e) => self.status(format!("Upload to {remote} failed: {e}")),
             },
             Msg::Fetched { hash, result } => match result {
-                Ok(remote) => {
-                    self.status(format!("Downloaded {} from {remote}", util::short_hash(&hash)))
-                }
+                Ok(remote) => self.status(format!(
+                    "Downloaded {} from {remote}",
+                    util::short_hash(&hash)
+                )),
                 Err(e) => self.status(format!("Download failed: {e}")),
             },
             Msg::Checked {
@@ -2047,8 +2106,15 @@ impl App {
             } => match result {
                 Ok(size) => self.with_repo("record check", |repo| {
                     repo.record_blob_check(&remote, &hash, size)?;
-                    let verdict = if size.is_some() { "stored" } else { "not stored" };
-                    Ok(format!("{} is {verdict} on {remote}", util::short_hash(&hash)))
+                    let verdict = if size.is_some() {
+                        "stored"
+                    } else {
+                        "not stored"
+                    };
+                    Ok(format!(
+                        "{} is {verdict} on {remote}",
+                        util::short_hash(&hash)
+                    ))
                 }),
                 Err(e) => self.status(format!("Check on {remote} failed: {e}")),
             },
@@ -2080,10 +2146,7 @@ impl App {
                 }),
                 Err(e) => self.status(format!("Remote '{remote}' scan failed: {e}")),
             },
-            Msg::RemoteConfig {
-                remote,
-                result,
-            } => {
+            Msg::RemoteConfig { remote, result } => {
                 let current = self.edit.borrow().as_ref().map(|e| e.original.clone());
                 if current.as_deref() != Some(remote.as_str()) {
                     return; // the editor was closed or moved on meanwhile
@@ -2165,13 +2228,17 @@ impl App {
                 result,
             } => match result {
                 Ok(()) => {
-                    self.state.borrow_mut().repo_mut(&root).metadata_backups.insert(
-                        remote.clone(),
-                        BackupRecord {
-                            at: util::now(),
-                            db_hash,
-                        },
-                    );
+                    self.state
+                        .borrow_mut()
+                        .repo_mut(&root)
+                        .metadata_backups
+                        .insert(
+                            remote.clone(),
+                            BackupRecord {
+                                at: util::now(),
+                                db_hash,
+                            },
+                        );
                     self.save_state();
                     self.status(format!("Metadata backed up to {remote}"));
                 }
@@ -2235,7 +2302,10 @@ impl App {
                         RemoteHealth::Missing => "MISSING",
                         RemoteHealth::Corrupt => "DAMAGED (deleted there)",
                     };
-                    Ok(format!("{} is {verdict} on {remote}", util::short_hash(&hash)))
+                    Ok(format!(
+                        "{} is {verdict} on {remote}",
+                        util::short_hash(&hash)
+                    ))
                 }),
                 Err(e) => self.status(format!("Verifying on {remote} failed: {e}")),
             },
@@ -2304,7 +2374,8 @@ impl App {
                     .iter()
                     .map(|s| file_row(s, selection.paths.contains(&s.path), min_copies))
                     .collect();
-                self.window.set_at_risk_count(rows.iter().filter(|r| r.at_risk).count() as i32);
+                self.window
+                    .set_at_risk_count(rows.iter().filter(|r| r.at_risk).count() as i32);
                 // Same model, new contents: the list keeps its scroll position.
                 self.files.set_vec(rows);
                 *self.statuses.borrow_mut() = statuses;
@@ -2365,8 +2436,12 @@ impl App {
         w.set_password_available(self.password.borrow().is_some());
 
         let (remotes, chosen) = match repo.db.list_remotes().and_then(|all| {
-            let chosen: HashSet<String> =
-                repo.db.metadata_remotes()?.into_iter().map(|r| r.name).collect();
+            let chosen: HashSet<String> = repo
+                .db
+                .metadata_remotes()?
+                .into_iter()
+                .map(|r| r.name)
+                .collect();
             Ok((all, chosen))
         }) {
             Ok(found) => found,
@@ -2407,7 +2482,10 @@ impl App {
             (n, Some(at)) => {
                 let fresh = chosen_rows.iter().filter(|r| r.up_to_date).count();
                 if fresh == n {
-                    format!("Metadata is backed up and up to date (last backup {}).", util::format_time(at))
+                    format!(
+                        "Metadata is backed up and up to date (last backup {}).",
+                        util::format_time(at)
+                    )
                 } else {
                     format!(
                         "Metadata changed since the last backup ({}): {fresh} of {n} remote(s) up to date.",
@@ -2443,7 +2521,10 @@ fn form_field(backend: &Backend, field: &Field, value: &str, placeholder: &str) 
         .iter()
         .map(|v| SharedString::from(if v.is_empty() { "(rclone default)" } else { v }))
         .collect();
-    let examples: Vec<SharedString> = owned.iter().map(|v| SharedString::from(v.as_str())).collect();
+    let examples: Vec<SharedString> = owned
+        .iter()
+        .map(|v| SharedString::from(v.as_str()))
+        .collect();
     FormField {
         key: field.name.into(),
         label: field.label.into(),

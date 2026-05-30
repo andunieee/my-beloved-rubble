@@ -92,22 +92,32 @@ fn encrypted_remotes_hide_content_and_names() {
     for section in ["[_root-mbr-disk]", "[_plain-mbr-disk]", "[_crypt-mbr-disk]"] {
         assert!(config.contains(section), "{config}");
     }
-    assert!(!config.contains(PASSWORD), "the password is stored obscured");
+    assert!(
+        !config.contains(PASSWORD),
+        "the password is stored obscured"
+    );
 
     repo.push_blob(&remote, &hash).unwrap();
     let dir = store.join(remotes::folder_dir(&repo.folder_id().unwrap()));
     let stored = files_under(&dir);
     assert_eq!(stored.len(), 1, "{stored:?}");
-    assert!(!stored[0].contains(&hash[..8]), "names are encrypted: {stored:?}");
+    assert!(
+        !stored[0].contains(&hash[..8]),
+        "names are encrypted: {stored:?}"
+    );
     let raw = fs::read(dir.join(&stored[0])).unwrap();
-    assert!(!raw.windows(4).any(|w| w == b"meow"), "content is encrypted");
+    assert!(
+        !raw.windows(4).any(|w| w == b"meow"),
+        "content is encrypted"
+    );
 
     // It reads back through the crypt layer.
     assert!(repo.verify_on_remote(&remote, &hash).is_ok());
     assert_eq!(repo.scan_remote(&remote).unwrap().present, [hash]);
     // Metadata backups go next to the folder's directory.
     assert_eq!(
-        repo.with_rclone(|| remotes::backup_location(&remote.target)).unwrap(),
+        repo.with_rclone(|| remotes::backup_location(&remote.target))
+            .unwrap(),
         format!("_root-mbr-disk:{}", store.display())
     );
 
@@ -181,7 +191,9 @@ fn a_lost_folder_is_found_again_from_the_remote_and_the_password() {
             SetupOutcome::Question(q) => return Err(format!("unexpected question {}", q.name)),
         }
         let location = remotes::root_location(&section, &store.display().to_string());
-        assert!(metadata::download(&location, "mbr-metadata-0.tar.gz.encrypted", &scratch).is_err());
+        assert!(
+            metadata::download(&location, "mbr-metadata-0.tar.gz.encrypted", &scratch).is_err()
+        );
         metadata::download(&location, &metadata::backup_name(PASSWORD)?, &scratch)
     })
     .unwrap();

@@ -49,7 +49,9 @@ fn scanning_a_remote_adopts_unknown_blobs_and_pull_downloads_them() {
 
     let mut repo = Repo::init(&folder).unwrap();
     repo.scan().unwrap();
-    repo.db.add_remote("disk", &store.display().to_string()).unwrap();
+    repo.db
+        .add_remote("disk", &store.display().to_string())
+        .unwrap();
     let remote = repo.db.remote("disk").unwrap().unwrap();
 
     // Nothing there yet; a scan of an empty remote is fine.
@@ -67,7 +69,10 @@ fn scanning_a_remote_adopts_unknown_blobs_and_pull_downloads_them() {
     // The stranger got a name, a size, and a remote record.
     let unnamed = format!("unnamed/{stranger}");
     let status = repo.status().unwrap();
-    let s = status.iter().find(|s| s.path == unnamed).expect("adopted name");
+    let s = status
+        .iter()
+        .find(|s| s.path == unnamed)
+        .expect("adopted name");
     assert_eq!(s.size, "from elsewhere".len() as u64);
     assert_eq!(s.remotes, ["disk"]);
     assert!(!s.present_locally);
@@ -79,7 +84,10 @@ fn scanning_a_remote_adopts_unknown_blobs_and_pull_downloads_them() {
     assert!(check.adopted.is_empty() && check.discovered.is_empty());
 
     // Download everything recorded on the remote that is missing here.
-    assert_eq!(repo.blobs_missing_locally("disk").unwrap(), [stranger.clone()]);
+    assert_eq!(
+        repo.blobs_missing_locally("disk").unwrap(),
+        [stranger.clone()]
+    );
     repo.fetch_blob_from(&remote, &stranger).unwrap();
     assert_eq!(
         fs::read_to_string(folder.join(&unnamed)).unwrap(),

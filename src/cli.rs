@@ -551,7 +551,10 @@ fn print_auth_url(url: String) {
 fn prompt_yes_no(label: &str, default: &str) -> Result<String, String> {
     let default = if default == "true" { "y" } else { "n" };
     loop {
-        match prompt(&format!("{label} (y/n)"), default)?.to_lowercase().as_str() {
+        match prompt(&format!("{label} (y/n)"), default)?
+            .to_lowercase()
+            .as_str()
+        {
             "y" | "yes" | "true" => return Ok("true".to_owned()),
             "n" | "no" | "false" => return Ok("false".to_owned()),
             _ => println!("answer y or n"),

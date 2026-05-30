@@ -193,9 +193,9 @@ pub fn download(location: &str, name: &str, scratch: &Path) -> Result<Vec<u8>, S
         .map_err(|e| format!("cannot create {}: {e}", scratch.display()))?;
     let file = scratch.join(name);
     let result = match rclone::download_file(location, name, &file) {
-        Err(e) if rclone::is_not_found(&e) => Err(
-            "there is no metadata backup made with this master password there".to_owned(),
-        ),
+        Err(e) if rclone::is_not_found(&e) => {
+            Err("there is no metadata backup made with this master password there".to_owned())
+        }
         Err(e) => Err(e),
         Ok(()) => std::fs::read(&file).map_err(|e| format!("cannot read {}: {e}", file.display())),
     };
@@ -265,9 +265,7 @@ pub fn restore(dir: &Path, db: &[u8], rclone_conf: &[u8]) -> Result<(Repo, Resto
 /// Create the symlink for an active path: `false` if something is there.
 fn recreate_link(root: &Path, path: &str, hash: &str) -> Result<bool, String> {
     let rel = Path::new(path);
-    let safe = rel
-        .components()
-        .all(|c| matches!(c, Component::Normal(_)));
+    let safe = rel.components().all(|c| matches!(c, Component::Normal(_)));
     if !safe || !util::is_hash(hash) {
         return Err("not a valid tracked path".to_owned());
     }
@@ -356,10 +354,16 @@ mod tests {
         let sealed = seal(&snapshot, "correct horse").unwrap();
         assert!(!sealed.windows(8).any(|w| w == b"database"));
         let (db, conf) = unseal(&sealed, "correct horse").unwrap();
-        assert_eq!((db.as_slice(), conf.as_slice()), (&b"database"[..], &b"[remote]\n"[..]));
+        assert_eq!(
+            (db.as_slice(), conf.as_slice()),
+            (&b"database"[..], &b"[remote]\n"[..])
+        );
         let err = unseal(&sealed, "correct house").unwrap_err();
         assert!(err.contains("wrong master password"), "{err}");
-        let err = unseal(&encrypt("correct horse", b"not a tarball").unwrap(), "correct horse");
+        let err = unseal(
+            &encrypt("correct horse", b"not a tarball").unwrap(),
+            "correct horse",
+        );
         assert!(err.is_err());
     }
 }

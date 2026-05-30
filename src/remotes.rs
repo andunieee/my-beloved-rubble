@@ -75,7 +75,11 @@ impl Layout {
 
     /// The alias for the folder's own directory in the backend.
     pub fn store_section(&self) -> String {
-        let prefix = if self.encrypt { PLAIN_PREFIX } else { DANGEROUS_PREFIX };
+        let prefix = if self.encrypt {
+            PLAIN_PREFIX
+        } else {
+            DANGEROUS_PREFIX
+        };
         format!("{prefix}{}", self.name)
     }
 
@@ -167,7 +171,10 @@ fn create(section: &str, backend: &str, parameters: Value) -> Result<(), String>
         SetupOutcome::Done => Ok(()),
         SetupOutcome::Question(q) => {
             rclone::cancel_setup(section, &q.state).ok();
-            Err(format!("rclone asked '{}' while setting up {backend}", q.name))
+            Err(format!(
+                "rclone asked '{}' while setting up {backend}",
+                q.name
+            ))
         }
     }
 }
@@ -366,7 +373,10 @@ mod tests {
         );
         assert_eq!(encrypted.target(), "_crypt-mbr-drive:");
         let plain = Layout::new("usb", false).unwrap();
-        assert_eq!(plain.sections(), ["_root-mbr-usb", "_dangerouslyplain-mbr-usb"]);
+        assert_eq!(
+            plain.sections(),
+            ["_root-mbr-usb", "_dangerouslyplain-mbr-usb"]
+        );
         assert_eq!(plain.target(), "_dangerouslyplain-mbr-usb:");
         for bad in ["", "_x", "-x", "a b", "a:b", "a/b"] {
             assert!(check_name(bad).is_err(), "{bad}");

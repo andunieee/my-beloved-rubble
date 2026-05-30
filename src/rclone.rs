@@ -55,22 +55,25 @@ pub fn auth_url(since: u64) -> Option<String> {
     file.seek(SeekFrom::Start(since)).ok()?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).ok()?;
-    String::from_utf8_lossy(&bytes).lines().rev().find_map(extract_url)
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .rev()
+        .find_map(extract_url)
 }
 
 fn extract_url(line: &str) -> Option<String> {
     let pos = line.find("/auth?state=")?;
     let start = line[..pos].rfind("http://")?;
     let rest = &line[pos..];
-    let end = rest
-        .find(|c: char| c.is_whitespace())
-        .unwrap_or(rest.len());
+    let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
     Some(format!("{}{}", &line[start..pos], &rest[..end]))
 }
 
 /// Run one librclone RPC call while protecting rclone's process-global state.
 pub fn call(method: &str, input: Value) -> Result<Value, String> {
-    let _guard = lock().lock().map_err(|_| "rclone lock poisoned".to_owned())?;
+    let _guard = lock()
+        .lock()
+        .map_err(|_| "rclone lock poisoned".to_owned())?;
     ensure_initialized();
     let output = rpc(method, input.to_string())?;
     serde_json::from_str(&output).map_err(|e| format!("invalid rclone response: {e}"))

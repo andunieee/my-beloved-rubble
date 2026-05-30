@@ -7,8 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// SHA-256 of a file's contents, as a lowercase hex string.
 pub fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -42,7 +42,11 @@ pub fn format_time(unix: i64) -> String {
     let days = unix.div_euclid(86_400);
     let secs = unix.rem_euclid(86_400);
     let (y, m, d) = civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", secs / 3600, (secs % 3600) / 60)
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}",
+        secs / 3600,
+        (secs % 3600) / 60
+    )
 }
 
 /// Days since 1970-01-01 to (year, month, day). Howard Hinnant's algorithm.

@@ -323,7 +323,10 @@ impl Db {
     }
 
     pub fn remote(&mut self, name: &str) -> Result<Option<Remote>, String> {
-        let sql = format!("SELECT name, target FROM remotes WHERE name = {}", quote(name));
+        let sql = format!(
+            "SELECT name, target FROM remotes WHERE name = {}",
+            quote(name)
+        );
         let r = self.conn.query(&sql).map_err(|e| e.to_string())?;
         Ok(r.rows.first().and_then(|row| {
             Some(Remote {
@@ -506,7 +509,11 @@ mod tests {
         db.set_metadata_remote("a", true).unwrap();
         db.update_remote("a", "c", "x:").unwrap();
         let names = |db: &mut Db| -> Vec<String> {
-            db.metadata_remotes().unwrap().into_iter().map(|r| r.name).collect()
+            db.metadata_remotes()
+                .unwrap()
+                .into_iter()
+                .map(|r| r.name)
+                .collect()
         };
         assert_eq!(names(&mut db), ["c"]);
         db.set_metadata_remote("b", true).unwrap();

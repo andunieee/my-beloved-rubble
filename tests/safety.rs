@@ -37,7 +37,9 @@ impl Drop for TempDir {
 }
 
 fn add_disk(repo: &mut Repo, name: &str, dir: &Path) -> Remote {
-    repo.db.add_remote(name, &dir.display().to_string()).unwrap();
+    repo.db
+        .add_remote(name, &dir.display().to_string())
+        .unwrap();
     repo.db.remote(name).unwrap().unwrap()
 }
 
@@ -59,12 +61,18 @@ fn blobs_are_read_only_and_verification_catches_corruption() {
 
     let remote = add_disk(&mut repo, "disk", &store);
     repo.push_blob(&remote, &hash).unwrap();
-    assert_eq!(repo.verify_on_remote(&remote, &hash).unwrap(), RemoteHealth::Ok);
+    assert_eq!(
+        repo.verify_on_remote(&remote, &hash).unwrap(),
+        RemoteHealth::Ok
+    );
 
     // Rot both copies behind mbr's back.
     let remote_copy = store.join(mbr::rclone::blob_path(&hash));
     fs::write(&remote_copy, "applf").unwrap();
-    assert_eq!(repo.verify_on_remote(&remote, &hash).unwrap(), RemoteHealth::Corrupt);
+    assert_eq!(
+        repo.verify_on_remote(&remote, &hash).unwrap(),
+        RemoteHealth::Corrupt
+    );
     assert!(!remote_copy.exists(), "corrupt remote copy is deleted");
     assert!(repo.db.remotes_for_blob(&hash).unwrap().is_empty());
 
@@ -118,7 +126,12 @@ fn dropping_needs_enough_verified_remote_copies() {
 
     // Fetching brings it back, read-only again.
     repo.fetch_blob(&hash).unwrap();
-    assert!(fs::metadata(repo.blob_path(&hash)).unwrap().permissions().readonly());
+    assert!(
+        fs::metadata(repo.blob_path(&hash))
+            .unwrap()
+            .permissions()
+            .readonly()
+    );
     assert_eq!(fs::read_to_string(folder.join("a.txt")).unwrap(), "apple");
 
     repo.set_min_copies(1).unwrap();
@@ -156,7 +169,10 @@ fn gc_finds_old_versions_and_purge_removes_them_everywhere() {
     assert!(repo.unreferenced_blobs().unwrap().is_empty());
     // The history row stays, now stored nowhere.
     let status = repo.status().unwrap();
-    assert_eq!(status[0].previous_versions[0].stored_summary(), "NOT STORED ANYWHERE");
+    assert_eq!(
+        status[0].previous_versions[0].stored_summary(),
+        "NOT STORED ANYWHERE"
+    );
 }
 
 #[test]
@@ -189,7 +205,12 @@ fn metadata_backup_restores_a_lost_folder() {
     .unwrap();
     let on_remote = store.join(&name);
     assert!(on_remote.is_file());
-    assert!(!fs::read(&on_remote).unwrap().windows(4).any(|w| w == b"meow"));
+    assert!(
+        !fs::read(&on_remote)
+            .unwrap()
+            .windows(4)
+            .any(|w| w == b"meow")
+    );
     // Backups are not blobs: scanning the remote ignores them.
     let check = repo.scan_remote(&remote).unwrap();
     assert!(check.adopted.is_empty());
@@ -202,7 +223,10 @@ fn metadata_backup_restores_a_lost_folder() {
     let sealed = fs::read(&on_remote).unwrap();
     assert!(metadata::unseal(&sealed, "wrong horse").is_err());
     let (db, conf) = metadata::unseal(&sealed, "correct horse").unwrap();
-    assert!(metadata::restore(&fresh, &conf, &db).is_err(), "files swapped");
+    assert!(
+        metadata::restore(&fresh, &conf, &db).is_err(),
+        "files swapped"
+    );
     assert!(!Repo::is_initialized(&fresh));
     let (mut repo, report) = metadata::restore(&fresh, &db, &conf).unwrap();
     assert_eq!(report.files, 1, "{:?}", report.skipped);
@@ -213,13 +237,20 @@ fn metadata_backup_restores_a_lost_folder() {
     let status = repo.status().unwrap();
     let paths: Vec<&str> = status.iter().map(|s| s.path.as_str()).collect();
     assert_eq!(paths, ["notes.txt", "photos/cat.jpg"]);
-    assert!(status.iter().all(|s| !s.present_locally && s.remotes == ["disk"]));
+    assert!(
+        status
+            .iter()
+            .all(|s| !s.present_locally && s.remotes == ["disk"])
+    );
 
     let disk = repo.db.remote("disk").unwrap().unwrap();
     for hash in repo.blobs_missing_locally("disk").unwrap() {
         repo.fetch_blob_from(&disk, &hash).unwrap();
     }
-    assert_eq!(fs::read_to_string(fresh.join("photos/cat.jpg")).unwrap(), "meow");
+    assert_eq!(
+        fs::read_to_string(fresh.join("photos/cat.jpg")).unwrap(),
+        "meow"
+    );
     // The file that was in the way becomes a new version of notes.txt.
     let report = repo.scan().unwrap();
     assert_eq!(report.replaced, ["notes.txt"]);

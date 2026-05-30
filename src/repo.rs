@@ -129,7 +129,9 @@ pub enum LocalHealth {
     Missing,
     /// Its content no longer matches its hash. It was moved to `moved_to`
     /// (under [`CORRUPT_DIR`]), so it now counts as missing.
-    Corrupt { moved_to: PathBuf },
+    Corrupt {
+        moved_to: PathBuf,
+    },
 }
 
 /// Outcome of verifying the copy of a blob stored on a remote.
@@ -479,8 +481,7 @@ impl Repo {
         let holders = self.holders(hash)?;
         let min_copies = self.min_copies()?;
         let root = self.root.clone();
-        let outcome =
-            self.with_rclone(|| drop_local_blob(&root, hash, &holders, min_copies))?;
+        let outcome = self.with_rclone(|| drop_local_blob(&root, hash, &holders, min_copies))?;
         self.record_drop(&outcome)?;
         Ok(outcome)
     }
@@ -676,8 +677,7 @@ impl Repo {
         let root = self.root.clone();
         let now = util::now();
         self.db.transaction(|db| {
-            let found: HashMap<String, u64> =
-                found.into_iter().map(|b| (b.hash, b.size)).collect();
+            let found: HashMap<String, u64> = found.into_iter().map(|b| (b.hash, b.size)).collect();
             let expected: HashSet<String> = db.blobs_on_remote(&remote.name)?.into_iter().collect();
             let sized: HashSet<String> = db.list_blobs()?.into_iter().map(|b| b.hash).collect();
             let known: HashSet<String> = db.known_hashes()?.into_iter().collect();
