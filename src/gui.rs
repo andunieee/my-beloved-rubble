@@ -26,7 +26,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 
 slint::include_modules!();
 
@@ -256,6 +257,9 @@ struct PendingSetup {
     /// The master password: keys the crypt layer, or names the backup.
     password: SecretString,
     purpose: Purpose,
+    /// Set when the user cancels while a step runs: a browser sign-in is
+    /// then cut short, and whatever the step returns is abandoned.
+    cancelled: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -298,6 +302,7 @@ fn answer_automatically(
     mut outcome: Result<mbr::rclone::SetupOutcome, String>,
     parameters: serde_json::Value,
     on_url: &mut dyn FnMut(String),
+    cancel: &AtomicBool,
 ) -> Result<mbr::rclone::SetupOutcome, String> {
     loop {
         let (state, answer) = match &outcome {
@@ -313,6 +318,7 @@ fn answer_automatically(
             answer,
             parameters.clone(),
             on_url,
+            cancel,
         );
     }
 }
@@ -340,7 +346,7 @@ impl PendingSetup {
                     }
                     let begun =
                         mbr::rclone::begin_setup(&self.section, backend, parameters.clone());
-                    answer_automatically(&self.section, begun, parameters, on_url)
+                    answer_automatically(&self.section, begun, parameters, on_url, &self.cancelled)
                 }
                 SetupStep::Continue {
                     state,
@@ -353,8 +359,9 @@ impl PendingSetup {
                         &answer,
                         parameters.clone(),
                         on_url,
+                        &self.cancelled,
                     );
-                    answer_automatically(&self.section, step, parameters, on_url)
+                    answer_automatically(&self.section, step, parameters, on_url, &self.cancelled)
                 }
             };
             let password = self.password.expose_secret();
@@ -577,6 +584,11 @@ fn main() -> Result<(), slint::PlatformError> {
         let app = app.clone();
         w.on_cancel_remote_setup(move || app.cancel_remote_setup());
     }
+    w.on_open_url(|url| {
+        if let Err(e) = open::that_detached(url.as_str()) {
+            log::warn!("cannot open {url}: {e}");
+        }
+    });
 
     // keeping copies safe
     {
@@ -899,6 +911,7 @@ impl App {
             spec,
             password: SecretString::from(password.to_owned()),
             purpose: Purpose::Restore { dir },
+            cancelled: Arc::default(),
         };
         let parameters = backends::form_parameters(backend, values);
         self.run_setup_step(
@@ -1960,6 +1973,7 @@ impl App {
             spec,
             password,
             purpose: Purpose::Remote { layout, folder_id },
+            cancelled: Arc::default(),
         };
         let parameters = backends::form_parameters(backend, values);
         self.run_setup_step(
@@ -2036,9 +2050,23 @@ impl App {
 
     fn cancel_remote_setup(&self) {
         let state = self.window.get_setup_state().to_string();
+        let connecting = self.window.get_setup_connecting();
         let pending = self.setup.borrow().clone();
         self.reset_setup_ui();
         let Some(pending) = pending else { return };
+        if connecting {
+            // A step is running (maybe waiting for a browser sign-in): it
+            // stops and is cleaned up when it returns, see `Msg::Setup`.
+            pending.cancelled.store(true, Ordering::Relaxed);
+            self.status("Cancelling…");
+            return;
+        }
+        self.abandon_setup(pending, state);
+    }
+
+    /// Abort `pending`'s setup conversation, now at `state` (empty when
+    /// there is none to abort), in the background.
+    fn abandon_setup(&self, pending: PendingSetup, state: String) {
         if state.is_empty() && pending.throwaway_config().is_none() {
             return;
         }
@@ -2055,6 +2083,19 @@ impl App {
             }
             tx.send(Msg::Cancelled { result }).ok();
         });
+    }
+
+    /// Record the remote `layout` just set up in rclone.
+    fn save_new_remote(&self, layout: &mbr::remotes::Layout) {
+        let (name, target) = (layout.name.clone(), layout.target());
+        self.with_repo("save remote", |repo| {
+            repo.db.add_remote(&name, &target)?;
+            Ok(format!(
+                "Added remote {name} ({})",
+                mbr::remotes::describe(&target)
+            ))
+        });
+        self.refresh();
     }
 
     /// Clear the form and question panels.
@@ -2167,6 +2208,23 @@ impl App {
                 Ok(()) => self.finish_remote_edit(&old, &name, &target),
                 Err(e) => self.status(format!("Saving rclone settings failed: {e}")),
             },
+            Msg::Setup { pending, result } if pending.cancelled.load(Ordering::Relaxed) => {
+                // The UI was reset when the user cancelled; only clean up.
+                match result {
+                    Err(_) => self.status("Setup cancelled"),
+                    Ok(mbr::rclone::SetupOutcome::Question(q)) => {
+                        self.status("Setup cancelled");
+                        self.abandon_setup(pending, q.state);
+                    }
+                    // Finished before the cancel took effect: the remote
+                    // exists in rclone's config now, so keep it.
+                    Ok(mbr::rclone::SetupOutcome::Done) => {
+                        if let Purpose::Remote { layout, .. } = pending.purpose {
+                            self.save_new_remote(&layout);
+                        }
+                    }
+                }
+            }
             Msg::Setup { pending, result } => {
                 self.window.set_setup_connecting(false);
                 match result {
@@ -2174,6 +2232,7 @@ impl App {
                         self.window
                             .set_setup_help(SharedString::from(format!("Error: {e}")));
                         self.window.set_setup_state(SharedString::default());
+                        self.window.set_setup_url(SharedString::default());
                         self.status(match pending.purpose {
                             Purpose::Remote { .. } => format!("Remote setup failed: {e}"),
                             Purpose::Restore { .. } => format!("Restore failed: {e}"),
@@ -2181,16 +2240,8 @@ impl App {
                     }
                     Ok(mbr::rclone::SetupOutcome::Done) => {
                         if let Purpose::Remote { layout, .. } = pending.purpose {
-                            let (name, target) = (layout.name.clone(), layout.target());
-                            self.with_repo("save remote", |repo| {
-                                repo.db.add_remote(&name, &target)?;
-                                Ok(format!(
-                                    "Added remote {name} ({})",
-                                    mbr::remotes::describe(&target)
-                                ))
-                            });
+                            self.save_new_remote(&layout);
                             self.reset_setup_ui();
-                            self.refresh();
                         }
                     }
                     Ok(mbr::rclone::SetupOutcome::Question(q)) => {

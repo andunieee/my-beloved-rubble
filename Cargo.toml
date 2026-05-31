@@ -37,6 +37,9 @@ serde = { version = "1", features = ["derive"] }
 tar = "0.4.46"
 flate2 = "1.1.10"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # Password hashing and age's scrypt are deliberately slow; unoptimized they
 # take seconds, so optimize them even in debug builds.
 [profile.dev.package]

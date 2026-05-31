@@ -22,7 +22,7 @@ that directory.
 
 ## Setting up a new remote
 
-Give the remote a name, pick the kind of storage, and fill in the form. Fields marked **required** must be filled;
+Pick the kind of storage, give the remote a name, and fill in the form. Fields marked **required** must be filled;
 the others can usually be left alone. The **?** next to each field opens rclone's documentation for it. Storage that
 holds buckets or shares asks which one to use; a local disk asks for the folder.
 
@@ -31,7 +31,8 @@ anyone with access to it, can only be made from the [command line](../cli/) with
 It is meant for disks you keep yourself.
 
 Services that sign in through the browser (Google Drive, Dropbox, OneDrive, …) have little or nothing to fill in, and
-open a browser window once you save. If one doesn't open, the link is shown in the app. Their less common settings
+open a browser window once you save. While the app waits for the sign-in, the link is shown in the app (to copy, or
+to open again if the browser didn't open or was closed), and **Cancel** gives up on it. Their less common settings
 (your own OAuth client id, a service account, …) can be given from the [command line](../cli/) with
 `mbr remote setup <name> <type> --set KEY=VALUE`. If rclone needs anything else, it asks in a box below the form.
 

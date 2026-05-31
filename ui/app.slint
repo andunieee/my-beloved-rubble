@@ -294,13 +294,18 @@ component SetupForm inherits VerticalLayout {
     in property <string> default;
     // The question is yes/no: asked with a checkbox.
     in property <bool> boolean;
+    // The browser sign-in link, while rclone waits for it.
     in property <string> url;
     in-out property <string> answer;
     in property <bool> busy;
     in property <length> text-width;
+    // Ask for a name for the remote, under the backend picker.
+    in property <bool> ask-name;
+    in-out property <string> name;
     callback select-backend(title: string);
     callback answer-question(state: string, answer: string);
     callback cancel();
+    callback open-url(url: string);
     spacing: 8px;
 
     ComboBox {
@@ -310,6 +315,11 @@ component SetupForm inherits VerticalLayout {
         current-index: root.backend-index;
         enabled: !root.busy && root.state == "";
         selected(title) => { root.select-backend(title); }
+    }
+    if root.ask-name: LineEdit {
+        placeholder-text: "my-cloud-drive";
+        text <=> root.name;
+        enabled: !root.busy && root.state == "";
     }
     if root.active && root.state == "": BackendForm {
         fields: root.fields;
@@ -340,13 +350,6 @@ component SetupForm inherits VerticalLayout {
                 width: root.text-width - 20px;
                 color: Palette.foreground.transparentize(25%);
             }
-            if root.url != "": Text {
-                text: root.url;
-                font-size: 11px;
-                wrap: word-wrap;
-                width: root.text-width - 20px;
-                color: Palette.accent-background;
-            }
             if root.boolean: CheckBox {
                 text: "Yes";
                 checked: root.answer == "true";
@@ -368,6 +371,32 @@ component SetupForm inherits VerticalLayout {
                     text: "Cancel";
                     clicked => { root.cancel(); }
                 }
+            }
+        }
+    }
+    if root.url != "": VerticalLayout {
+        spacing: 4px;
+        Text {
+            text: "Sign in in your browser. If it didn't open, or you closed it, use this link:";
+            font-size: 11px;
+            wrap: word-wrap;
+            width: root.text-width;
+            color: Palette.foreground.transparentize(25%);
+        }
+        // Selectable, to copy it.
+        TextInput {
+            text: root.url;
+            read-only: true;
+            font-size: 11px;
+            wrap: word-wrap;
+            width: root.text-width;
+            color: Palette.accent-background;
+        }
+        HorizontalLayout {
+            alignment: start;
+            Button {
+                text: "Open link";
+                clicked => { root.open-url(root.url); }
             }
         }
     }
@@ -548,6 +577,7 @@ export component AppWindow inherits Window {
     callback submit-form(name: string, backend: string, values: [string]);
     callback submit-remote-setup(backend: string, state: string, answer: string);
     callback cancel-remote-setup();
+    callback open-url(url: string);
     // keeping copies safe
     callback drop-selected();
     callback verify-selected();
@@ -846,6 +876,7 @@ export component AppWindow inherits Window {
                                         select-backend(title) => { root.select-backend(title); }
                                         answer-question(state, answer) => { root.submit-remote-setup(root.setup-backend, state, answer); }
                                         cancel => { root.cancel-remote-setup(); }
+                                        open-url(url) => { root.open-url(url); }
                                     }
                                     if root.setup-state == "": HorizontalLayout {
                                         spacing: 6px;
@@ -1533,12 +1564,9 @@ width: Side.text-width;
                                 spacing: 6px;
                                 SectionTitle { text: "SET UP A NEW REMOTE"; help: "remotes/#setting-up-a-new-remote"; }
 
-                                LineEdit {
-                                    placeholder-text: "name (e.g. backup)";
-                                    text <=> root.new-remote-name;
-                                    enabled: !root.busy && root.setup-state == "";
-                                }
                                 SetupForm {
+                                    ask-name: true;
+                                    name <=> root.new-remote-name;
                                     backend-titles: root.backend-titles;
                                     backend-index: root.setup-backend-index;
                                     active: root.setup-active;
@@ -1556,6 +1584,7 @@ width: Side.text-width;
                                     select-backend(title) => { root.select-backend(title); }
                                     answer-question(state, answer) => { root.submit-remote-setup(root.setup-backend, state, answer); }
                                     cancel => { root.cancel-remote-setup(); }
+                                    open-url(url) => { root.open-url(url); }
                                 }
                                 if root.setup-active && root.setup-state == "": VerticalLayout {
                                     spacing: 8px;
@@ -1577,7 +1606,8 @@ width: Side.text-width;
                                         }
                                         Button {
                                             text: "Cancel";
-                                            enabled: !root.busy;
+                                            // Also cuts a browser sign-in short.
+                                            enabled: !root.busy || root.setup-connecting;
                                             clicked => { root.cancel-remote-setup(); }
                                         }
                                     }

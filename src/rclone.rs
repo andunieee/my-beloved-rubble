@@ -9,6 +9,7 @@ use crate::util::is_hash;
 use librclone::{initialize, rpc};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once, OnceLock};
 use std::time::Duration;
 
@@ -41,9 +42,24 @@ fn log_len() -> u64 {
 
 fn ensure_initialized() {
     INITIALIZED.call_once(|| {
-        // Must be set before rclone reads its log-file option at init time.
-        unsafe { std::env::set_var("RCLONE_LOG_FILE", log_path()) };
+        // rclone read its `RCLONE_*` environment when the library loaded,
+        // so set the log file directly; `initialize` then opens it.
+        let log = json!({"log": {"File": log_path()}});
+        if let Err(e) = rpc("options/set", log.to_string()) {
+            log::warn!("cannot send rclone's log to {}: {e}", log_path().display());
+        }
+        // Opening it also points the whole process's stderr at it; keep
+        // ours (logs, panics) where it was.
+        #[cfg(unix)]
+        let stderr = unsafe { libc::dup(libc::STDERR_FILENO) };
         initialize();
+        #[cfg(unix)]
+        if stderr >= 0 {
+            unsafe {
+                libc::dup2(stderr, libc::STDERR_FILENO);
+                libc::close(stderr);
+            }
+        }
     });
 }
 
@@ -283,12 +299,15 @@ pub fn cancel_setup(name: &str, state: &str) -> Result<(), String> {
 /// Like [`continue_setup`], but while rclone blocks doing OAuth (browser
 /// flow) it watches rclone's log for the auth URL and reports it through
 /// `on_url` — so the UI can show the link if the browser fails to open.
+/// Once `cancel` is set, the sign-in is cut short (see
+/// [`abort_browser_sign_in`]) and the step fails.
 pub fn continue_setup_watching(
     name: &str,
     state: &str,
     answer: &str,
     parameters: Value,
     on_url: &mut dyn FnMut(String),
+    cancel: &AtomicBool,
 ) -> Result<SetupOutcome, String> {
     // Only URLs logged by this step count, not ones from earlier setups.
     let since = log_len();
@@ -302,6 +321,7 @@ pub fn continue_setup_watching(
     });
 
     let mut reported: Option<String> = None;
+    let mut aborted = false;
     loop {
         match rx.recv_timeout(Duration::from_millis(300)) {
             Ok(result) => return result,
@@ -310,7 +330,14 @@ pub fn continue_setup_watching(
                     && reported.as_deref() != Some(url.as_str())
                 {
                     reported = Some(url.clone());
+                    aborted = false;
                     on_url(url);
+                }
+                // Only once per sign-in: its server takes one answer. If
+                // its URL wasn't logged, try where rclone always puts it.
+                if cancel.load(Ordering::Relaxed) && !aborted {
+                    aborted =
+                        abort_browser_sign_in(reported.as_deref().unwrap_or(DEFAULT_SIGN_IN_URL));
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -318,6 +345,39 @@ pub fn continue_setup_watching(
             }
         }
     }
+}
+
+/// Where rclone's local sign-in server listens (its `bindAddress`).
+const DEFAULT_SIGN_IN_URL: &str = "http://127.0.0.1:53682/";
+
+/// Cut short the browser sign-in whose link is `auth_url`: rclone waits
+/// for the browser to come back to its local sign-in server, so answer
+/// that server with an error in the browser's place. Whether the server
+/// took the answer.
+pub fn abort_browser_sign_in(auth_url: &str) -> bool {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+    let Some(host) = auth_url
+        .strip_prefix("http://")
+        .and_then(|rest| rest.split_once('/'))
+        .map(|(host, _)| host)
+    else {
+        return false;
+    };
+    let Some(addr) = host.to_socket_addrs().ok().and_then(|mut a| a.next()) else {
+        return false;
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) else {
+        return false;
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    let request = format!("GET /?error=cancelled HTTP/1.0\r\nHost: {host}\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut reply = Vec::new();
+    stream.read_to_end(&mut reply).ok();
+    !reply.is_empty()
 }
 
 /// The remote `name` already exists in the selected config.

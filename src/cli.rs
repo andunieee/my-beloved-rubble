@@ -8,6 +8,7 @@ use mbr::repo::{LocalHealth, RemoteHealth, Repo};
 use mbr::state::{AppState, BackupRecord, RepoState};
 use mbr::util;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 #[derive(Parser)]
 #[command(
@@ -536,6 +537,7 @@ fn answer_questions(
             &answer,
             parameters.clone(),
             &mut print_auth_url,
+            &AtomicBool::new(false),
         );
         outcome = finish(step)?;
     }
