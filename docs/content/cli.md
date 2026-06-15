@@ -11,11 +11,10 @@ least 6).
 
 ```
 mbr init [dir]                    attach mbr to a folder
-mbr restore [dir] (--from <type> | --backup FILE | --db FILE --rclone-conf FILE)
+mbr restore [dir] (--from <type> | --backup FILE)
                                   make a folder the one a metadata backup
                                   describes: from a remote (asking for the
-                                  password and its settings), a backup file,
-                                  or the database and rclone config
+                                  password and its settings) or a backup file
 mbr scan                          take in new files, record removals
 mbr ls                            list tracked files
 mbr info <path|hash>              full details of one file

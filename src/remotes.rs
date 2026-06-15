@@ -22,15 +22,26 @@
 //! backups don't go in the folder's directory but next to it, in the
 //! bucket or folder the user named (see [`backup_location`]): a lost folder
 //! is found again from the remote's settings and the master password alone.
+//!
+//! The database is where remotes are kept: `.mbr/rclone.conf` can always be
+//! written again from it and the master password ([`Repo::write_rclone_config`]).
+//! Only the backend's own section holds anything else, so that section is
+//! copied into the database whenever rclone may have changed it: when a
+//! remote is set up or edited, and after anything rclone does (it refreshes
+//! sign-in tokens on its own) — see [`Repo::absorb_rclone_config`].
 
+use crate::db::{Remote, RemoteRecord};
 use crate::rclone::{self, SetupOutcome};
-use crate::repo::Repo;
+use crate::repo::{self, Repo};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 pub const ROOT_PREFIX: &str = "_root-mbr-";
 pub const PLAIN_PREFIX: &str = "_plain-mbr-";
 pub const CRYPT_PREFIX: &str = "_crypt-mbr-";
 pub const DANGEROUS_PREFIX: &str = "_dangerouslyplain-mbr-";
+/// Every prefix of the sections mbr makes.
+const PREFIXES: [&str; 4] = [ROOT_PREFIX, PLAIN_PREFIX, CRYPT_PREFIX, DANGEROUS_PREFIX];
 /// Database setting holding the folder id.
 pub const FOLDER_ID_SETTING: &str = "folder_id";
 
@@ -147,22 +158,111 @@ impl Layout {
     }
 
     fn create_layers(&self, spec: &str, folder_id: &str, password: &str) -> Result<(), String> {
-        let store = format!("{}:{}", self.root_section(), location(spec, folder_id));
-        create(&self.store_section(), "alias", json!({ "remote": store }))?;
+        create(
+            &self.store_section(),
+            "alias",
+            json!({ "remote": self.store_remote(spec, folder_id) }),
+        )?;
         if self.encrypt {
-            create(
-                &self.crypt_section(),
-                "crypt",
-                json!({
-                    "remote": format!("{}:", self.store_section()),
-                    "password": password,
-                    "filename_encryption": "standard",
-                    "directory_name_encryption": "true",
-                }),
-            )?;
+            let mut parameters = self.crypt_settings();
+            parameters.insert("password".to_owned(), password.to_owned());
+            create(&self.crypt_section(), "crypt", json!(parameters))?;
         }
         Ok(())
     }
+
+    /// What the alias section points at: the folder's directory.
+    fn store_remote(&self, spec: &str, folder_id: &str) -> String {
+        format!("{}:{}", self.root_section(), location(spec, folder_id))
+    }
+
+    /// The crypt section's settings, but its password.
+    fn crypt_settings(&self) -> BTreeMap<String, String> {
+        BTreeMap::from(
+            [
+                ("remote", format!("{}:", self.store_section())),
+                ("filename_encryption", "standard".to_owned()),
+                ("directory_name_encryption", "true".to_owned()),
+            ]
+            .map(|(k, v)| (k.to_owned(), v)),
+        )
+    }
+}
+
+// ── rclone.conf ──
+
+/// An rclone config file: settings by section, values exactly as written.
+pub type Config = BTreeMap<String, BTreeMap<String, String>>;
+
+/// Read an rclone config file's text.
+pub fn parse_config(text: &str) -> Config {
+    let mut config = Config::new();
+    let mut section: Option<&mut BTreeMap<String, String>> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            section = Some(config.entry(name.trim().to_owned()).or_default());
+        } else if let (Some(section), Some((key, value))) = (section.as_mut(), line.split_once('='))
+        {
+            section.insert(key.trim().to_owned(), value.trim().to_owned());
+        }
+    }
+    config
+}
+
+/// The text of an rclone config file, each section's `type` first.
+pub fn format_config(config: &Config) -> String {
+    let mut text = String::new();
+    for (name, settings) in config {
+        text += &format!("[{name}]\n");
+        if let Some(kind) = settings.get("type") {
+            text += &format!("type = {kind}\n");
+        }
+        for (key, value) in settings.iter().filter(|(k, _)| *k != "type") {
+            text += &format!("{key} = {value}\n");
+        }
+        text += "\n";
+    }
+    text
+}
+
+/// The rclone sections of the remote `name` recorded as `record`, in the
+/// folder `folder_id`, its crypt layer keyed with `obscured` (the master
+/// password, obscured by rclone).
+pub fn render_sections(
+    name: &str,
+    record: &RemoteRecord,
+    folder_id: &str,
+    obscured: &str,
+) -> Config {
+    let layout = Layout {
+        name: name.to_owned(),
+        encrypt: record.encrypt,
+    };
+    let mut config = Config::new();
+    let mut root = record.config.clone();
+    root.insert("type".to_owned(), record.backend.clone());
+    config.insert(layout.root_section(), root);
+    config.insert(
+        layout.store_section(),
+        BTreeMap::from([
+            ("type".to_owned(), "alias".to_owned()),
+            (
+                "remote".to_owned(),
+                layout.store_remote(&record.spec, folder_id),
+            ),
+        ]),
+    );
+    if record.encrypt {
+        let mut crypt = layout.crypt_settings();
+        crypt.insert("type".to_owned(), "crypt".to_owned());
+        crypt.insert("password".to_owned(), obscured.to_owned());
+        config.insert(layout.crypt_section(), crypt);
+    }
+    config
 }
 
 /// Create a section that needs no questions answered.
@@ -310,6 +410,128 @@ pub fn owned_sections(target: &str) -> Vec<String> {
 }
 
 impl Repo {
+    /// This folder's rclone config, as it is now (empty if missing).
+    fn read_rclone_config(&self) -> Result<Config, String> {
+        let path = self.rclone_config_path();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Ok(parse_config(&text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::new()),
+            Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+        }
+    }
+
+    /// Record the remote `layout` just set up in rclone, in the bucket or
+    /// folder `spec`: its backend's settings are copied from rclone.conf.
+    pub fn add_remote(&mut self, layout: &Layout, spec: &str) -> Result<Remote, String> {
+        let mut config = self
+            .read_rclone_config()?
+            .remove(&layout.root_section())
+            .ok_or_else(|| format!("the rclone settings of '{}' are missing", layout.name))?;
+        let backend = config.remove("type").unwrap_or_default();
+        let record = RemoteRecord {
+            backend,
+            spec: spec.trim().to_owned(),
+            encrypt: layout.encrypt,
+            metadata_backup: false,
+            config,
+        };
+        self.db.add_remote(&layout.name, &record)?;
+        self.db
+            .remote(&layout.name)?
+            .ok_or_else(|| format!("remote '{}' vanished", layout.name))
+    }
+
+    /// Copy the settings of every remote's backend from rclone.conf into
+    /// the database, where they changed. Remotes whose section is missing
+    /// keep what the database says.
+    pub fn absorb_rclone_config(&mut self) -> Result<(), String> {
+        let config = self.read_rclone_config()?;
+        for (name, mut record) in self.db.remote_records()? {
+            let Some(mut settings) = config.get(&format!("{ROOT_PREFIX}{name}")).cloned() else {
+                continue;
+            };
+            let Some(backend) = settings.remove("type") else {
+                continue;
+            };
+            if backend == record.backend && settings == record.config {
+                continue;
+            }
+            record.backend = backend;
+            record.config = settings;
+            self.db.set_remote_record(&name, &record)?;
+        }
+        Ok(())
+    }
+
+    /// Write the sections of every remote into rclone.conf again, from the
+    /// database alone, replacing whatever sections mbr made before; others
+    /// are kept. Crypt layers are keyed with `password`, or without it with
+    /// the (obscured) master password already in rclone.conf.
+    pub fn write_rclone_config(&mut self, password: Option<&str>) -> Result<(), String> {
+        let current = self.read_rclone_config()?;
+        let records = self.db.remote_records()?;
+        let obscured = if records.values().any(|r| r.encrypt) {
+            match password {
+                Some(password) => rclone::obscure(password)?,
+                None => current
+                    .iter()
+                    .filter(|(name, _)| name.starts_with(CRYPT_PREFIX))
+                    .find_map(|(_, s)| s.get("password").cloned())
+                    .ok_or("the master password is needed to write the rclone settings")?,
+            }
+        } else {
+            String::new()
+        };
+        let folder_id = self.folder_id()?;
+        let mut config: Config = current
+            .into_iter()
+            .filter(|(name, _)| !PREFIXES.iter().any(|p| name.starts_with(p)))
+            .collect();
+        for (name, record) in &records {
+            config.extend(render_sections(name, record, &folder_id, &obscured));
+        }
+
+        let path = self.rclone_config_path();
+        let tmp = path.with_extension("conf.tmp");
+        std::fs::write(&tmp, format_config(&config))
+            .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        repo::ensure_rclone_config(&tmp)?;
+        rclone::with_config(&path, || {
+            std::fs::rename(&tmp, &path)
+                .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+            // rclone may still hold the remotes as they were.
+            rclone::forget_cached_remotes()
+        })
+    }
+
+    /// Whether rclone.conf lacks a section of some remote.
+    pub fn rclone_config_incomplete(&mut self) -> Result<bool, String> {
+        let config = self.read_rclone_config()?;
+        Ok(self.db.remote_records()?.iter().any(|(name, record)| {
+            Layout {
+                name: name.clone(),
+                encrypt: record.encrypt,
+            }
+            .sections()
+            .iter()
+            .any(|section| !config.contains_key(section))
+        }))
+    }
+
+    /// Rename remote `old` to `name`: its records follow it, and its rclone
+    /// sections are written again under the new name (see
+    /// [`Repo::write_rclone_config`] for `password`).
+    pub fn rename_remote(
+        &mut self,
+        old: &str,
+        name: &str,
+        password: Option<&str>,
+    ) -> Result<(), String> {
+        check_name(name)?;
+        self.db.rename_remote(old, name)?;
+        self.write_rclone_config(password)
+    }
+
     /// This folder's id (12 hex digits), made on first use.
     pub fn folder_id(&mut self) -> Result<String, String> {
         if let Some(id) = self.db.setting(FOLDER_ID_SETTING)?

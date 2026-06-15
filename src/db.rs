@@ -1,30 +1,72 @@
-//! SQLite metadata store for a rubble folder.
+//! The metadata store of a rubble folder: an [iroh-docs] replica whose
+//! entry values live in an [iroh-blobs] store, both under `.mbr/db/`, laid
+//! out as iroh-docs' own `Docs::persistent` would, so the same files can
+//! later be synced with other devices.
 //!
-//! Six tables:
-//! - `paths`: every name the folder has ever held — which blob it pointed
-//!   to, when it was added, and (once gone or replaced) when it was removed.
-//!   A path is *active* while `removed_at` is NULL.
-//! - `blobs`: content-addressed blobs (hash → size).
-//! - `remotes`: configured rclone remotes (name → rclone target).
-//! - `blob_remotes`: which blobs are known to be stored on which remotes.
-//! - `metadata_remotes`: remotes chosen to hold encrypted backups of this
-//!   database (see [`crate::metadata`]).
-//! - `settings`: folder-wide key → value settings (e.g. `min_copies`).
+//! An iroh-docs entry is identified by `(key, author)`, each device writing
+//! as its own author, and a newer entry replaces an older one with the same
+//! key and author. Writing an entry also deletes the same author's entries
+//! whose keys it prefixes, so every key segment here ends with a NUL byte:
+//! no key is ever a prefix of another. An empty entry is a deletion.
 //!
-//! minisqlite has no parameter binding, so every string value is inlined
-//! through [`quote`] (integers are inlined directly, which is always safe).
+//! Keys (segments shown separated by `/`, each actually NUL-terminated):
+//!
+//! ```text
+//! setting/<key>                 → value
+//! remote/<name>                 → JSON (RemoteRecord); read from this device's author only
+//! blob/<sha256>/<size>          → "1"
+//! on/<remote>/<sha256>          → "1"   the blob is stored on the remote
+//! path/<path>/<µs>/<sha256|->   → "1"   from then on, the path names the blob ("-": nothing)
+//! ```
+//!
+//! Everything but settings and remotes is carried by the key itself, with
+//! the same one-byte value, so loading never reads more than a handful of
+//! values. A path's history is a log of events that are never rewritten:
+//! each event closes the path's previous one.
+//!
+//! The whole store is read into memory on open and kept in step with every
+//! write, so reads never touch the disk.
+//!
+//! [iroh-docs]: https://docs.rs/iroh-docs
+//! [iroh-blobs]: https://docs.rs/iroh-blobs
 
-use minisqlite::{Connection, Value};
+use iroh_blobs::store::fs::FsStore;
+use iroh_docs::store::Query;
+use iroh_docs::store::fs::Store as DocStore;
+use iroh_docs::{Author, AuthorId, NamespaceId, NamespaceSecret};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+/// The iroh-docs store, inside the database directory.
+const DOCS_FILE: &str = "docs.redb";
+/// This device's author id, as iroh-docs' `Docs::persistent` keeps it.
+const AUTHOR_FILE: &str = "default-author";
+/// The iroh-blobs store holding entry values, inside the database directory.
+const BLOBS_DIR: &str = "blobs";
+/// The value of entries that carry everything in their key.
+const MARKER: &[u8] = b"1";
+/// The path event segment meaning "the path names nothing any more".
+const REMOVED: &str = "-";
+
 pub struct Db {
-    conn: Connection,
+    rt: tokio::runtime::Runtime,
+    docs: DocStore,
+    blobs: FsStore,
+    namespace: NamespaceId,
+    author: Author,
+    /// The hash of [`MARKER`], stored once.
+    marker: iroh_blobs::Hash,
+    cache: Cache,
+    /// Inside [`Db::batch`]: writes are committed when it ends.
+    batching: bool,
+    /// The last path event timestamp handed out (µs), to keep them unique.
+    clock: u64,
 }
 
-/// One row of `paths`.
+/// One name a path held: from `added_at` until `removed_at` (unix seconds).
 #[derive(Debug, Clone)]
 pub struct PathRecord {
-    pub id: i64,
     pub path: String,
     pub hash: String,
     pub added_at: i64,
@@ -37,391 +79,609 @@ impl PathRecord {
     }
 }
 
-/// One row of `blobs`.
+/// A content-addressed blob the folder knows of.
 #[derive(Debug, Clone)]
 pub struct BlobRecord {
     pub hash: String,
     pub size: u64,
 }
 
-/// One row of `remotes`.
+/// A remote, as the rest of mbr uses it.
 #[derive(Debug, Clone)]
 pub struct Remote {
     pub name: String,
-    /// rclone destination this remote maps to, e.g. `backup:bucket/mbr`.
+    /// rclone destination this remote maps to, e.g. `_crypt-mbr-drive:`.
     pub target: String,
 }
 
-/// Single-quote a string literal for inlining into SQL.
-fn quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+/// Everything known about a remote: enough to write its rclone settings
+/// again (see [`crate::remotes::render_config`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteRecord {
+    /// rclone backend of the storage itself (`drive`, `s3`, `local`, …).
+    pub backend: String,
+    /// The bucket, share or folder named when setting it up.
+    pub spec: String,
+    /// Wrapped in a crypt layer keyed with the master password.
+    pub encrypt: bool,
+    /// Receives metadata backups.
+    #[serde(default)]
+    pub metadata_backup: bool,
+    /// The settings of the storage's rclone section, besides its `type`,
+    /// exactly as they are in `rclone.conf` (secrets obscured).
+    #[serde(default)]
+    pub config: BTreeMap<String, String>,
 }
 
-fn as_i64(v: &Value) -> Option<i64> {
-    match v {
-        Value::Integer(i) => Some(*i),
-        _ => None,
+impl RemoteRecord {
+    fn target(&self, name: &str) -> String {
+        crate::remotes::Layout {
+            name: name.to_owned(),
+            encrypt: self.encrypt,
+        }
+        .target()
     }
 }
 
-fn as_text(v: &Value) -> Option<String> {
-    match v {
-        Value::Text(s) => Some(s.clone()),
-        _ => None,
+/// One event in a path's history.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PathEvent {
+    /// When it happened (unix µs).
+    pub at: u64,
+    /// The blob the path names from then on; none once it is removed.
+    pub hash: Option<String>,
+}
+
+/// The whole metadata, as backed up (see [`Db::export`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Dump {
+    pub settings: BTreeMap<String, String>,
+    pub remotes: BTreeMap<String, RemoteRecord>,
+    /// Blob sizes by hash.
+    pub blobs: BTreeMap<String, u64>,
+    /// The blobs stored on each remote.
+    pub locations: BTreeMap<String, BTreeSet<String>>,
+    /// Every path's history, oldest event first.
+    pub paths: BTreeMap<String, Vec<PathEvent>>,
+}
+
+/// The store, in memory.
+#[derive(Default)]
+struct Cache {
+    settings: BTreeMap<String, String>,
+    remotes: BTreeMap<String, RemoteRecord>,
+    /// Every size recorded for each blob (normally exactly one).
+    blobs: BTreeMap<String, BTreeSet<u64>>,
+    /// `(hash, remote)` pairs.
+    locations: BTreeSet<(String, String)>,
+    paths: BTreeMap<String, Vec<PathEvent>>,
+}
+
+fn err(e: impl std::fmt::Display) -> String {
+    e.to_string()
+}
+
+/// A key made of `segments`, each NUL-terminated.
+fn key(segments: &[&str]) -> Vec<u8> {
+    let mut key = Vec::new();
+    for segment in segments {
+        key.extend_from_slice(segment.as_bytes());
+        key.push(0);
     }
+    key
+}
+
+/// The segments of a key made by [`key`].
+fn segments(key: &[u8]) -> Option<Vec<&str>> {
+    let body = key.strip_suffix(&[0])?;
+    body.split(|&b| b == 0)
+        .map(|s| std::str::from_utf8(s).ok())
+        .collect()
+}
+
+/// A segment may not hold the separator.
+fn check_segment(s: &str) -> Result<(), String> {
+    if s.contains('\0') {
+        return Err(format!("{s:?} contains a NUL byte"));
+    }
+    Ok(())
+}
+
+fn random_bytes() -> [u8; 32] {
+    use argon2::password_hash::rand_core::{OsRng, RngCore};
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    bytes
+}
+
+fn now_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
+
+fn seconds(micros: u64) -> i64 {
+    (micros / 1_000_000) as i64
 }
 
 impl Db {
-    /// Run `f` inside one transaction: committed if it returns `Ok`, rolled
-    /// back otherwise. Much faster than autocommitting each statement, and
-    /// keeps a multi-statement update all-or-nothing.
-    pub fn transaction<T>(
+    /// Open the store in the directory `dir`, creating it if need be.
+    pub fn open(dir: &Path) -> Result<Self, String> {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(err)?;
+        let mut docs = DocStore::persistent(dir.join(DOCS_FILE)).map_err(err)?;
+        let blobs = rt
+            .block_on(FsStore::load(dir.join(BLOBS_DIR)))
+            .map_err(err)?;
+
+        let existing = docs
+            .list_namespaces()
+            .map_err(err)?
+            .next()
+            .transpose()
+            .map_err(err)?;
+        let namespace = match existing {
+            Some((id, _)) => id,
+            None => {
+                let secret = NamespaceSecret::from_bytes(&random_bytes());
+                let id = secret.id();
+                docs.new_replica(secret).map_err(err)?;
+                id
+            }
+        };
+
+        let author_file = dir.join(AUTHOR_FILE);
+        let saved = match std::fs::read_to_string(&author_file) {
+            Ok(text) => {
+                let id: AuthorId = text.trim().parse().map_err(err)?;
+                docs.get_author(&id).map_err(err)?
+            }
+            Err(_) => None,
+        };
+        let author = match saved {
+            Some(author) => author,
+            None => {
+                let author = Author::from_bytes(&random_bytes());
+                docs.import_author(author.clone()).map_err(err)?;
+                std::fs::write(&author_file, author.id().to_string())
+                    .map_err(|e| format!("cannot write {}: {e}", author_file.display()))?;
+                author
+            }
+        };
+
+        let marker = rt
+            .block_on(blobs.add_bytes(MARKER).with_named_tag(b"marker"))
+            .map_err(err)?
+            .hash;
+        let mut db = Self {
+            rt,
+            docs,
+            blobs,
+            namespace,
+            author,
+            marker,
+            cache: Cache::default(),
+            batching: false,
+            clock: 0,
+        };
+        db.reload()?;
+        Ok(db)
+    }
+
+    /// Read the whole store into memory again.
+    pub fn reload(&mut self) -> Result<(), String> {
+        let mut cache = Cache::default();
+        let mut values: Vec<(String, iroh_blobs::Hash)> = Vec::new();
+        // The newest entry of every key, whoever wrote it, except remotes:
+        // each device sees its own version of those.
+        let entries = self
+            .docs
+            .get_many(self.namespace, Query::single_latest_per_key().build())
+            .map_err(err)?;
+        for entry in entries {
+            let entry = entry.map_err(err)?;
+            let Some(parts) = segments(entry.key()) else {
+                continue;
+            };
+            match parts[..] {
+                ["setting", name] => {
+                    values.push((format!("setting\0{name}"), entry.content_hash()))
+                }
+                ["blob", hash, size] => {
+                    if let Ok(size) = size.parse() {
+                        cache.blobs.entry(hash.to_owned()).or_default().insert(size);
+                    }
+                }
+                ["on", remote, hash] => {
+                    cache.locations.insert((hash.to_owned(), remote.to_owned()));
+                }
+                ["path", path, at, hash] => {
+                    let Ok(at) = at.parse() else { continue };
+                    let hash = (hash != REMOVED).then(|| hash.to_owned());
+                    cache
+                        .paths
+                        .entry(path.to_owned())
+                        .or_default()
+                        .push(PathEvent { at, hash });
+                    self.clock = self.clock.max(at);
+                }
+                _ => {}
+            }
+        }
+        let own = self
+            .docs
+            .get_many(
+                self.namespace,
+                Query::author(self.author.id())
+                    .key_prefix(key(&["remote"]))
+                    .build(),
+            )
+            .map_err(err)?;
+        for entry in own {
+            let entry = entry.map_err(err)?;
+            if let Some(["remote", name]) = segments(entry.key()).as_deref() {
+                values.push((format!("remote\0{name}"), entry.content_hash()));
+            }
+        }
+
+        for (what, hash) in values {
+            let bytes = self.rt.block_on(self.blobs.get_bytes(hash)).map_err(err)?;
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            match what.split_once('\0') {
+                Some(("setting", name)) => {
+                    cache.settings.insert(name.to_owned(), text);
+                }
+                Some(("remote", name)) => match serde_json::from_str(&text) {
+                    Ok(record) => {
+                        cache.remotes.insert(name.to_owned(), record);
+                    }
+                    Err(e) => log::warn!("ignoring unreadable remote '{name}': {e}"),
+                },
+                _ => {}
+            }
+        }
+        for events in cache.paths.values_mut() {
+            events.sort();
+        }
+        self.cache = cache;
+        Ok(())
+    }
+
+    // ── writing entries ──
+
+    /// Set `key` to `value`, keeping the value in the blob store under a tag
+    /// named after the key (so it is never garbage collected).
+    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), String> {
+        let hash = if value == MARKER {
+            self.marker
+        } else {
+            self.rt
+                .block_on(self.blobs.add_bytes(value.to_vec()).with_named_tag(key))
+                .map_err(err)?
+                .hash
+        };
+        let mut replica = self.docs.open_replica(&self.namespace).map_err(err)?;
+        self.rt
+            .block_on(replica.insert(key, &self.author, hash, value.len() as u64))
+            .map_err(err)?;
+        self.commit()
+    }
+
+    /// Delete `key` (for every device: the deletion is the newest entry).
+    fn delete(&mut self, key: &[u8]) -> Result<(), String> {
+        let mut replica = self.docs.open_replica(&self.namespace).map_err(err)?;
+        self.rt
+            .block_on(replica.delete_prefix(key, &self.author))
+            .map_err(err)?;
+        if value_tagged(key) {
+            self.rt
+                .block_on(self.blobs.tags().delete(key))
+                .map_err(err)?;
+        }
+        self.commit()
+    }
+
+    /// Commit what was written, unless a batch is running.
+    fn commit(&mut self) -> Result<(), String> {
+        if self.batching {
+            return Ok(());
+        }
+        self.docs.flush().map_err(err)?;
+        self.rt.block_on(self.blobs.sync_db()).map_err(err)
+    }
+
+    /// Run `f`, committing its writes once at the end (much faster than
+    /// one by one). Not a transaction: writes made before an error stay.
+    pub fn batch<T>(
         &mut self,
         f: impl FnOnce(&mut Self) -> Result<T, String>,
     ) -> Result<T, String> {
-        self.conn.execute("BEGIN").map_err(|e| e.to_string())?;
-        match f(self) {
-            Ok(value) => {
-                self.conn.execute("COMMIT").map_err(|e| e.to_string())?;
-                Ok(value)
-            }
-            Err(e) => {
-                self.conn.execute("ROLLBACK").ok();
-                Err(e)
-            }
-        }
+        let nested = std::mem::replace(&mut self.batching, true);
+        let result = f(self);
+        self.batching = nested;
+        let committed = self.commit();
+        let value = result?;
+        committed.map(|()| value)
     }
 
-    pub fn open(path: &Path) -> Result<Self, String> {
-        let conn = Connection::open(path).map_err(|e| e.to_string())?;
-        let mut db = Self { conn };
-        db.init_schema()?;
-        Ok(db)
-    }
-
-    /// A throwaway database, for when the real one has to be closed.
-    pub fn open_in_memory() -> Result<Self, String> {
-        let conn = Connection::open_in_memory().map_err(|e| e.to_string())?;
-        let mut db = Self { conn };
-        db.init_schema()?;
-        Ok(db)
-    }
-
-    /// Write a consistent copy of the whole database to `dest`, which must
-    /// not exist yet.
-    pub fn snapshot_to(&mut self, dest: &Path) -> Result<(), String> {
-        let dest = dest
-            .to_str()
-            .ok_or_else(|| format!("{} is not valid UTF-8", dest.display()))?;
-        self.conn
-            .execute(&format!("VACUUM INTO {}", quote(dest)))
-            .map_err(|e| e.to_string())
-    }
-
-    fn init_schema(&mut self) -> Result<(), String> {
-        self.conn
-            .execute(
-                "CREATE TABLE IF NOT EXISTS paths (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    path TEXT NOT NULL,
-                    hash TEXT NOT NULL,
-                    added_at INTEGER NOT NULL,
-                    removed_at INTEGER
-                );
-                CREATE TABLE IF NOT EXISTS blobs (
-                    hash TEXT PRIMARY KEY,
-                    size INTEGER NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS remotes (
-                    name TEXT PRIMARY KEY,
-                    target TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS blob_remotes (
-                    hash TEXT NOT NULL,
-                    remote TEXT NOT NULL,
-                    PRIMARY KEY (hash, remote)
-                );
-                CREATE TABLE IF NOT EXISTS metadata_remotes (
-                    name TEXT PRIMARY KEY
-                );
-                CREATE TABLE IF NOT EXISTS settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );",
-            )
-            .map_err(|e| e.to_string())
+    /// A timestamp for a new path event: now, but always after the last.
+    fn tick(&mut self) -> u64 {
+        self.clock = now_micros().max(self.clock + 1);
+        self.clock
     }
 
     // ── paths ──
 
-    /// Every path row ever recorded, active and removed alike.
+    /// Every name ever recorded, active and removed alike, ordered by path
+    /// and then by when it was added.
     pub fn list_paths(&mut self) -> Result<Vec<PathRecord>, String> {
-        let r = self
-            .conn
-            .query("SELECT id, path, hash, added_at, removed_at FROM paths ORDER BY path, added_at")
-            .map_err(|e| e.to_string())?;
-        Ok(r.rows
+        Ok(self
+            .cache
+            .paths
             .iter()
-            .filter_map(|row| {
-                Some(PathRecord {
-                    id: as_i64(&row[0])?,
-                    path: as_text(&row[1])?,
-                    hash: as_text(&row[2])?,
-                    added_at: as_i64(&row[3])?,
-                    removed_at: as_i64(&row[4]),
-                })
-            })
+            .flat_map(|(path, events)| records(path, events))
             .collect())
     }
 
-    /// The active (not removed) row for `path`, if any.
+    /// The active record for `path`, if any.
     pub fn active_path(&mut self, path: &str) -> Result<Option<PathRecord>, String> {
-        let sql = format!(
-            "SELECT id, path, hash, added_at, removed_at FROM paths
-             WHERE path = {} AND removed_at IS NULL",
-            quote(path)
-        );
-        let r = self.conn.query(&sql).map_err(|e| e.to_string())?;
-        Ok(r.rows.first().and_then(|row| {
-            Some(PathRecord {
-                id: as_i64(&row[0])?,
-                path: as_text(&row[1])?,
-                hash: as_text(&row[2])?,
-                added_at: as_i64(&row[3])?,
-                removed_at: as_i64(&row[4]),
-            })
-        }))
+        Ok(self
+            .cache
+            .paths
+            .get(path)
+            .and_then(|events| records(path, events).pop())
+            .filter(PathRecord::is_active))
     }
 
-    pub fn insert_path(&mut self, path: &str, hash: &str, added_at: i64) -> Result<(), String> {
-        let sql = format!(
-            "INSERT INTO paths (path, hash, added_at, removed_at) VALUES ({}, {}, {added_at}, NULL)",
-            quote(path),
-            quote(hash)
-        );
-        self.conn.execute(&sql).map_err(|e| e.to_string())
+    /// From now on, `path` names `hash` (closing what it named before).
+    pub fn insert_path(&mut self, path: &str, hash: &str) -> Result<(), String> {
+        let at = self.tick();
+        self.record_path_event(path, at, Some(hash))
     }
 
-    pub fn mark_path_removed(&mut self, id: i64, removed_at: i64) -> Result<(), String> {
-        let sql = format!("UPDATE paths SET removed_at = {removed_at} WHERE id = {id}");
-        self.conn.execute(&sql).map_err(|e| e.to_string())
+    /// From now on, `path` names nothing.
+    pub fn remove_path(&mut self, path: &str) -> Result<(), String> {
+        let at = self.tick();
+        self.record_path_event(path, at, None)
+    }
+
+    fn record_path_event(&mut self, path: &str, at: u64, hash: Option<&str>) -> Result<(), String> {
+        check_segment(path)?;
+        let stamp = format!("{at:020}");
+        let named = hash.unwrap_or(REMOVED);
+        check_segment(named)?;
+        self.put(&key(&["path", path, &stamp, named]), MARKER)?;
+        let events = self.cache.paths.entry(path.to_owned()).or_default();
+        events.push(PathEvent {
+            at,
+            hash: hash.map(str::to_owned),
+        });
+        events.sort();
+        Ok(())
     }
 
     // ── blobs ──
 
+    /// Record blob `hash` with `size`, replacing any other size recorded.
     pub fn upsert_blob(&mut self, hash: &str, size: u64) -> Result<(), String> {
-        self.conn
-            .execute(&format!(
-                "INSERT INTO blobs (hash, size) VALUES ({}, {size})
-                 ON CONFLICT (hash) DO UPDATE SET size = excluded.size",
-                quote(hash)
-            ))
-            .map_err(|e| e.to_string())
+        check_segment(hash)?;
+        let known = self.cache.blobs.get(hash).cloned().unwrap_or_default();
+        if known.len() == 1 && known.contains(&size) {
+            return Ok(());
+        }
+        self.put(&key(&["blob", hash, &size.to_string()]), MARKER)?;
+        for old in known.iter().filter(|&&s| s != size) {
+            self.delete(&key(&["blob", hash, &old.to_string()]))?;
+        }
+        self.cache
+            .blobs
+            .insert(hash.to_owned(), BTreeSet::from([size]));
+        Ok(())
     }
 
-    /// Forget a blob entirely: its size and every remote record. Path rows
-    /// pointing at it stay, as history.
+    /// Forget a blob entirely: its size and every remote record. Path
+    /// events naming it stay, as history.
     pub fn forget_blob(&mut self, hash: &str) -> Result<(), String> {
-        let q = quote(hash);
-        self.conn
-            .execute(&format!(
-                "DELETE FROM blob_remotes WHERE hash = {q};
-                 DELETE FROM blobs WHERE hash = {q}"
-            ))
-            .map_err(|e| e.to_string())
+        for size in self.cache.blobs.remove(hash).unwrap_or_default() {
+            self.delete(&key(&["blob", hash, &size.to_string()]))?;
+        }
+        for remote in self.remotes_for_blob(hash)? {
+            self.unset_blob_on_remote(hash, &remote)?;
+        }
+        Ok(())
     }
 
     pub fn has_blob(&mut self, hash: &str) -> Result<bool, String> {
-        let sql = format!("SELECT 1 FROM blobs WHERE hash = {}", quote(hash));
-        let r = self.conn.query(&sql).map_err(|e| e.to_string())?;
-        Ok(!r.rows.is_empty())
+        Ok(self.cache.blobs.contains_key(hash))
     }
 
     pub fn list_blobs(&mut self) -> Result<Vec<BlobRecord>, String> {
-        let r = self
-            .conn
-            .query("SELECT hash, size FROM blobs ORDER BY hash")
-            .map_err(|e| e.to_string())?;
-        Ok(r.rows
+        Ok(self
+            .cache
+            .blobs
             .iter()
-            .filter_map(|row| {
+            .filter_map(|(hash, sizes)| {
                 Some(BlobRecord {
-                    hash: as_text(&row[0])?,
-                    size: as_i64(&row[1])? as u64,
+                    hash: hash.clone(),
+                    size: *sizes.last()?,
                 })
             })
             .collect())
     }
 
-    /// Every hash the database knows of: stored blobs and blobs any path
-    /// (current or past) ever pointed at.
+    /// Every hash the store knows of: recorded blobs, and blobs any path
+    /// (current or past) ever named.
     pub fn known_hashes(&mut self) -> Result<Vec<String>, String> {
-        let r = self
-            .conn
-            .query("SELECT hash FROM blobs UNION SELECT hash FROM paths")
-            .map_err(|e| e.to_string())?;
-        Ok(r.rows.iter().filter_map(|row| as_text(&row[0])).collect())
+        let mut known: BTreeSet<String> = self.cache.blobs.keys().cloned().collect();
+        for events in self.cache.paths.values() {
+            known.extend(events.iter().filter_map(|e| e.hash.clone()));
+        }
+        Ok(known.into_iter().collect())
     }
 
     // ── remotes ──
 
-    pub fn add_remote(&mut self, name: &str, target: &str) -> Result<(), String> {
-        let sql = format!(
-            "INSERT INTO remotes (name, target) VALUES ({}, {})",
-            quote(name),
-            quote(target)
-        );
-        self.conn.execute(&sql).map_err(|e| e.to_string())
-    }
-
-    pub fn remove_remote(&mut self, name: &str) -> Result<(), String> {
-        let q = quote(name);
-        self.conn
-            .execute(&format!(
-                "DELETE FROM blob_remotes WHERE remote = {q};
-                 DELETE FROM metadata_remotes WHERE name = {q};
-                 DELETE FROM remotes WHERE name = {q}"
-            ))
-            .map_err(|e| e.to_string())
-    }
-
-    /// Rename and/or retarget the remote `old`, carrying its blob records
-    /// over to the new name.
-    pub fn update_remote(&mut self, old: &str, name: &str, target: &str) -> Result<(), String> {
-        if name != old && self.remote(name)?.is_some() {
+    /// Record a new remote.
+    pub fn add_remote(&mut self, name: &str, record: &RemoteRecord) -> Result<(), String> {
+        if self.cache.remotes.contains_key(name) {
             return Err(format!("remote '{name}' already exists"));
         }
-        if self.remote(old)?.is_none() {
-            return Err(format!("no remote named '{old}'"));
+        self.set_remote_record(name, record)
+    }
+
+    /// Replace everything recorded about remote `name`.
+    pub fn set_remote_record(&mut self, name: &str, record: &RemoteRecord) -> Result<(), String> {
+        check_segment(name)?;
+        if self.cache.remotes.get(name) == Some(record) {
+            return Ok(());
         }
-        let (old, name, target) = (quote(old), quote(name), quote(target));
-        self.transaction(|db| {
-            db.conn
-                .execute(&format!(
-                    "UPDATE remotes SET name = {name}, target = {target} WHERE name = {old};
-                     UPDATE blob_remotes SET remote = {name} WHERE remote = {old};
-                     UPDATE metadata_remotes SET name = {name} WHERE name = {old}"
-                ))
-                .map_err(|e| e.to_string())
+        let json = serde_json::to_vec(record).map_err(err)?;
+        self.put(&key(&["remote", name]), &json)?;
+        self.cache.remotes.insert(name.to_owned(), record.clone());
+        Ok(())
+    }
+
+    /// Forget remote `name` and which blobs it stores.
+    pub fn remove_remote(&mut self, name: &str) -> Result<(), String> {
+        if !self.cache.remotes.contains_key(name) {
+            return Err(format!("no remote named '{name}'"));
+        }
+        self.batch(|db| {
+            for hash in db.blobs_on_remote(name)? {
+                db.unset_blob_on_remote(&hash, name)?;
+            }
+            db.delete(&key(&["remote", name]))?;
+            db.cache.remotes.remove(name);
+            Ok(())
         })
     }
 
+    /// Rename remote `old` to `name`, carrying its blob records over.
+    pub fn rename_remote(&mut self, old: &str, name: &str) -> Result<(), String> {
+        if name == old {
+            return Ok(());
+        }
+        if self.cache.remotes.contains_key(name) {
+            return Err(format!("remote '{name}' already exists"));
+        }
+        let record = self
+            .remote_record(old)?
+            .ok_or_else(|| format!("no remote named '{old}'"))?;
+        let stored = self.blobs_on_remote(old)?;
+        self.batch(|db| {
+            db.add_remote(name, &record)?;
+            for hash in &stored {
+                db.set_blob_on_remote(hash, name)?;
+            }
+            db.remove_remote(old)
+        })
+    }
+
+    pub fn remote_record(&mut self, name: &str) -> Result<Option<RemoteRecord>, String> {
+        Ok(self.cache.remotes.get(name).cloned())
+    }
+
+    /// Every remote's record, by name.
+    pub fn remote_records(&mut self) -> Result<BTreeMap<String, RemoteRecord>, String> {
+        Ok(self.cache.remotes.clone())
+    }
+
     pub fn list_remotes(&mut self) -> Result<Vec<Remote>, String> {
-        let r = self
-            .conn
-            .query("SELECT name, target FROM remotes ORDER BY name")
-            .map_err(|e| e.to_string())?;
-        Ok(r.rows
+        Ok(self
+            .cache
+            .remotes
             .iter()
-            .filter_map(|row| {
-                Some(Remote {
-                    name: as_text(&row[0])?,
-                    target: as_text(&row[1])?,
-                })
+            .map(|(name, record)| Remote {
+                name: name.clone(),
+                target: record.target(name),
             })
             .collect())
     }
 
     pub fn remote(&mut self, name: &str) -> Result<Option<Remote>, String> {
-        let sql = format!(
-            "SELECT name, target FROM remotes WHERE name = {}",
-            quote(name)
-        );
-        let r = self.conn.query(&sql).map_err(|e| e.to_string())?;
-        Ok(r.rows.first().and_then(|row| {
-            Some(Remote {
-                name: as_text(&row[0])?,
-                target: as_text(&row[1])?,
-            })
+        Ok(self.cache.remotes.get(name).map(|record| Remote {
+            name: name.to_owned(),
+            target: record.target(name),
         }))
     }
 
     // ── blob ↔ remote presence ──
 
     pub fn set_blob_on_remote(&mut self, hash: &str, remote: &str) -> Result<(), String> {
-        self.conn
-            .execute(&format!(
-                "INSERT INTO blob_remotes (hash, remote) VALUES ({}, {})
-                 ON CONFLICT DO NOTHING",
-                quote(hash),
-                quote(remote)
-            ))
-            .map_err(|e| e.to_string())
+        check_segment(hash)?;
+        check_segment(remote)?;
+        let pair = (hash.to_owned(), remote.to_owned());
+        if self.cache.locations.contains(&pair) {
+            return Ok(());
+        }
+        self.put(&key(&["on", remote, hash]), MARKER)?;
+        self.cache.locations.insert(pair);
+        Ok(())
     }
 
     pub fn unset_blob_on_remote(&mut self, hash: &str, remote: &str) -> Result<(), String> {
-        let sql = format!(
-            "DELETE FROM blob_remotes WHERE hash = {} AND remote = {}",
-            quote(hash),
-            quote(remote)
-        );
-        self.conn.execute(&sql).map_err(|e| e.to_string())
+        let pair = (hash.to_owned(), remote.to_owned());
+        if !self.cache.locations.contains(&pair) {
+            return Ok(());
+        }
+        self.delete(&key(&["on", remote, hash]))?;
+        self.cache.locations.remove(&pair);
+        Ok(())
     }
 
     /// All `(hash, remote)` pairs.
     pub fn list_blob_remotes(&mut self) -> Result<Vec<(String, String)>, String> {
-        let r = self
-            .conn
-            .query("SELECT hash, remote FROM blob_remotes ORDER BY hash, remote")
-            .map_err(|e| e.to_string())?;
-        Ok(r.rows
-            .iter()
-            .filter_map(|row| Some((as_text(&row[0])?, as_text(&row[1])?)))
-            .collect())
+        Ok(self.cache.locations.iter().cloned().collect())
     }
 
     /// Remotes recorded as storing `hash`.
     pub fn remotes_for_blob(&mut self, hash: &str) -> Result<Vec<String>, String> {
-        let sql = format!(
-            "SELECT remote FROM blob_remotes WHERE hash = {} ORDER BY remote",
-            quote(hash)
-        );
-        let r = self.conn.query(&sql).map_err(|e| e.to_string())?;
-        Ok(r.rows.iter().filter_map(|row| as_text(&row[0])).collect())
+        Ok(self
+            .cache
+            .locations
+            .range((hash.to_owned(), String::new())..)
+            .take_while(|(h, _)| h == hash)
+            .map(|(_, remote)| remote.clone())
+            .collect())
     }
 
     /// Hashes recorded as stored on `remote`.
     pub fn blobs_on_remote(&mut self, remote: &str) -> Result<Vec<String>, String> {
-        let sql = format!(
-            "SELECT hash FROM blob_remotes WHERE remote = {} ORDER BY hash",
-            quote(remote)
-        );
-        let r = self.conn.query(&sql).map_err(|e| e.to_string())?;
-        Ok(r.rows.iter().filter_map(|row| as_text(&row[0])).collect())
+        Ok(self
+            .cache
+            .locations
+            .iter()
+            .filter(|(_, r)| r == remote)
+            .map(|(hash, _)| hash.clone())
+            .collect())
     }
 
     // ── metadata backup targets ──
 
     /// Choose whether remote `name` receives metadata backups.
     pub fn set_metadata_remote(&mut self, name: &str, enabled: bool) -> Result<(), String> {
-        if enabled && self.remote(name)?.is_none() {
-            return Err(format!("no remote named '{name}'"));
-        }
-        let q = quote(name);
-        let sql = if enabled {
-            format!("INSERT INTO metadata_remotes (name) VALUES ({q}) ON CONFLICT DO NOTHING")
-        } else {
-            format!("DELETE FROM metadata_remotes WHERE name = {q}")
-        };
-        self.conn.execute(&sql).map_err(|e| e.to_string())
+        let mut record = self
+            .remote_record(name)?
+            .ok_or_else(|| format!("no remote named '{name}'"))?;
+        record.metadata_backup = enabled;
+        self.set_remote_record(name, &record)
     }
 
     /// Remotes chosen to receive metadata backups.
     pub fn metadata_remotes(&mut self) -> Result<Vec<Remote>, String> {
-        let r = self
-            .conn
-            .query(
-                "SELECT r.name, r.target FROM remotes r
-                 JOIN metadata_remotes m ON m.name = r.name ORDER BY r.name",
-            )
-            .map_err(|e| e.to_string())?;
-        Ok(r.rows
+        Ok(self
+            .cache
+            .remotes
             .iter()
-            .filter_map(|row| {
-                Some(Remote {
-                    name: as_text(&row[0])?,
-                    target: as_text(&row[1])?,
-                })
+            .filter(|(_, record)| record.metadata_backup)
+            .map(|(name, record)| Remote {
+                name: name.clone(),
+                target: record.target(name),
             })
             .collect())
     }
@@ -429,124 +689,291 @@ impl Db {
     // ── settings ──
 
     pub fn setting(&mut self, key: &str) -> Result<Option<String>, String> {
-        let sql = format!("SELECT value FROM settings WHERE key = {}", quote(key));
-        let r = self.conn.query(&sql).map_err(|e| e.to_string())?;
-        Ok(r.rows.first().and_then(|row| as_text(&row[0])))
+        Ok(self.cache.settings.get(key).cloned())
     }
 
-    pub fn set_setting(&mut self, key: &str, value: &str) -> Result<(), String> {
-        self.conn
-            .execute(&format!(
-                "INSERT INTO settings (key, value) VALUES ({}, {})
-                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-                quote(key),
-                quote(value)
-            ))
-            .map_err(|e| e.to_string())
+    pub fn set_setting(&mut self, name: &str, value: &str) -> Result<(), String> {
+        check_segment(name)?;
+        if self.cache.settings.get(name).map(String::as_str) == Some(value) {
+            return Ok(());
+        }
+        self.put(&key(&["setting", name]), value.as_bytes())?;
+        self.cache
+            .settings
+            .insert(name.to_owned(), value.to_owned());
+        Ok(())
     }
+
+    // ── export ──
+
+    /// The whole metadata, for a backup.
+    pub fn export(&mut self) -> Result<Dump, String> {
+        let mut locations: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (hash, remote) in &self.cache.locations {
+            locations
+                .entry(remote.clone())
+                .or_default()
+                .insert(hash.clone());
+        }
+        Ok(Dump {
+            settings: self.cache.settings.clone(),
+            remotes: self.cache.remotes.clone(),
+            blobs: self
+                .list_blobs()?
+                .into_iter()
+                .map(|b| (b.hash, b.size))
+                .collect(),
+            locations,
+            paths: self.cache.paths.clone(),
+        })
+    }
+
+    /// Write everything in `dump` into this store (meant to be empty).
+    pub fn import(&mut self, dump: &Dump) -> Result<(), String> {
+        self.batch(|db| {
+            for (name, value) in &dump.settings {
+                db.set_setting(name, value)?;
+            }
+            for (name, record) in &dump.remotes {
+                db.set_remote_record(name, record)?;
+            }
+            for (hash, &size) in &dump.blobs {
+                db.upsert_blob(hash, size)?;
+            }
+            for (remote, hashes) in &dump.locations {
+                for hash in hashes {
+                    db.set_blob_on_remote(hash, remote)?;
+                }
+            }
+            for (path, events) in &dump.paths {
+                for event in events {
+                    db.record_path_event(path, event.at, event.hash.as_deref())?;
+                    db.clock = db.clock.max(event.at);
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+impl Drop for Db {
+    fn drop(&mut self) {
+        if let Err(e) = self.commit() {
+            log::warn!("cannot commit the database: {e}");
+        }
+        self.rt.block_on(self.blobs.shutdown()).ok();
+    }
+}
+
+/// Whether the value of `key` is kept under a tag of its own (see
+/// [`Db::put`]).
+fn value_tagged(key: &[u8]) -> bool {
+    key.starts_with(b"setting\0") || key.starts_with(b"remote\0")
+}
+
+/// The names `path` held, from its history: each event closes the one
+/// before it.
+fn records(path: &str, events: &[PathEvent]) -> Vec<PathRecord> {
+    let mut records: Vec<PathRecord> = Vec::new();
+    for event in events {
+        if let Some(open) = records.last_mut().filter(|r| r.is_active()) {
+            open.removed_at = Some(seconds(event.at));
+        }
+        if let Some(hash) = &event.hash {
+            records.push(PathRecord {
+                path: path.to_owned(),
+                hash: hash.clone(),
+                added_at: seconds(event.at),
+                removed_at: None,
+            });
+        }
+    }
+    records
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn db() -> Db {
-        let mut db = Db {
-            conn: Connection::open_in_memory().unwrap(),
-        };
-        db.init_schema().unwrap();
-        db
+    /// A store in a fresh directory, removed when dropped.
+    struct TestDb {
+        db: Option<Db>,
+        dir: std::path::PathBuf,
+    }
+
+    impl TestDb {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("mbr-db-{name}-{}", std::process::id()));
+            std::fs::remove_dir_all(&dir).ok();
+            let db = Db::open(&dir).unwrap();
+            Self { db: Some(db), dir }
+        }
+
+        /// Close and open the store again.
+        fn reopen(&mut self) {
+            drop(self.db.take());
+            self.db = Some(Db::open(&self.dir).unwrap());
+        }
+    }
+
+    impl std::ops::Deref for TestDb {
+        type Target = Db;
+        fn deref(&self) -> &Db {
+            self.db.as_ref().unwrap()
+        }
+    }
+
+    impl std::ops::DerefMut for TestDb {
+        fn deref_mut(&mut self) -> &mut Db {
+            self.db.as_mut().unwrap()
+        }
+    }
+
+    impl Drop for TestDb {
+        fn drop(&mut self) {
+            drop(self.db.take());
+            std::fs::remove_dir_all(&self.dir).ok();
+        }
+    }
+
+    fn record(backend: &str) -> RemoteRecord {
+        RemoteRecord {
+            backend: backend.to_owned(),
+            encrypt: true,
+            ..RemoteRecord::default()
+        }
     }
 
     #[test]
-    fn upserts_are_idempotent() {
-        let mut db = db();
+    fn keys_never_prefix_each_other() {
+        let a = key(&["remote", "drive"]);
+        let b = key(&["remote", "drive2"]);
+        assert!(!b.starts_with(&a));
+        assert_eq!(segments(&b).unwrap(), ["remote", "drive2"]);
+        assert!(check_segment("a\0b").is_err());
+    }
+
+    #[test]
+    fn everything_survives_reopening() {
+        let mut db = TestDb::new("reopen");
+        db.set_setting("min_copies", "3").unwrap();
+        db.add_remote("drive", &record("drive")).unwrap();
+        db.add_remote("drive2", &record("s3")).unwrap();
         db.upsert_blob("ab", 1).unwrap();
         db.upsert_blob("ab", 2).unwrap();
+        db.set_blob_on_remote("ab", "drive").unwrap();
+        db.set_blob_on_remote("ab", "drive").unwrap();
+        db.insert_path("p", "ab").unwrap();
+        db.reopen();
+
+        assert_eq!(db.setting("min_copies").unwrap().as_deref(), Some("3"));
+        let names: Vec<String> = db
+            .list_remotes()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(
+            names,
+            ["drive", "drive2"],
+            "a key prefixing another deletes nothing"
+        );
+        assert_eq!(
+            db.remote("drive").unwrap().unwrap().target,
+            "_crypt-mbr-drive:"
+        );
         assert_eq!(db.list_blobs().unwrap()[0].size, 2);
-        db.set_blob_on_remote("ab", "r").unwrap();
-        db.set_blob_on_remote("ab", "r").unwrap();
-        assert_eq!(db.remotes_for_blob("ab").unwrap(), ["r"]);
+        assert_eq!(db.remotes_for_blob("ab").unwrap(), ["drive"]);
+        assert_eq!(db.active_path("p").unwrap().unwrap().hash, "ab");
     }
 
     #[test]
-    fn transactions_roll_back_on_error() {
-        let mut db = db();
-        let result: Result<(), String> = db.transaction(|db| {
-            db.add_remote("r", "x:")?;
-            Err("boom".into())
-        });
-        assert!(result.is_err());
-        assert!(db.remote("r").unwrap().is_none());
-        db.transaction(|db| db.add_remote("r", "x:")).unwrap();
-        assert_eq!(db.remote("r").unwrap().unwrap().target, "x:");
+    fn paths_keep_their_history() {
+        let mut db = TestDb::new("history");
+        db.insert_path("p", "one").unwrap();
+        db.insert_path("p", "two").unwrap();
+        db.remove_path("p").unwrap();
+        assert!(db.active_path("p").unwrap().is_none());
+        db.insert_path("p", "one").unwrap();
+        db.reopen();
+        let history: Vec<(String, bool)> = db
+            .list_paths()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.hash.clone(), r.is_active()))
+            .collect();
+        assert_eq!(
+            history,
+            [
+                ("one".to_owned(), false),
+                ("two".to_owned(), false),
+                ("one".to_owned(), true)
+            ]
+        );
     }
 
     #[test]
-    fn renaming_a_remote_keeps_its_blobs() {
-        let mut db = db();
-        db.add_remote("a", "x:").unwrap();
-        db.add_remote("taken", "y:").unwrap();
+    fn renaming_a_remote_keeps_its_blobs_and_settings() {
+        let mut db = TestDb::new("rename");
+        db.add_remote("a", &record("drive")).unwrap();
+        db.add_remote("taken", &record("s3")).unwrap();
         db.set_blob_on_remote("h", "a").unwrap();
-        assert!(db.update_remote("a", "taken", "x:").is_err());
-        assert!(db.update_remote("nope", "b", "x:").is_err());
-        db.update_remote("a", "b", "z:").unwrap();
+        db.set_metadata_remote("a", true).unwrap();
+        assert!(db.rename_remote("a", "taken").is_err());
+        assert!(db.rename_remote("nope", "b").is_err());
+        db.rename_remote("a", "b").unwrap();
+        db.reopen();
         assert!(db.remote("a").unwrap().is_none());
-        assert_eq!(db.remote("b").unwrap().unwrap().target, "z:");
+        assert_eq!(db.remote_record("b").unwrap().unwrap().backend, "drive");
         assert_eq!(db.remotes_for_blob("h").unwrap(), ["b"]);
-        // Retargeting alone keeps the name.
-        db.update_remote("b", "b", "w:").unwrap();
-        assert_eq!(db.remote("b").unwrap().unwrap().target, "w:");
+        assert_eq!(db.metadata_remotes().unwrap()[0].name, "b");
     }
 
     #[test]
-    fn metadata_remotes_follow_renames_and_removals() {
-        let mut db = db();
+    fn removed_remotes_and_blobs_stay_removed() {
+        let mut db = TestDb::new("remove");
         assert!(db.set_metadata_remote("nope", true).is_err());
-        db.add_remote("a", "x:").unwrap();
-        db.add_remote("b", "y:").unwrap();
-        db.set_metadata_remote("a", true).unwrap();
-        db.set_metadata_remote("a", true).unwrap();
-        db.update_remote("a", "c", "x:").unwrap();
-        let names = |db: &mut Db| -> Vec<String> {
-            db.metadata_remotes()
-                .unwrap()
-                .into_iter()
-                .map(|r| r.name)
-                .collect()
-        };
-        assert_eq!(names(&mut db), ["c"]);
-        db.set_metadata_remote("b", true).unwrap();
-        db.remove_remote("c").unwrap();
-        assert_eq!(names(&mut db), ["b"]);
-        db.set_metadata_remote("b", false).unwrap();
-        assert!(names(&mut db).is_empty());
-    }
-
-    #[test]
-    fn settings_round_trip() {
-        let mut db = db();
-        assert_eq!(db.setting("k").unwrap(), None);
-        db.set_setting("k", "1").unwrap();
-        db.set_setting("k", "2").unwrap();
-        assert_eq!(db.setting("k").unwrap().as_deref(), Some("2"));
+        db.add_remote("a", &record("drive")).unwrap();
+        db.upsert_blob("h", 1).unwrap();
+        db.set_blob_on_remote("h", "a").unwrap();
+        db.remove_remote("a").unwrap();
+        db.upsert_blob("g", 1).unwrap();
+        db.forget_blob("g").unwrap();
+        db.reopen();
+        assert!(db.list_remotes().unwrap().is_empty());
+        assert!(db.list_blob_remotes().unwrap().is_empty());
+        assert!(!db.has_blob("g").unwrap());
+        assert!(db.has_blob("h").unwrap());
     }
 
     #[test]
     fn known_hashes_include_path_only_blobs() {
-        let mut db = db();
+        let mut db = TestDb::new("known");
         db.upsert_blob("stored", 1).unwrap();
-        db.insert_path("p", "named", 0).unwrap();
-        let mut known = db.known_hashes().unwrap();
-        known.sort();
-        assert_eq!(known, ["named", "stored"]);
+        db.insert_path("p", "named").unwrap();
+        assert_eq!(db.known_hashes().unwrap(), ["named", "stored"]);
     }
 
     #[test]
-    fn quoting_survives_hostile_names() {
-        let mut db = db();
-        let name = "it's'; DROP TABLE remotes; --";
-        db.add_remote(name, "t:").unwrap();
-        assert!(db.remote(name).unwrap().is_some());
+    fn exports_import_into_an_identical_store() {
+        let mut db = TestDb::new("export");
+        db.set_setting("folder_id", "0123456789ab").unwrap();
+        db.add_remote("a", &record("drive")).unwrap();
+        db.upsert_blob("h", 5).unwrap();
+        db.set_blob_on_remote("h", "a").unwrap();
+        db.insert_path("dir/it's here", "h").unwrap();
+        db.remove_path("dir/it's here").unwrap();
+        let dump = db.export().unwrap();
+
+        let mut copy = TestDb::new("import");
+        copy.import(&dump).unwrap();
+        copy.reopen();
+        assert_eq!(copy.export().unwrap(), dump);
+        // New events still come after the imported ones.
+        copy.insert_path("dir/it's here", "g").unwrap();
+        assert_eq!(
+            copy.active_path("dir/it's here").unwrap().unwrap().hash,
+            "g"
+        );
     }
 }

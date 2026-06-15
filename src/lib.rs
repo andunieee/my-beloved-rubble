@@ -10,8 +10,9 @@
 //! folder/
 //!   .mbr/
 //!     blobs/fa/2e/fa2e38…   actual content
-//!     mbr.db                sqlite metadata (paths, blobs, remotes)
-//!     rclone.conf           repository-local rclone configuration
+//!     db/                   metadata: paths, blobs, remotes, settings
+//!                           (an iroh-docs replica, see [`db`])
+//!     rclone.conf           rclone configuration, written from the metadata
 //!   fruits.png -> .mbr/blobs/fa/2e/fa2e38…
 //! ```
 //!

@@ -10,6 +10,7 @@ use mbr::db::Remote;
 use mbr::metadata;
 use mbr::rclone::{self, SetupOutcome};
 use mbr::remotes::{self, Layout};
+use mbr::repo::RemoteHealth;
 use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -54,8 +55,7 @@ fn set_up(repo: &mut Repo, name: &str, store: &Path, encrypt: bool) -> Remote {
         }
     })
     .unwrap();
-    repo.db.add_remote(name, &layout.target()).unwrap();
-    repo.db.remote(name).unwrap().unwrap()
+    repo.add_remote(&layout, &spec).unwrap()
 }
 
 /// Every file under `dir`, relative to it.
@@ -113,7 +113,7 @@ fn encrypted_remotes_hide_content_and_names() {
 
     // It reads back through the crypt layer.
     assert!(repo.verify_on_remote(&remote, &hash).is_ok());
-    assert_eq!(repo.scan_remote(&remote).unwrap().present, [hash]);
+    assert_eq!(repo.scan_remote(&remote).unwrap().present, [hash.clone()]);
     // Metadata backups go next to the folder's directory.
     assert_eq!(
         repo.with_rclone(|| remotes::backup_location(&remote.target))
@@ -121,10 +121,32 @@ fn encrypted_remotes_hide_content_and_names() {
         format!("_root-mbr-disk:{}", store.display())
     );
 
-    // Removing the remote deletes its rclone settings, not what it stores.
-    repo.remove_remote("disk").unwrap();
+    // rclone.conf is written again from the database alone.
+    fs::write(repo.rclone_config_path(), "").unwrap();
+    assert!(repo.rclone_config_incomplete().unwrap());
+    repo.write_rclone_config(Some(PASSWORD)).unwrap();
+    assert!(!repo.rclone_config_incomplete().unwrap());
+    assert_eq!(
+        repo.verify_on_remote(&remote, &hash).unwrap(),
+        RemoteHealth::Ok
+    );
+
+    // Renaming rewrites its sections, still keyed with the same password.
+    repo.rename_remote("disk", "nas", None).unwrap();
+    let remote = repo.db.remote("nas").unwrap().unwrap();
+    assert_eq!(remote.target, "_crypt-mbr-nas:");
     let config = fs::read_to_string(repo.rclone_config_path()).unwrap();
     assert!(!config.contains("mbr-disk"), "{config}");
+    assert_eq!(
+        repo.verify_on_remote(&remote, &hash).unwrap(),
+        RemoteHealth::Ok
+    );
+    assert_eq!(repo.db.remotes_for_blob(&hash).unwrap(), ["nas"]);
+
+    // Removing the remote deletes its rclone settings, not what it stores.
+    repo.remove_remote("nas").unwrap();
+    let config = fs::read_to_string(repo.rclone_config_path()).unwrap();
+    assert!(!config.contains("mbr-nas"), "{config}");
     assert_eq!(files_under(&store).len(), 1);
 }
 
@@ -197,8 +219,8 @@ fn a_lost_folder_is_found_again_from_the_remote_and_the_password() {
         metadata::download(&location, &metadata::backup_name(PASSWORD)?, &scratch)
     })
     .unwrap();
-    let (db, conf) = metadata::unseal(&sealed, PASSWORD).unwrap();
-    let (mut repo, report) = metadata::restore(&fresh, &db, &conf).unwrap();
+    let dump = metadata::unseal(&sealed, PASSWORD).unwrap();
+    let (mut repo, report) = metadata::restore(&fresh, &dump, PASSWORD).unwrap();
     assert_eq!(report.files, 1, "{:?}", report.skipped);
 
     // It is the lost folder again, remotes and all.

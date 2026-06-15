@@ -82,12 +82,12 @@ enum Msg {
         db_hash: String,
         result: Result<(), String>,
     },
-    /// A metadata backup was read and decrypted (database, rclone config);
-    /// on success, restore it into `dir`.
+    /// A metadata backup was read and decrypted; on success, restore it
+    /// into `dir`.
     BackupOpened {
         dir: PathBuf,
         password: SecretString,
-        result: Result<(Vec<u8>, Vec<u8>), String>,
+        result: Result<Vec<u8>, String>,
     },
     /// An attempt to drop the local copy of a blob of `size` bytes.
     Dropped {
@@ -111,11 +111,10 @@ enum Msg {
         result: Result<Option<serde_json::Map<String, serde_json::Value>>, String>,
     },
     /// The rclone half of saving a remote edit finished; on success,
-    /// record the new name and target.
+    /// record the new settings and name.
     RemoteEdited {
         old: String,
         name: String,
-        target: String,
         result: Result<(), String>,
     },
 }
@@ -210,8 +209,6 @@ fn range_of(rows: &[String], a: usize, b: usize) -> BTreeSet<String> {
 struct EditState {
     /// Name of the remote when editing started.
     original: String,
-    /// Its target, which editing never changes.
-    target: String,
     /// The rclone section holding its backend settings, if any.
     section: Option<String>,
     /// Its backend, when mbr has a form for it.
@@ -441,6 +438,9 @@ fn main() -> Result<(), slint::PlatformError> {
                 while let Ok(msg) = rx.try_recv() {
                     app.handle(msg);
                     refresh_needed = true;
+                }
+                if refresh_needed {
+                    app.absorb_rclone_config();
                 }
                 if refresh_needed {
                     app.refresh();
@@ -700,11 +700,7 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let app = app.clone();
-        w.on_pick_restore_file(move |which| app.pick_restore_file(which));
-    }
-    {
-        let app = app.clone();
-        w.on_restore_from_files(move || app.restore_from_files());
+        w.on_pick_restore_file(move || app.pick_restore_file());
     }
     {
         let app = app.clone();
@@ -734,7 +730,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
     // ── reopen last folder ──
     let last = app.state.borrow().last_folder.clone();
-    if let Some(dir) = last.filter(|dir| dir.join(repo::DB_FILE).is_file()) {
+    if let Some(dir) = last.filter(|dir| Repo::is_initialized(dir)) {
         app.attach(dir);
     }
 
@@ -798,13 +794,23 @@ impl App {
         *self.pending_folder.borrow_mut() = Some(dir);
     }
 
-    /// Show `repo` as the open folder.
-    fn open_repo(&self, repo: Repo) {
+    /// Show `repo` as the open folder, writing its rclone settings again
+    /// if some remote's are missing.
+    fn open_repo(&self, mut repo: Repo) {
         *self.pending_folder.borrow_mut() = None;
         self.window.set_pending_folder(SharedString::default());
         self.state.borrow_mut().last_folder = Some(repo.root.clone());
         self.save_state();
         let saved = self.state.borrow().repo(&repo.root).password;
+        let rewritten = repo.rclone_config_incomplete().and_then(|incomplete| {
+            if incomplete {
+                repo.write_rclone_config(saved.as_deref())?;
+            }
+            Ok(())
+        });
+        if let Err(e) = rewritten {
+            self.status(format!("Cannot write the rclone settings: {e}"));
+        }
         *self.password.borrow_mut() = saved.map(SecretString::from);
         self.reset_setup_ui();
         *self.repo.borrow_mut() = Some(repo);
@@ -839,32 +845,11 @@ impl App {
         }
     }
 
-    /// Pick a file to restore from: 1 = the database, 2 = the rclone
-    /// config, 3 = an encrypted backup.
-    fn pick_restore_file(&self, which: i32) {
-        let Some(file) = rfd::FileDialog::new().pick_file() else {
-            return;
-        };
-        let path = SharedString::from(file.display().to_string());
-        match which {
-            1 => self.window.set_restore_db_file(path),
-            2 => self.window.set_restore_conf_file(path),
-            _ => self.window.set_restore_backup_file(path),
-        }
-    }
-
-    fn restore_from_files(&self) {
-        let Some(dir) = self.pending_folder.borrow().clone() else {
-            return;
-        };
-        let read = |path: SharedString| {
-            std::fs::read(path.as_str()).map_err(|e| format!("cannot read {path}: {e}"))
-        };
-        let files = read(self.window.get_restore_db_file())
-            .and_then(|db| Ok((db, read(self.window.get_restore_conf_file())?)));
-        match files {
-            Ok((db, conf)) => self.finish_restore(&dir, &db, &conf, None),
-            Err(e) => self.status(format!("Restore failed: {e}")),
+    /// Pick the encrypted backup file to restore from.
+    fn pick_restore_file(&self) {
+        if let Some(file) = rfd::FileDialog::new().pick_file() {
+            self.window
+                .set_restore_backup_file(file.display().to_string().into());
         }
     }
 
@@ -924,8 +909,8 @@ impl App {
     }
 
     /// Make the pending folder the one a decrypted backup describes.
-    fn finish_restore(&self, dir: &Path, db: &[u8], conf: &[u8], password: Option<SecretString>) {
-        let (repo, report) = match metadata::restore(dir, db, conf) {
+    fn finish_restore(&self, dir: &Path, dump: &[u8], password: SecretString) {
+        let (repo, report) = match metadata::restore(dir, dump, password.expose_secret()) {
             Ok(restored) => restored,
             Err(e) => {
                 self.status(format!("Restore failed: {e}"));
@@ -937,16 +922,11 @@ impl App {
             let mut state = self.state.borrow_mut();
             let repo_state = state.repo_mut(&repo.root);
             *repo_state = RepoState::default();
-            if let Some(password) = &password
-                && let Err(e) = repo_state.set_password(password.expose_secret())
-            {
+            if let Err(e) = repo_state.set_password(password.expose_secret()) {
                 log::warn!("cannot save the master password: {e}");
             }
         }
         self.open_repo(repo);
-        if password.is_none() {
-            self.window.set_active_tab(2);
-        }
         let mut text = format!("Restored {} file(s)", report.files);
         if report.files > 0 {
             text += "; download them from the Remotes tab";
@@ -956,9 +936,6 @@ impl App {
         }
         if !report.skipped.is_empty() {
             text += &format!("; {} skipped", report.skipped.len());
-        }
-        if password.is_none() {
-            text += "; choose the master password in the Settings tab";
         }
         self.status(text);
     }
@@ -975,8 +952,6 @@ impl App {
         }
         let w = &self.window;
         w.set_restore_mode(0);
-        w.set_restore_db_file(SharedString::default());
-        w.set_restore_conf_file(SharedString::default());
         w.set_restore_backup_file(SharedString::default());
         w.set_pw_restore(SharedString::default());
     }
@@ -1683,7 +1658,6 @@ impl App {
         let section = mbr::remotes::settings_section(&remote.target);
         *self.edit.borrow_mut() = Some(EditState {
             original: remote.name.clone(),
-            target: remote.target.clone(),
             section: section.clone(),
             backend: None,
             fields: Vec::new(),
@@ -1796,7 +1770,7 @@ impl App {
             return;
         }
         let values: Vec<SharedString> = w.get_edit_values().iter().collect();
-        let (old, target, section, parameters) = {
+        let (old, section, parameters) = {
             let edit = self.edit.borrow();
             let Some(edit) = edit.as_ref() else { return };
             // Send only what changed; empty answers can't be told apart
@@ -1808,12 +1782,7 @@ impl App {
                     parameters.insert(field.name.to_owned(), value.into());
                 }
             }
-            (
-                edit.original.clone(),
-                edit.target.clone(),
-                edit.section.clone(),
-                parameters,
-            )
+            (edit.original.clone(), edit.section.clone(), parameters)
         };
 
         match section {
@@ -1826,24 +1795,23 @@ impl App {
                     let result = mbr::rclone::with_config(&config_path, || {
                         mbr::rclone::update_remote(&section, serde_json::Value::Object(parameters))
                     });
-                    tx.send(Msg::RemoteEdited {
-                        old,
-                        name,
-                        target,
-                        result,
-                    })
-                    .ok();
+                    tx.send(Msg::RemoteEdited { old, name, result }).ok();
                 });
             }
-            _ => self.finish_remote_edit(&old, &name, &target),
+            _ => self.finish_remote_edit(&old, &name),
         }
     }
 
-    /// Record a remote's new name and target, and close the editor.
-    fn finish_remote_edit(&self, old: &str, name: &str, target: &str) {
+    /// Record a remote's new settings and name, and close the editor.
+    fn finish_remote_edit(&self, old: &str, name: &str) {
         let mut ok = false;
+        let password = self.password.borrow().clone();
         self.with_repo("save remote", |repo| {
-            repo.db.update_remote(old, name, target)?;
+            repo.absorb_rclone_config()?;
+            if name != old {
+                let password = password.as_ref().map(|p| p.expose_secret());
+                repo.rename_remote(old, name, password)?;
+            }
             ok = true;
             Ok(format!("Saved remote {name}"))
         });
@@ -2085,17 +2053,28 @@ impl App {
         });
     }
 
-    /// Record the remote `layout` just set up in rclone.
-    fn save_new_remote(&self, layout: &mbr::remotes::Layout) {
-        let (name, target) = (layout.name.clone(), layout.target());
+    /// Record the remote `layout` just set up in rclone, in `spec`.
+    fn save_new_remote(&self, layout: &mbr::remotes::Layout, spec: &str) {
         self.with_repo("save remote", |repo| {
-            repo.db.add_remote(&name, &target)?;
+            let remote = repo.add_remote(layout, spec)?;
             Ok(format!(
-                "Added remote {name} ({})",
-                mbr::remotes::describe(&target)
+                "Added remote {} ({})",
+                remote.name,
+                mbr::remotes::describe(&remote.target)
             ))
         });
         self.refresh();
+    }
+
+    /// Record in the database whatever rclone changed in the open folder's
+    /// rclone settings (sign-in tokens it refreshed, …).
+    fn absorb_rclone_config(&self) {
+        let mut repo = self.repo.borrow_mut();
+        if let Some(repo) = repo.as_mut()
+            && let Err(e) = repo.absorb_rclone_config()
+        {
+            log::warn!("cannot record the rclone settings: {e}");
+        }
     }
 
     /// Clear the form and question panels.
@@ -2199,13 +2178,8 @@ impl App {
                         .set_edit_note(format!("Could not read rclone settings: {e}").into()),
                 }
             }
-            Msg::RemoteEdited {
-                old,
-                name,
-                target,
-                result,
-            } => match result {
-                Ok(()) => self.finish_remote_edit(&old, &name, &target),
+            Msg::RemoteEdited { old, name, result } => match result {
+                Ok(()) => self.finish_remote_edit(&old, &name),
                 Err(e) => self.status(format!("Saving rclone settings failed: {e}")),
             },
             Msg::Setup { pending, result } if pending.cancelled.load(Ordering::Relaxed) => {
@@ -2219,8 +2193,8 @@ impl App {
                     // Finished before the cancel took effect: the remote
                     // exists in rclone's config now, so keep it.
                     Ok(mbr::rclone::SetupOutcome::Done) => {
-                        if let Purpose::Remote { layout, .. } = pending.purpose {
-                            self.save_new_remote(&layout);
+                        if let Purpose::Remote { layout, .. } = &pending.purpose {
+                            self.save_new_remote(layout, &pending.spec);
                         }
                     }
                 }
@@ -2239,8 +2213,8 @@ impl App {
                         });
                     }
                     Ok(mbr::rclone::SetupOutcome::Done) => {
-                        if let Purpose::Remote { layout, .. } = pending.purpose {
-                            self.save_new_remote(&layout);
+                        if let Purpose::Remote { layout, .. } = &pending.purpose {
+                            self.save_new_remote(layout, &pending.spec);
                             self.reset_setup_ui();
                         }
                     }
@@ -2304,7 +2278,7 @@ impl App {
                     return; // another folder was opened meanwhile
                 }
                 match result {
-                    Ok((db, conf)) => self.finish_restore(&dir, &db, &conf, Some(password)),
+                    Ok(dump) => self.finish_restore(&dir, &dump, password),
                     Err(e) => self.status(format!("Restore failed: {e}")),
                 }
             }

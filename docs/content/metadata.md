@@ -6,7 +6,7 @@ nav = "metadata backup"
 +++
 
 Remotes store your files by their content only. The names, folders and history of your files live in the folder's
-database, `.mbr/mbr.db`. If the folder is lost along with the computer, its remotes would come back as a heap of
+database, `.mbr/db`. If the folder is lost along with the computer, its remotes would come back as a heap of
 nameless files. So the database is backed up separately, encrypted with the [master password](../settings/), to the
 remotes you choose in the **Settings** tab.
 
@@ -14,9 +14,9 @@ Each remote shows when it was last backed up, and whether that backup is out of 
 
 ## Backing up
 
-Tick the remotes that should hold a backup, then click **Back up now**. The app packs the database together with this
-folder's rclone settings (so the remotes can be reached again from a new computer), encrypts them, and uploads the
-result to each ticked remote, replacing the previous backup there.
+Tick the remotes that should hold a backup, then click **Back up now**. The app packs the database, which includes the
+settings of every remote (so they can be reached again from a new computer), encrypts it, and uploads the result to
+each ticked remote, replacing the previous backup there.
 
 The backup sits at the top of the remote, in the bucket or folder you named when setting it up, next to the folder's
 own `mbr-…` directory. It is called `mbr-metadata-` followed by a code made from the master password (for example
@@ -26,8 +26,8 @@ remote is.
 Back up again after adding or changing files: the tab shows which backups are out of date.
 
 The backup is an ordinary [age](https://age-encryption.org) file encrypted with the password, holding a tar.gz, so it
-can also be opened without the app: `age -d mbr-metadata-….tar.gz.encrypted | tar xz` gives back `mbr.db` and
-`rclone.conf`.
+can also be opened without the app: `age -d mbr-metadata-….tar.gz.encrypted | tar xz` gives back
+`mbr-metadata.json`, the whole database as JSON.
 
 ## Restoring a lost folder
 
@@ -37,8 +37,6 @@ app asks whether to start a new one there or to restore a lost one, and restores
 - **a remote**: enter the master password and fill in the remote's settings as when it was set up: the same kind of
   storage, account and bucket or folder. The app looks for the backup made with that password there.
 - **a backup file**: a `mbr-metadata-….tar.gz.encrypted` file you downloaded, and the master password.
-- **database files**: a copy of the old folder's `.mbr/mbr.db` and `.mbr/rclone.conf`, as they are. Afterwards, choose
-  the old folder's master password in the **Settings** tab.
 
 Every file reappears with its name, history and records of where it is stored, and the remotes come back with their
 settings. The files' content is still on the remotes: download it from the **Remotes** tab with **Download all**, or

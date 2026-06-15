@@ -37,7 +37,8 @@ to open again if the browser didn't open or was closed), and **Cancel** gives up
 `mbr remote setup <name> <type> --set KEY=VALUE`. If rclone needs anything else, it asks in a box below the form.
 
 Each folder keeps its own rclone settings in `.mbr/rclone.conf`, separate from any other rclone configuration on the
-computer. The remotes there have names starting with `_root-mbr-` (the storage itself), `_plain-mbr-` (the folder's
+computer. The remotes' settings live in the folder's database; `.mbr/rclone.conf` is written from it, and whatever
+rclone changes there (such as a renewed sign-in) is copied back into the database. The remotes there have names starting with `_root-mbr-` (the storage itself), `_plain-mbr-` (the folder's
 directory in it), `_crypt-mbr-` (the encryption) or `_dangerouslyplain-mbr-`; the app only ever shows the name you
 chose.
 

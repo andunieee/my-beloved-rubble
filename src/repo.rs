@@ -8,7 +8,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 pub const BLOBS_DIR: &str = ".mbr/blobs";
-pub const DB_FILE: &str = ".mbr/mbr.db";
+/// The metadata store (see [`crate::db`]).
+pub const DB_DIR: &str = ".mbr/db";
 pub const RCLONE_CONFIG_FILE: &str = ".mbr/rclone.conf";
 /// Scratch space for downloads being verified and backups being sealed.
 pub const TMP_DIR: &str = ".mbr/tmp";
@@ -200,7 +201,7 @@ const STAGED_SUFFIX: &str = ".mbr-ingest";
 
 impl Repo {
     /// Attach mbr to `root`: create the `.mbr` store, database, and
-    /// repository-local rclone config (fresh folders only; no migration).
+    /// repository-local rclone config.
     pub fn init(root: &Path) -> Result<Self, String> {
         if !root.is_dir() {
             return Err(format!("{} is not a directory", root.display()));
@@ -211,13 +212,15 @@ impl Repo {
             .canonicalize()
             .map_err(|e| format!("cannot resolve {}: {e}", root.display()))?;
         ensure_rclone_config(&root.join(RCLONE_CONFIG_FILE))?;
-        let db = Db::open(&root.join(DB_FILE))?;
-        Ok(Self { root, db })
+        let db = Db::open(&root.join(DB_DIR))?;
+        let mut repo = Self { root, db };
+        repo.absorb_rclone_config()?;
+        Ok(repo)
     }
 
     /// Whether `root` already has the `.mbr` store and database.
     pub fn is_initialized(root: &Path) -> bool {
-        root.join(BLOBS_DIR).is_dir() && root.join(DB_FILE).is_file()
+        root.join(BLOBS_DIR).is_dir() && root.join(DB_DIR).is_dir()
     }
 
     /// Open an already-attached folder (or one being initialized).
@@ -231,8 +234,10 @@ impl Repo {
                 root.display()
             ));
         }
-        let db = Db::open(&root.join(DB_FILE))?;
-        Ok(Self { root, db })
+        let db = Db::open(&root.join(DB_DIR))?;
+        let mut repo = Self { root, db };
+        repo.absorb_rclone_config()?;
+        Ok(repo)
     }
 
     /// Walk up from `start` to find the nearest attached folder.
@@ -242,7 +247,7 @@ impl Repo {
             .map_err(|e| format!("cannot resolve {}: {e}", start.display()))?;
         let mut dir = start.as_path();
         loop {
-            if dir.join(DB_FILE).is_file() {
+            if Self::is_initialized(dir) {
                 return Self::open(dir);
             }
             match dir.parent() {
@@ -277,11 +282,16 @@ impl Repo {
     }
 
     /// Run `f` with librclone using this repository's configuration (see
-    /// [`rclone::with_config`]).
-    pub fn with_rclone<T>(&self, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    /// [`rclone::with_config`]), then record any settings rclone changed
+    /// meanwhile (a refreshed sign-in token, …) in the database.
+    pub fn with_rclone<T>(&mut self, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
         let path = self.rclone_config_path();
         ensure_rclone_config(&path)?;
-        rclone::with_config(&path, f)
+        let result = rclone::with_config(&path, f);
+        if let Err(e) = self.absorb_rclone_config() {
+            log::warn!("cannot record the rclone settings: {e}");
+        }
+        result
     }
 
     pub fn blob_present(&self, hash: &str) -> bool {
@@ -299,11 +309,10 @@ impl Repo {
     }
 
     /// The database half of [`Repo::scan`]: record what [`ingest_tree`]
-    /// found, in one transaction. Paths tracked but absent from `entries`
-    /// are marked removed.
+    /// found, in one batch. Paths tracked but absent from `entries` are
+    /// marked removed.
     pub fn apply_scan(&mut self, entries: Vec<ScannedEntry>) -> Result<ScanReport, String> {
-        let now = util::now();
-        self.db.transaction(|db| {
+        self.db.batch(|db| {
             let mut report = ScanReport::default();
             let mut active: HashMap<String, PathRecord> = db
                 .list_paths()?
@@ -318,13 +327,12 @@ impl Repo {
                 }
                 match active.remove(&entry.path) {
                     Some(record) if record.hash == entry.hash => {}
-                    Some(record) => {
-                        db.mark_path_removed(record.id, now)?;
-                        db.insert_path(&entry.path, &entry.hash, now)?;
+                    Some(_) => {
+                        db.insert_path(&entry.path, &entry.hash)?;
                         report.replaced.push(entry.path);
                     }
                     None => {
-                        db.insert_path(&entry.path, &entry.hash, now)?;
+                        db.insert_path(&entry.path, &entry.hash)?;
                         report.added.push(entry.path);
                     }
                 }
@@ -334,7 +342,7 @@ impl Repo {
             let mut gone: Vec<PathRecord> = active.into_values().collect();
             gone.sort_by(|a, b| a.path.cmp(&b.path));
             for record in gone {
-                db.mark_path_removed(record.id, now)?;
+                db.remove_path(&record.path)?;
                 report.removed.push(record.path);
             }
             Ok(report)
@@ -675,8 +683,7 @@ impl Repo {
         found: Vec<rclone::RemoteBlob>,
     ) -> Result<RemoteCheck, String> {
         let root = self.root.clone();
-        let now = util::now();
-        self.db.transaction(|db| {
+        self.db.batch(|db| {
             let found: HashMap<String, u64> = found.into_iter().map(|b| (b.hash, b.size)).collect();
             let expected: HashSet<String> = db.blobs_on_remote(&remote.name)?.into_iter().collect();
             let sized: HashSet<String> = db.list_blobs()?.into_iter().map(|b| b.hash).collect();
@@ -698,7 +705,7 @@ impl Repo {
                 if !known.contains(hash) {
                     let path = name_unnamed_blob(&root, hash)?;
                     if db.active_path(&path)?.is_none() {
-                        db.insert_path(&path, hash, now)?;
+                        db.insert_path(&path, hash)?;
                     }
                     check.adopted.push(hash.clone());
                 } else if !expected.contains(hash) {

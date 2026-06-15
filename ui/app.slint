@@ -493,11 +493,8 @@ export component AppWindow inherits Window {
 
     // ── a folder that isn't an mbr folder yet: start anew or restore ──
     in-out property <string> pending-folder: "";
-    // 0 = choosing, 1 = from database files, 2 = from a backup file,
-    // 3 = from a remote.
+    // 0 = choosing, 2 = from a backup file, 3 = from a remote.
     in-out property <int> restore-mode: 0;
-    in-out property <string> restore-db-file: "";
-    in-out property <string> restore-conf-file: "";
     in-out property <string> restore-backup-file: "";
     in-out property <string> pw-restore: "";
     // Side panel width; drag the divider to change it.
@@ -592,9 +589,8 @@ export component AppWindow inherits Window {
     callback backup-metadata();
     // a folder that isn't an mbr folder yet
     callback start-new();
-    // 1 = the database, 2 = the rclone config, 3 = an encrypted backup
-    callback pick-restore-file(which: int);
-    callback restore-from-files();
+    // the encrypted backup to restore from
+    callback pick-restore-file();
     callback restore-from-backup(password: string);
     callback restore-from-remote(backend: string, values: [string], password: string);
     callback cancel-restore();
@@ -765,50 +761,7 @@ export component AppWindow inherits Window {
                                             enabled: !root.busy;
                                             clicked => { root.restore-mode = 2; }
                                         }
-                                        Button {
-                                            text: "From database files";
-                                            enabled: !root.busy;
-                                            clicked => { root.restore-mode = 1; }
-                                        }
                                         Help { page: "metadata/#restoring-a-lost-folder"; }
-                                    }
-                                }
-
-                                // ── restoring from the database and rclone config ──
-                                if root.restore-mode == 1: VerticalLayout {
-                                    spacing: 10px;
-                                    SectionTitle { text: "RESTORE FROM DATABASE FILES"; }
-                                    PickedFile {
-                                        label: "Database (mbr.db)";
-                                        path: root.restore-db-file;
-                                        enabled: !root.busy;
-                                        text-width: root.column-width;
-                                        pick => { root.pick-restore-file(1); }
-                                    }
-                                    PickedFile {
-                                        label: "rclone config (rclone.conf)";
-                                        path: root.restore-conf-file;
-                                        enabled: !root.busy;
-                                        text-width: root.column-width;
-                                        pick => { root.pick-restore-file(2); }
-                                    }
-                                    Hint {
-                                        text: "After restoring, choose the master password used by this folder's remotes in the Settings tab.";
-                                        width: root.column-width;
-                                    }
-                                    HorizontalLayout {
-                                        spacing: 6px;
-                                        alignment: start;
-                                        Button {
-                                            text: "Restore";
-                                            primary: true;
-                                            enabled: !root.busy && root.restore-db-file != "" && root.restore-conf-file != "";
-                                            clicked => { root.restore-from-files(); }
-                                        }
-                                        Button {
-                                            text: "Back";
-                                            clicked => { root.cancel-restore(); }
-                                        }
                                     }
                                 }
 
@@ -821,7 +774,7 @@ export component AppWindow inherits Window {
                                         path: root.restore-backup-file;
                                         enabled: !root.busy;
                                         text-width: root.column-width;
-                                        pick => { root.pick-restore-file(3); }
+                                        pick => { root.pick-restore-file(); }
                                     }
                                     LineEdit {
                                         input-type: InputType.password;

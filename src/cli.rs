@@ -29,16 +29,10 @@ enum Command {
         dir: Option<PathBuf>,
     },
     /// make a folder the one a metadata backup describes, instead of `init`
-    #[command(group(clap::ArgGroup::new("source").required(true).args(["db", "backup", "from"])))]
+    #[command(group(clap::ArgGroup::new("source").required(true).args(["backup", "from"])))]
     Restore {
         /// folder to restore into (defaults to the current directory)
         dir: Option<PathBuf>,
-        /// a database file (mbr.db), restored along with --rclone-conf
-        #[arg(long, value_name = "FILE", requires = "rclone_conf")]
-        db: Option<PathBuf>,
-        /// the rclone config file (rclone.conf) that goes with --db
-        #[arg(long, value_name = "FILE", requires = "db")]
-        rclone_conf: Option<PathBuf>,
         /// an encrypted backup file (mbr-metadata-….tar.gz.encrypted)
         #[arg(long, value_name = "FILE")]
         backup: Option<PathBuf>,
@@ -198,18 +192,11 @@ fn main() {
 fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Init { dir } => init(&dir.unwrap_or_else(|| PathBuf::from("."))),
-        Command::Restore {
-            dir,
-            db,
-            rclone_conf,
-            backup,
-            from,
-        } => {
+        Command::Restore { dir, backup, from } => {
             let dir = dir.unwrap_or_else(|| PathBuf::from("."));
-            let source = match (db, rclone_conf, backup, from) {
-                (Some(db), Some(conf), _, _) => Source::Files(db, conf),
-                (_, _, Some(file), _) => Source::Backup(file),
-                (_, _, _, Some(backend)) => Source::Remote(backend),
+            let source = match (backup, from) {
+                (Some(file), _) => Source::Backup(file),
+                (_, Some(backend)) => Source::Remote(backend),
                 _ => unreachable!("clap requires one source"),
             };
             restore(&dir, source)
@@ -260,8 +247,18 @@ fn run(cli: Cli) -> Result<(), String> {
     }
 }
 
+/// The folder around the current directory, its rclone settings written
+/// again if some remote's are missing (with the master password saved on
+/// this machine, if any).
 fn open() -> Result<Repo, String> {
-    Repo::discover(&std::env::current_dir().map_err(|e| e.to_string())?)
+    let mut repo = Repo::discover(&std::env::current_dir().map_err(|e| e.to_string())?)?;
+    if repo.rclone_config_incomplete()? {
+        let password = AppState::load().repo(&repo.root).password;
+        if let Err(e) = repo.write_rclone_config(password.as_deref()) {
+            eprintln!("warning: cannot write the rclone settings: {e}");
+        }
+    }
+    Ok(repo)
 }
 
 fn lookup_remote(repo: &mut Repo, name: &str) -> Result<Remote, String> {
@@ -468,9 +465,11 @@ fn remote_setup(
         layout.finish(outcome, &spec, &folder_id, &password)
     })?;
 
-    let target = layout.target();
-    repo.db.add_remote(name, &target)?;
-    println!("added remote {name} ({})", mbr::remotes::describe(&target));
+    let remote = repo.add_remote(&layout, &spec)?;
+    println!(
+        "added remote {name} ({})",
+        mbr::remotes::describe(&remote.target)
+    );
     Ok(())
 }
 
@@ -630,28 +629,19 @@ fn remote_show(repo: &mut Repo, name: &str) -> Result<(), String> {
     println!("name:    {}", remote.name);
     println!("storage: {}", mbr::remotes::describe(&remote.target));
     println!("blobs:   {} recorded", repo.db.blobs_on_remote(name)?.len());
-    let Some(section) = mbr::remotes::settings_section(&remote.target) else {
-        println!("(a plain path; no rclone settings)");
-        return Ok(());
-    };
-    let Some(config) = repo.with_rclone(|| mbr::rclone::remote_config(&section))? else {
-        println!("(its rclone settings are missing from this folder's rclone.conf)");
-        return Ok(());
-    };
-    let backend = config
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_owned();
-    println!("backend: {backend}");
-    for (key, value) in &config {
-        if key == "type" {
-            continue;
-        }
-        let value = if is_secret_key(&backend, key) {
-            "(hidden)".to_owned()
+    let record = repo
+        .db
+        .remote_record(name)?
+        .ok_or_else(|| format!("no remote named '{name}'"))?;
+    if !record.spec.is_empty() {
+        println!("place:   {}", record.spec);
+    }
+    println!("backend: {}", record.backend);
+    for (key, value) in &record.config {
+        let value = if is_secret_key(&record.backend, key) {
+            "(hidden)"
         } else {
-            mbr::rclone::display_value_for_ui(value)
+            value
         };
         println!("    {key:<24} {value}");
     }
@@ -695,8 +685,8 @@ fn remote_edit(
         println!("updated the settings of '{name}'");
     }
     if new_name != remote.name {
-        repo.db
-            .update_remote(&remote.name, &new_name, &remote.target)?;
+        let password = AppState::load().repo(&repo.root).password;
+        repo.rename_remote(&remote.name, &new_name, password.as_deref())?;
         println!("renamed remote {name} to {new_name}");
     }
     Ok(())
@@ -1172,8 +1162,6 @@ fn metadata_backup(repo: &mut Repo) -> Result<(), String> {
 
 /// Where `mbr restore` gets the backup from.
 enum Source {
-    /// The database and rclone config, as plain files.
-    Files(PathBuf, PathBuf),
     /// An encrypted backup file.
     Backup(PathBuf),
     /// A remote of this backend, whose settings are asked for.
@@ -1184,30 +1172,23 @@ fn restore(dir: &Path, source: Source) -> Result<(), String> {
     let read = |path: &Path| {
         std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))
     };
-    let (db, conf, password) = match source {
-        Source::Files(db, conf) => (read(&db)?, read(&conf)?, None),
+    let (dump, password) = match source {
         Source::Backup(file) => {
             let sealed = read(&file)?;
             let password =
                 rpassword::prompt_password("master password: ").map_err(|e| e.to_string())?;
             println!("decrypting…");
-            let (db, conf) = metadata::unseal(&sealed, &password)?;
-            (db, conf, Some(password))
+            (metadata::unseal(&sealed, &password)?, password)
         }
-        Source::Remote(backend) => {
-            let (db, conf, password) = download_backup(dir, &backend)?;
-            (db, conf, Some(password))
-        }
+        Source::Remote(backend) => download_backup(dir, &backend)?,
     };
-    let (repo, report) = metadata::restore(dir, &db, &conf)?;
+    let (repo, report) = metadata::restore(dir, &dump, &password)?;
 
     // Nothing this machine knew about the folder at that path still holds.
     let mut state = AppState::load();
     let repo_state = state.repo_mut(&repo.root);
     *repo_state = RepoState::default();
-    if let Some(password) = &password {
-        repo_state.set_password(password)?;
-    }
+    repo_state.set_password(&password)?;
     state.save()?;
 
     println!(
@@ -1221,9 +1202,6 @@ fn restore(dir: &Path, source: Source) -> Result<(), String> {
     for (path, why) in &report.skipped {
         println!("  skipped {path}: {why}");
     }
-    if password.is_none() {
-        println!("set the master password the remotes were made with: `mbr config password`");
-    }
     if report.files > 0 {
         println!("the files' content is still on the remotes: `mbr pull <remote>` downloads it");
     }
@@ -1236,15 +1214,15 @@ fn plural(n: usize, what: &str) -> String {
 
 /// Ask for the master password and the settings of a remote of `backend`,
 /// and download the backup made with that password from it:
-/// `(database, rclone config, password)`. The remote is set up in a
-/// throwaway rclone config, since the backup brings the folder's own.
-fn download_backup(dir: &Path, backend: &str) -> Result<(Vec<u8>, Vec<u8>, String), String> {
+/// `(metadata, password)`. The remote is set up in a throwaway rclone
+/// config, since the backup brings the folder's own settings.
+fn download_backup(dir: &Path, backend: &str) -> Result<(Vec<u8>, String), String> {
     let Some(backend) = mbr::backends::offered().find(|b| b.name == backend) else {
         return Err(format!(
             "unknown backend '{backend}' (see `mbr remote types`)"
         ));
     };
-    if dir.join(mbr::repo::DB_FILE).exists() {
+    if Repo::is_initialized(dir) {
         return Err(format!(
             "{} is already an mbr folder: restore into a new one",
             dir.display()
@@ -1272,6 +1250,5 @@ fn download_backup(dir: &Path, backend: &str) -> Result<(Vec<u8>, Vec<u8>, Strin
     });
     std::fs::remove_file(&config).ok();
     println!("decrypting…");
-    let (db, conf) = metadata::unseal(&sealed?, &password)?;
-    Ok((db, conf, password))
+    Ok((metadata::unseal(&sealed?, &password)?, password))
 }

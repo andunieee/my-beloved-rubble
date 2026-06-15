@@ -8,7 +8,10 @@
 use mbr::Repo;
 use mbr::db::Remote;
 use mbr::metadata;
+use mbr::rclone;
+use mbr::remotes::{self, Layout};
 use mbr::repo::{LocalHealth, RemoteHealth};
+use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -36,11 +39,19 @@ impl Drop for TempDir {
     }
 }
 
-fn add_disk(repo: &mut Repo, name: &str, dir: &Path) -> Remote {
-    repo.db
-        .add_remote(name, &dir.display().to_string())
-        .unwrap();
-    repo.db.remote(name).unwrap().unwrap()
+/// Set up remote `name`, unencrypted, on the local directory `dir`, as the
+/// CLI does: the remote and the directory blobs are stored under in it.
+fn add_disk(repo: &mut Repo, name: &str, dir: &Path) -> (Remote, PathBuf) {
+    let layout = Layout::new(name, false).unwrap();
+    let folder_id = repo.folder_id().unwrap();
+    let spec = dir.display().to_string();
+    repo.with_rclone(|| {
+        let begun = rclone::begin_setup(&layout.root_section(), "local", json!({}));
+        layout.finish(begun, &spec, &folder_id, "").map(|_| ())
+    })
+    .unwrap();
+    let remote = repo.add_remote(&layout, &spec).unwrap();
+    (remote, dir.join(remotes::folder_dir(&folder_id)))
 }
 
 #[test]
@@ -59,7 +70,7 @@ fn blobs_are_read_only_and_verification_catches_corruption() {
     assert!(fs::write(folder.join("a.txt"), "apricot").is_err());
     assert_eq!(repo.verify_local(&hash).unwrap(), LocalHealth::Ok);
 
-    let remote = add_disk(&mut repo, "disk", &store);
+    let (remote, store) = add_disk(&mut repo, "disk", &store);
     repo.push_blob(&remote, &hash).unwrap();
     assert_eq!(
         repo.verify_on_remote(&remote, &hash).unwrap(),
@@ -101,8 +112,8 @@ fn dropping_needs_enough_verified_remote_copies() {
     let hash = repo.resolve_spec("a.txt").unwrap();
     assert_eq!(repo.min_copies().unwrap(), mbr::repo::DEFAULT_MIN_COPIES);
 
-    let one = add_disk(&mut repo, "one", &one);
-    let two = add_disk(&mut repo, "two", &two);
+    let (one, _) = add_disk(&mut repo, "one", &one);
+    let (two, _) = add_disk(&mut repo, "two", &two);
     repo.push_blob(&one, &hash).unwrap();
 
     // One copy elsewhere is not enough for the default of two.
@@ -148,7 +159,7 @@ fn gc_finds_old_versions_and_purge_removes_them_everywhere() {
     let mut repo = Repo::init(&folder).unwrap();
     repo.scan().unwrap();
     let old = repo.resolve_spec("a.txt").unwrap();
-    let remote = add_disk(&mut repo, "disk", &store);
+    let (remote, store) = add_disk(&mut repo, "disk", &store);
     repo.push_blob(&remote, &old).unwrap();
 
     fs::remove_file(folder.join("a.txt")).unwrap();
@@ -186,7 +197,7 @@ fn metadata_backup_restores_a_lost_folder() {
 
     let mut repo = Repo::init(&folder).unwrap();
     repo.scan().unwrap();
-    let remote = add_disk(&mut repo, "disk", &store);
+    let (remote, _) = add_disk(&mut repo, "disk", &store);
     repo.db.set_metadata_remote("disk", true).unwrap();
     for hash in repo.blobs_missing_on_remote("disk").unwrap() {
         repo.push_blob(&remote, &hash).unwrap();
@@ -198,7 +209,6 @@ fn metadata_backup_restores_a_lost_folder() {
     let name = metadata::backup_name("correct horse").unwrap();
     let scratch = repo.scratch_dir();
     repo.with_rclone(|| {
-        // A remote mbr didn't lay out keeps backups in its target.
         let location = mbr::remotes::backup_location(&remote.target)?;
         metadata::upload(&location, &name, &sealed, &scratch)
     })
@@ -222,17 +232,17 @@ fn metadata_backup_restores_a_lost_folder() {
     fs::write(fresh.join("notes.txt"), "already here").unwrap();
     let sealed = fs::read(&on_remote).unwrap();
     assert!(metadata::unseal(&sealed, "wrong horse").is_err());
-    let (db, conf) = metadata::unseal(&sealed, "correct horse").unwrap();
+    let dump = metadata::unseal(&sealed, "correct horse").unwrap();
     assert!(
-        metadata::restore(&fresh, &conf, &db).is_err(),
-        "files swapped"
+        metadata::restore(&fresh, b"{not metadata", "correct horse").is_err(),
+        "garbage"
     );
     assert!(!Repo::is_initialized(&fresh));
-    let (mut repo, report) = metadata::restore(&fresh, &db, &conf).unwrap();
+    let (mut repo, report) = metadata::restore(&fresh, &dump, "correct horse").unwrap();
     assert_eq!(report.files, 1, "{:?}", report.skipped);
     assert_eq!(report.kept, ["notes.txt"]);
     assert_eq!(repo.db.metadata_remotes().unwrap()[0].name, "disk");
-    assert_eq!(fs::read(repo.rclone_config_path()).unwrap(), conf);
+    assert!(!repo.rclone_config_incomplete().unwrap());
 
     let status = repo.status().unwrap();
     let paths: Vec<&str> = status.iter().map(|s| s.path.as_str()).collect();
@@ -257,5 +267,5 @@ fn metadata_backup_restores_a_lost_folder() {
 
     // Restoring is only ever into a folder that isn't an mbr folder yet.
     drop(repo);
-    assert!(metadata::restore(&fresh, &db, &conf).is_err());
+    assert!(metadata::restore(&fresh, &dump, "correct horse").is_err());
 }

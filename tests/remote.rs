@@ -5,9 +5,10 @@
 
 use mbr::Repo;
 use mbr::db::Remote;
+use mbr::remotes::Layout;
 use serde_json::json;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A fresh empty directory under the system temp dir, removed on drop.
 struct TempDir(PathBuf);
@@ -27,8 +28,24 @@ impl Drop for TempDir {
     }
 }
 
+/// Set up remote `name`, unencrypted, on the local directory `dir`, as the
+/// CLI does: the remote and the directory blobs are stored under in it.
+fn add_disk(repo: &mut Repo, name: &str, dir: &Path) -> (Remote, PathBuf) {
+    let layout = Layout::new(name, false).unwrap();
+    let folder_id = repo.folder_id().unwrap();
+    let spec = dir.display().to_string();
+    repo.with_rclone(|| {
+        let begun = mbr::rclone::begin_setup(&layout.root_section(), "local", json!({}));
+        layout.finish(begun, &spec, &folder_id, "").map(|_| ())
+    })
+    .unwrap();
+    let remote = repo.add_remote(&layout, &spec).unwrap();
+    (remote, dir.join(mbr::remotes::folder_dir(&folder_id)))
+}
+
 /// Put `content` on the remote directory `dir` the way mbr lays blobs out.
-fn plant_blob(dir: &std::path::Path, content: &str) -> String {
+fn plant_blob(dir: &Path, content: &str) -> String {
+    fs::create_dir_all(dir).unwrap();
     let tmp = dir.join("plant.tmp");
     fs::write(&tmp, content).unwrap();
     let hash = mbr::util::sha256_file(&tmp).unwrap();
@@ -49,10 +66,7 @@ fn scanning_a_remote_adopts_unknown_blobs_and_pull_downloads_them() {
 
     let mut repo = Repo::init(&folder).unwrap();
     repo.scan().unwrap();
-    repo.db
-        .add_remote("disk", &store.display().to_string())
-        .unwrap();
-    let remote = repo.db.remote("disk").unwrap().unwrap();
+    let (remote, store) = add_disk(&mut repo, "disk", &store);
 
     // Nothing there yet; a scan of an empty remote is fine.
     let check = repo.scan_remote(&remote).unwrap();
@@ -116,11 +130,7 @@ fn checking_specific_blobs_updates_their_records() {
     repo.scan().unwrap();
     let a = repo.resolve_spec("a").unwrap();
     let b = repo.resolve_spec("b").unwrap();
-    let remote = Remote {
-        name: "disk".into(),
-        target: store.display().to_string(),
-    };
-    repo.db.add_remote(&remote.name, &remote.target).unwrap();
+    let (remote, store) = add_disk(&mut repo, "disk", &store);
 
     // Present on the remote, but not recorded: the check records it.
     fs::create_dir_all(store.join(mbr::rclone::blob_path(&a)).parent().unwrap()).unwrap();
@@ -160,4 +170,28 @@ fn editing_a_configured_remote_keeps_other_settings() {
     .unwrap();
 
     fs::remove_file(&config).ok();
+}
+
+#[test]
+fn settings_rclone_changes_are_recorded_in_the_database() {
+    let tmp = TempDir::new("remote-absorb");
+    let folder = tmp.0.join("folder");
+    let store = tmp.0.join("store");
+    fs::create_dir_all(&folder).unwrap();
+    fs::create_dir_all(&store).unwrap();
+    let mut repo = Repo::init(&folder).unwrap();
+    add_disk(&mut repo, "disk", &store);
+    let record = repo.db.remote_record("disk").unwrap().unwrap();
+    assert_eq!(record.backend, "local");
+    assert_eq!(record.spec, store.display().to_string());
+    assert!(!record.encrypt);
+
+    repo.with_rclone(|| {
+        mbr::rclone::update_remote("_root-mbr-disk", json!({"copy_links": "true"}))
+    })
+    .unwrap();
+    drop(repo);
+    let mut repo = Repo::open(&folder).unwrap();
+    let record = repo.db.remote_record("disk").unwrap().unwrap();
+    assert_eq!(record.config["copy_links"], "true");
 }

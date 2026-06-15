@@ -20,7 +20,6 @@ slint-build = "1.11"
 
 [dependencies]
 slint = "1.17"
-minisqlite = { git = "https://github.com/cursor/minisqlite" }
 sha2 = "0.10"
 rfd = "0.15"
 open = "5"
@@ -36,6 +35,9 @@ argon2 = "0.5"
 serde = { version = "1", features = ["derive"] }
 tar = "0.4.46"
 flate2 = "1.1.10"
+iroh-docs = { version = "0.101", default-features = false, features = ["fs-store"] }
+iroh-blobs = { version = "0.103", default-features = false, features = ["fs-store"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -119,6 +119,15 @@ pub fn forget_cached_remotes() -> Result<(), String> {
     Ok(())
 }
 
+/// `clear` obscured the way rclone stores secrets in its config.
+pub fn obscure(clear: &str) -> Result<String, String> {
+    call("core/obscure", json!({"clear": clear}))?
+        .get("obscured")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| "rclone did not obscure the value".to_owned())
+}
+
 /// Run `f` with librclone pointed at the config at `path`, keeping other
 /// [`with_config`] callers (possibly using another repository's config)
 /// out until it returns.

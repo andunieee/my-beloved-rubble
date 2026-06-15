@@ -1,11 +1,12 @@
 //! Encrypted metadata backups.
 //!
-//! Blobs on a remote are named only by hash, so without `.mbr/mbr.db` a
-//! remote is a heap of anonymous files. The database is therefore backed
-//! up on its own terms, together with the rclone config (the credentials
-//! of every remote, to restore with): both go in one tar.gz, encrypted
-//! with the folder's master password, stored at the root of each remote
-//! chosen for it (next to the folder's own `mbr-<id>` directory) as
+//! Blobs on a remote are named only by hash, so without the database
+//! (`.mbr/db`) a remote is a heap of anonymous files. The database is
+//! therefore backed up on its own terms: everything in it ([`Db::export`]),
+//! remotes' settings included (the credentials to restore with), goes as
+//! JSON in a tar.gz, encrypted with the folder's master password, stored at
+//! the root of each remote chosen for it (next to the folder's own
+//! `mbr-<id>` directory) as
 //!
 //! ```text
 //! mbr-metadata-<backup id>.tar.gz.encrypted
@@ -25,25 +26,24 @@
 //! A backup is restored into a folder that is not an mbr folder yet
 //! ([`restore`]), never merged into one in use.
 
-use crate::db::Db;
+use crate::db::{Db, Dump};
 use crate::repo::{self, Repo};
 use crate::{rclone, util};
 use age::secrecy::SecretString;
+use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Component, Path};
 
 /// Shortest master password accepted.
 pub const MIN_PASSWORD_LEN: usize = 8;
-/// The database's name inside the tarball.
-pub const DB_ENTRY: &str = "mbr.db";
-/// The rclone config's name inside the tarball.
-pub const CONFIG_ENTRY: &str = "rclone.conf";
+/// The metadata's name inside the tarball.
+pub const DUMP_ENTRY: &str = "mbr-metadata.json";
 
 /// A consistent copy of the folder's metadata, in the clear.
 pub struct Snapshot {
-    pub db: Vec<u8>,
-    pub rclone_conf: Vec<u8>,
-    /// SHA-256 of `mbr.db` at the time of the snapshot.
+    /// The database as JSON (see [`Db::export`]).
+    pub dump: Vec<u8>,
+    /// SHA-256 of `dump`, to tell whether the database changed since.
     pub db_hash: String,
 }
 
@@ -125,50 +125,42 @@ pub fn decrypt(password: &str, ciphertext: &[u8]) -> Result<Vec<u8>, String> {
 /// Pack and encrypt a snapshot with the master password. Slow on purpose
 /// (scrypt): run it off the UI thread.
 pub fn seal(snapshot: &Snapshot, password: &str) -> Result<Vec<u8>, String> {
-    encrypt(password, &pack(&snapshot.db, &snapshot.rclone_conf)?)
+    encrypt(password, &pack(&snapshot.dump)?)
 }
 
-/// Decrypt and unpack a backup: `(database, rclone config)`.
-pub fn unseal(sealed: &[u8], password: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
+/// Decrypt and unpack a backup: the database as JSON.
+pub fn unseal(sealed: &[u8], password: &str) -> Result<Vec<u8>, String> {
     unpack(&decrypt(password, sealed)?)
 }
 
-/// The database and rclone config as a tar.gz.
-fn pack(db: &[u8], rclone_conf: &[u8]) -> Result<Vec<u8>, String> {
+/// The metadata as a tar.gz.
+fn pack(dump: &[u8]) -> Result<Vec<u8>, String> {
     let fail = |e: std::io::Error| format!("cannot pack the metadata: {e}");
     let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     let mut tar = tar::Builder::new(gz);
-    for (name, bytes) in [(DB_ENTRY, db), (CONFIG_ENTRY, rclone_conf)] {
-        let mut header = tar::Header::new_gnu();
-        header.set_size(bytes.len() as u64);
-        header.set_mode(0o600);
-        header.set_mtime(util::now().max(0) as u64);
-        tar.append_data(&mut header, name, bytes).map_err(fail)?;
-    }
+    let mut header = tar::Header::new_gnu();
+    header.set_size(dump.len() as u64);
+    header.set_mode(0o600);
+    header.set_mtime(util::now().max(0) as u64);
+    tar.append_data(&mut header, DUMP_ENTRY, dump)
+        .map_err(fail)?;
     tar.into_inner().and_then(|gz| gz.finish()).map_err(fail)
 }
 
-/// The database and rclone config in a tar.gz made by [`pack`].
-fn unpack(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+/// The metadata in a tar.gz made by [`pack`].
+fn unpack(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let fail = |e: std::io::Error| format!("the backup is not a metadata tarball: {e}");
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(bytes));
-    let (mut db, mut rclone_conf) = (None, None);
     for entry in archive.entries().map_err(fail)? {
         let mut entry = entry.map_err(fail)?;
-        let name = entry.path().map_err(fail)?.to_string_lossy().into_owned();
-        let slot = match name.as_str() {
-            DB_ENTRY => &mut db,
-            CONFIG_ENTRY => &mut rclone_conf,
-            _ => continue,
-        };
+        if entry.path().map_err(fail)?.as_os_str() != DUMP_ENTRY {
+            continue;
+        }
         let mut data = Vec::new();
         entry.read_to_end(&mut data).map_err(fail)?;
-        *slot = Some(data);
+        return Ok(data);
     }
-    match (db, rclone_conf) {
-        (Some(db), Some(rclone_conf)) => Ok((db, rclone_conf)),
-        _ => Err(format!("the backup lacks {DB_ENTRY} or {CONFIG_ENTRY}")),
-    }
+    Err(format!("the backup lacks {DUMP_ENTRY}"))
 }
 
 // ── moving backups (rclone; safe off-thread) ──
@@ -205,49 +197,40 @@ pub fn download(location: &str, name: &str, scratch: &Path) -> Result<Vec<u8>, S
 
 // ── restoring ──
 
-/// Make `dir` the mbr folder the backup describes: its database and rclone
-/// config become the folder's, and every file it tracks comes back as a
-/// symlink into the blob store, dangling until its blob is downloaded.
-/// `dir` must not be an mbr folder already.
-pub fn restore(dir: &Path, db: &[u8], rclone_conf: &[u8]) -> Result<(Repo, RestoreReport), String> {
+/// Make `dir` the mbr folder the metadata `dump` (see [`unseal`]) describes:
+/// its database becomes the folder's, its rclone settings are written from
+/// it with `password` keying the crypt layers, and every file it tracks
+/// comes back as a symlink into the blob store, dangling until its blob is
+/// downloaded. `dir` must not be an mbr folder already.
+pub fn restore(dir: &Path, dump: &[u8], password: &str) -> Result<(Repo, RestoreReport), String> {
     if !dir.is_dir() {
         return Err(format!("{} is not a directory", dir.display()));
     }
-    if dir.join(repo::DB_FILE).exists() {
+    if Repo::is_initialized(dir) {
         return Err(format!(
             "{} is already an mbr folder: restore into a new one",
             dir.display()
         ));
     }
-    if std::str::from_utf8(rclone_conf).is_err() {
-        return Err("the rclone config is not a text file".to_owned());
-    }
+    let dump: Dump = serde_json::from_slice(dump).map_err(|e| format!("not mbr metadata: {e}"))?;
 
-    // Check it really is an mbr database before putting anything in place.
-    let scratch = dir.join(repo::TMP_DIR);
-    std::fs::create_dir_all(&scratch)
-        .map_err(|e| format!("cannot create {}: {e}", scratch.display()))?;
-    let staged = scratch.join("restore.db");
-    std::fs::remove_file(&staged).ok();
-    std::fs::write(&staged, db).map_err(|e| format!("cannot write {}: {e}", staged.display()))?;
-    if let Err(e) = Db::open(&staged).and_then(|mut db| db.list_paths()) {
-        std::fs::remove_file(&staged).ok();
-        return Err(format!("not an mbr database: {e}"));
+    // The database is made aside and moved in place last: until then, this
+    // is no mbr folder.
+    let staged = dir.join(repo::TMP_DIR).join("restore-db");
+    std::fs::remove_dir_all(&staged).ok();
+    let imported = Db::open(&staged).and_then(|mut db| db.import(&dump));
+    if let Err(e) = imported {
+        std::fs::remove_dir_all(&staged).ok();
+        return Err(e);
     }
-
-    // The database last: until it is in place, this is no mbr folder.
-    let config = dir.join(repo::RCLONE_CONFIG_FILE);
-    std::fs::write(&config, rclone_conf)
-        .map_err(|e| format!("cannot write {}: {e}", config.display()))?;
-    repo::ensure_rclone_config(&config)?;
     std::fs::create_dir_all(dir.join(repo::BLOBS_DIR))
         .map_err(|e| format!("cannot create {}: {e}", repo::BLOBS_DIR))?;
-    std::fs::rename(&staged, dir.join(repo::DB_FILE))
+    std::fs::rename(&staged, dir.join(repo::DB_DIR))
         .map_err(|e| format!("cannot put the database in place: {e}"))?;
-    // rclone may still hold remotes of an earlier config at this path.
-    rclone::forget_cached_remotes()?;
 
     let mut repo = Repo::open(dir)?;
+    std::fs::remove_file(repo.rclone_config_path()).ok();
+    repo.write_rclone_config(Some(password))?;
     let mut report = RestoreReport::default();
     for record in repo.db.list_paths()? {
         if !record.is_active() {
@@ -288,32 +271,20 @@ impl Repo {
         self.root.join(repo::TMP_DIR)
     }
 
-    /// SHA-256 of `mbr.db` as it is on disk now.
-    pub fn db_hash(&self) -> Result<String, String> {
-        util::sha256_file(&self.root.join(repo::DB_FILE))
+    /// SHA-256 of the database as it is now (as [`Repo::metadata_snapshot`]
+    /// would back it up).
+    pub fn db_hash(&mut self) -> Result<String, String> {
+        Ok(self.metadata_snapshot()?.db_hash)
     }
 
-    /// A consistent copy of the database and rclone config. Run it on the
-    /// thread that owns the database, between writes.
+    /// A consistent copy of the database.
     pub fn metadata_snapshot(&mut self) -> Result<Snapshot, String> {
-        let dir = self.scratch_dir();
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-        let copy = dir.join(format!("snapshot-{}.db", std::process::id()));
-        std::fs::remove_file(&copy).ok();
-        let db_hash = self.db_hash()?;
-        let db = self
-            .db
-            .snapshot_to(&copy)
-            .and_then(|()| std::fs::read(&copy).map_err(|e| format!("cannot read snapshot: {e}")));
-        std::fs::remove_file(&copy).ok();
-        let rclone_conf = std::fs::read(self.rclone_config_path())
-            .map_err(|e| format!("cannot read {}: {e}", repo::RCLONE_CONFIG_FILE))?;
-        Ok(Snapshot {
-            db: db?,
-            rclone_conf,
-            db_hash,
-        })
+        let dump = serde_json::to_vec(&self.db.export()?).map_err(|e| e.to_string())?;
+        let db_hash = Sha256::digest(&dump)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        Ok(Snapshot { dump, db_hash })
     }
 }
 
@@ -347,17 +318,12 @@ mod tests {
     #[test]
     fn sealing_round_trips_and_rejects_wrong_passwords() {
         let snapshot = Snapshot {
-            db: b"database".to_vec(),
-            rclone_conf: b"[remote]\n".to_vec(),
+            dump: b"database".to_vec(),
             db_hash: String::new(),
         };
         let sealed = seal(&snapshot, "correct horse").unwrap();
         assert!(!sealed.windows(8).any(|w| w == b"database"));
-        let (db, conf) = unseal(&sealed, "correct horse").unwrap();
-        assert_eq!(
-            (db.as_slice(), conf.as_slice()),
-            (&b"database"[..], &b"[remote]\n"[..])
-        );
+        assert_eq!(unseal(&sealed, "correct horse").unwrap(), b"database");
         let err = unseal(&sealed, "correct house").unwrap_err();
         assert!(err.contains("wrong master password"), "{err}");
         let err = unseal(
