@@ -108,28 +108,11 @@ jobs:
           cargo build --release --locked --target "$TARGET" \
             --bin mbr --bin my-beloved-rubble
 
-      - name: package
+      - name: package (Linux/macOS)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           mkdir -p dist
-
-          if [[ "$RUNNER_OS" == Windows ]]; then
-            iscc="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
-            if [[ ! -x "$iscc" ]]; then
-              iscc="/c/Program Files/Inno Setup 6/ISCC.exe"
-            fi
-            args=(
-              "/DAppVersion=$VERSION"
-              "/DSourceDir=$(cygpath -w "$PWD/target/$TARGET/release")"
-              "/DOutputDir=$(cygpath -w "$PWD/dist")"
-            )
-            if [[ -f "target/$TARGET/release/librclone.dll" ]]; then
-              args+=(/DBundleDll=1)
-            fi
-            "$iscc" "${args[@]}" packaging/windows/mbr.iss
-            exit 0
-          fi
-
           name="mbr-v${VERSION}-${TARGET}"
           dir="dist/$name"
           mkdir -p "$dir"
@@ -177,6 +160,28 @@ jobs:
 
           tar -czf "dist/$name.tar.gz" -C dist "$name"
           rm -rf "$dir"
+
+      - name: package Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (!(Test-Path $iscc)) {
+            $iscc = "C:\Program Files\Inno Setup 6\ISCC.exe"
+          }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $source = (Resolve-Path "target/$env:TARGET/release").Path
+          $output = (Resolve-Path "dist").Path
+          $isccArgs = @(
+            "/DAppVersion=$env:VERSION"
+            "/DSourceDir=$source"
+            "/DOutputDir=$output"
+          )
+          if (Test-Path "target/$env:TARGET/release/librclone.dll") {
+            $isccArgs += "/DBundleDll=1"
+          }
+          & $iscc @isccArgs packaging/windows/mbr.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - uses: actions/upload-artifact@v7
         with:
