@@ -1307,8 +1307,9 @@ impl App {
         self.thumbs.borrow_mut().insert(hash, image);
     }
 
-    /// Show a large preview of the one file selected, if it is an image:
-    /// its thumbnail at once, then the image itself once decoded.
+    /// Show a large preview of the one file selected, if it is an image
+    /// (its thumbnail at once, then the image itself once decoded) or
+    /// text (its first lines).
     fn show_detail_preview(&self) {
         let hash = match self.window.get_detail_index() {
             i if i >= 0 => self
@@ -1327,12 +1328,11 @@ impl App {
             .and_then(|(h, _)| self.thumbs.borrow().get(h).cloned());
         self.window.set_has_detail_preview(thumb.is_some());
         self.window.set_detail_preview(thumb.unwrap_or_default());
+        self.window.set_has_detail_text(false);
+        self.window.set_detail_text(Default::default());
         let (Some((hash, true)), Some(root)) = (hash, self.root()) else {
             return;
         };
-        if self.no_thumb.borrow().contains(&hash) {
-            return;
-        }
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let outcome = thumbs::preview(&root, &hash, PREVIEW_SIZE);
@@ -1344,9 +1344,16 @@ impl App {
         if self.previewed.borrow().as_deref() != Some(hash.as_str()) {
             return;
         }
-        if let thumbs::Outcome::Ready(preview) = outcome {
-            self.window.set_detail_preview(to_image(&preview));
-            self.window.set_has_detail_preview(true);
+        match outcome {
+            thumbs::Outcome::Ready(preview) => {
+                self.window.set_detail_preview(to_image(&preview));
+                self.window.set_has_detail_preview(true);
+            }
+            thumbs::Outcome::Text(text) => {
+                self.window.set_detail_text(text.into());
+                self.window.set_has_detail_text(true);
+            }
+            _ => {}
         }
     }
 

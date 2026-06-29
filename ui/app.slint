@@ -494,6 +494,9 @@ export component AppWindow inherits Window {
     // The one file selected, as an image (see has-detail-preview).
     in-out property <image> detail-preview;
     in-out property <bool> has-detail-preview: false;
+    // The start of the one file selected, if it is text.
+    in-out property <string> detail-text;
+    in-out property <bool> has-detail-text: false;
     // The detail preview, filling the window.
     in-out property <bool> viewer-open: false;
     changed active-tab => { root.show-panel = false; }
@@ -1459,6 +1462,22 @@ export component AppWindow inherits Window {
                                 TouchArea {
                                     mouse-cursor: pointer;
                                     clicked => { root.open-file(root.detail-index); }
+                                }
+                            }
+                            if root.has-detail-text: Rectangle {
+                                // As tall as the text, up to a limit.
+                                height: min(detail-text.preferred-height + 16px, 240px);
+                                background: Palette.background.darker(0.08);
+                                border-radius: 6px;
+                                clip: true;
+                                detail-text := Text {
+                                    x: 8px;
+                                    y: 8px;
+                                    width: parent.width - 16px;
+                                    text: root.detail-text;
+                                    font-family: "monospace";
+                                    font-size: 11px;
+                                    wrap: word-wrap;
                                 }
                             }
                             Text {
