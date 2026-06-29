@@ -643,7 +643,12 @@ export component AppWindow inherits Window {
     callback cancel-restore();
 
     VerticalLayout {
-        padding: 0px;
+        // Keep the UI out from under the status bar, navigation bar, notches
+        // and rounded corners. These are 0 on desktop.
+        padding-top: root.safe-area-insets.top;
+        padding-bottom: root.safe-area-insets.bottom;
+        padding-left: root.safe-area-insets.left;
+        padding-right: root.safe-area-insets.right;
         spacing: 0px;
 
         // ══ Toolbar ══
