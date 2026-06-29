@@ -129,7 +129,9 @@ Rclone is embedded through `librclone`; building requires a Go toolchain and C c
 
 ## Releases
 
-Pushing a `v*` tag builds and publishes a GitHub release with archives for Linux and macOS (x86_64 and arm64), plus a Windows x86_64 installer. Each archive holds both binaries, `mbr` and `my-beloved-rubble` (and a `My Beloved Rubble.app` bundle on macOS); the release also carries a `SHA256SUMS` file. Running the `release` workflow by hand builds the same artifacts without publishing a release.
+Pushing a `v*` tag builds and publishes a GitHub release with archives for Linux and macOS (x86_64 and arm64), a Windows x86_64 installer, and an Android arm64 APK. Each archive holds both binaries, `mbr` and `my-beloved-rubble` (and a `My Beloved Rubble.app` bundle on macOS); the release also carries a `SHA256SUMS` file. Running the `release` workflow by hand builds the same artifacts without publishing a release.
+
+The Android APK is signed with a throwaway key unless the repository has `ANDROID_KEYSTORE_BASE64` (a base64-encoded keystore) and `ANDROID_KEYSTORE_PASSWORD` secrets, in which case that key is used so new APKs can upgrade earlier installs.
 
 On Windows, enable **Developer Mode** (Settings → System → For developers) before using mbr: tracked files are stored as symlinks, which normal users can only create with that setting.
 

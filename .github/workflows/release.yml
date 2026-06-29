@@ -1,5 +1,6 @@
 # Builds the GUI (my-beloved-rubble) and CLI (mbr) for Linux, macOS and
-# Windows, and publishes them as a GitHub release when a v* tag is pushed.
+# Windows, plus the Android app, and publishes them as a GitHub release
+# when a v* tag is pushed.
 name: release
 
 on:
@@ -204,9 +205,94 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  android:
+    name: android arm64
+    needs: prepare
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # cargo-apk drives the SDK's aapt/apksigner/keytool, which run on a JDK.
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # Same bindgen/libclang requirement as the desktop builds.
+      - name: install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev
+
+      # librclone embeds rclone by building it with `go build`.
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.x'
+          cache: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: android
+          key: android-arm64
+
+      - name: install cargo-apk
+        run: cargo install cargo-apk --version 0.10.0 --locked
+
+      # cargo-apk refuses to build a release APK without a keystore. A
+      # keystore kept in secrets lets new APKs upgrade earlier installs;
+      # without one, sign with a throwaway key so the artifact still runs.
+      - name: prepare signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          keystore="$RUNNER_TEMP/release.keystore"
+          if [[ -n "$KEYSTORE_BASE64" ]]; then
+            if [[ -z "$KEYSTORE_PASSWORD" ]]; then
+              echo "ANDROID_KEYSTORE_BASE64 is set, but ANDROID_KEYSTORE_PASSWORD is not" >&2
+              exit 1
+            fi
+            printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$keystore"
+            password="$KEYSTORE_PASSWORD"
+          else
+            password="$(openssl rand -hex 16)"
+            keytool -genkeypair -keystore "$keystore" \
+              -storepass "$password" -alias mbr -keypass "$password" \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=My Beloved Rubble"
+            echo "::warning::ANDROID_KEYSTORE_BASE64 is not set; signing with a throwaway key, so this APK cannot upgrade an earlier install"
+          fi
+          echo "CARGO_APK_RELEASE_KEYSTORE=$keystore" >> "$GITHUB_ENV"
+          echo "CARGO_APK_RELEASE_KEYSTORE_PASSWORD=$password" >> "$GITHUB_ENV"
+
+      - name: build APK
+        run: ./android/build.sh build
+
+      - name: package APK
+        run: |
+          apk="android/target/release/apk/my-beloved-rubble.apk"
+          unzip -l "$apk" | grep -q 'lib/arm64-v8a/librclonego.so'
+          build_tools="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          "$build_tools/apksigner" verify --print-certs "$apk"
+          mkdir -p dist
+          cp "$apk" "dist/mbr-v${VERSION}-android-arm64.apk"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mbr-android-arm64
+          path: dist/*
+          if-no-files-found: error
+
   release:
     name: publish release
-    needs: [prepare, build]
+    needs: [prepare, build, android]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
@@ -228,8 +314,9 @@ jobs:
             Linux and macOS archives for x86_64 and arm64, each containing the
             `mbr` command-line tool and the `my-beloved-rubble` GUI (and a
             `My Beloved Rubble.app` bundle on macOS), plus a Windows x86_64
-            installer. On Windows, enable Developer Mode before using mbr: it
-            stores files as symlinks. Check downloads with `SHA256SUMS`.
+            installer and an Android arm64 APK. On Windows, enable Developer
+            Mode before using mbr: it stores files as symlinks. Check
+            downloads with `SHA256SUMS`.
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: dist/*
