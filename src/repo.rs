@@ -3,7 +3,7 @@
 
 use crate::db::{Db, PathRecord, Remote};
 use crate::{rclone, util};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -193,6 +193,22 @@ enum Entry {
     BlobLink(PathBuf, String),
 }
 
+/// What bringing the folder in line with a sync did (see
+/// [`Repo::apply_synced`]).
+#[derive(Debug, Default)]
+pub struct SyncApplied {
+    /// Files whose link was created, changed or removed.
+    pub updated: Vec<String>,
+    /// Files changed here since the last scan, left as they are: the next
+    /// scan records them, as the newest change.
+    pub kept: Vec<String>,
+    /// Files that could not be updated, with the reason.
+    pub skipped: Vec<(String, String)>,
+    /// Some remote was added, changed or removed: the rclone settings need
+    /// writing again ([`Repo::write_rclone_config`]).
+    pub remotes_changed: bool,
+}
+
 /// Suffix of the hidden symlink staged next to a file while it is being
 /// ingested (`dir/.name.mbr-ingest`). If mbr dies after moving the file
 /// into the store but before renaming the link into place, the next scan
@@ -214,6 +230,11 @@ impl Repo {
         ensure_rclone_config(&root.join(RCLONE_CONFIG_FILE))?;
         let db = Db::open(&root.join(DB_DIR))?;
         let mut repo = Self { root, db };
+        repo.carry_over_password_check()?;
+        // Made now rather than when the first remote is set up, so devices
+        // syncing the folder never each make their own: one joining
+        // another's folder gets its id with the rest.
+        repo.folder_id()?;
         repo.absorb_rclone_config()?;
         Ok(repo)
     }
@@ -236,8 +257,25 @@ impl Repo {
         }
         let db = Db::open(&root.join(DB_DIR))?;
         let mut repo = Self { root, db };
+        repo.carry_over_password_check()?;
+        // Made now rather than when the first remote is set up, so devices
+        // syncing the folder never each make their own: one joining
+        // another's folder gets its id with the rest.
+        repo.folder_id()?;
         repo.absorb_rclone_config()?;
         Ok(repo)
+    }
+
+    /// Earlier versions kept the master password's check in the folder's
+    /// `local.json`: move it into the metadata, where peers see it.
+    fn carry_over_password_check(&mut self) -> Result<(), String> {
+        if self.password_check()?.is_none()
+            && let Some(check) = crate::state::read_local(&self.root).password_check
+        {
+            self.db
+                .set_setting(crate::metadata::PASSWORD_CHECK_SETTING, &check)?;
+        }
+        Ok(())
     }
 
     /// Walk up from `start` to find the nearest attached folder.
@@ -347,6 +385,55 @@ impl Repo {
             }
             Ok(report)
         })
+    }
+
+    // ── syncing ──
+
+    /// Take in what a sync with another device wrote to the database (see
+    /// [`crate::peers`]), and make the folder match: a file the sync
+    /// added, changed or removed gets its link created, changed or removed
+    /// — dangling until its blob is downloaded, like a restored file —
+    /// unless it was changed here since the last scan, then it is left
+    /// alone. Don't scan meanwhile: the scan would take a file the sync
+    /// added, but not yet linked, for one removed here.
+    pub fn apply_synced(&mut self) -> Result<SyncApplied, String> {
+        let before = self.active_paths()?;
+        let remotes = self.db.remote_records()?;
+        self.db.reload()?;
+        let after = self.active_paths()?;
+        let mut applied = SyncApplied {
+            remotes_changed: remotes != self.db.remote_records()?,
+            ..SyncApplied::default()
+        };
+        let paths: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+        for path in paths {
+            let (old, new) = (before.get(path), after.get(path));
+            if old == new {
+                continue;
+            }
+            match relink(
+                &self.root,
+                path,
+                old.map(String::as_str),
+                new.map(String::as_str),
+            ) {
+                Ok(true) => applied.updated.push(path.clone()),
+                Ok(false) => applied.kept.push(path.clone()),
+                Err(e) => applied.skipped.push((path.clone(), e)),
+            }
+        }
+        Ok(applied)
+    }
+
+    /// The blob each current file names.
+    fn active_paths(&mut self) -> Result<BTreeMap<String, String>, String> {
+        Ok(self
+            .db
+            .list_paths()?
+            .into_iter()
+            .filter(PathRecord::is_active)
+            .map(|r| (r.path, r.hash))
+            .collect())
     }
 
     // ── status ──
@@ -776,6 +863,58 @@ fn name_unnamed_blob(root: &Path, hash: &str) -> Result<String, String> {
         link_blob(root, &rel, hash)?;
     }
     Ok(rel_str(&rel))
+}
+
+/// Make `path` name blob `new` (or nothing), provided it still names `old`
+/// (or nothing) as the database said before: `false` if it was changed
+/// meanwhile, and so left alone.
+fn relink(root: &Path, path: &str, old: Option<&str>, new: Option<&str>) -> Result<bool, String> {
+    let rel = Path::new(path);
+    let safe = rel
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)));
+    if !safe || new.is_some_and(|h| !util::is_hash(h)) {
+        return Err("not a valid tracked path".to_owned());
+    }
+    let abs = root.join(rel);
+    let here = match std::fs::symlink_metadata(&abs) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("cannot inspect {}: {e}", abs.display())),
+        Ok(meta) if meta.file_type().is_symlink() => match blob_link_hash(&abs) {
+            Some(hash) => Some(hash),
+            None => return Ok(false),
+        },
+        Ok(_) => return Ok(false),
+    };
+    if here.as_deref() == new {
+        return Ok(true);
+    }
+    if here.as_deref() != old {
+        return Ok(false);
+    }
+    if here.is_some() {
+        std::fs::remove_file(&abs).map_err(|e| format!("cannot remove {}: {e}", abs.display()))?;
+    }
+    match new {
+        Some(hash) => {
+            if let Some(parent) = abs.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+            }
+            link_blob(root, rel, hash)?;
+        }
+        None => {
+            // Folders the removal emptied go too.
+            let mut dir = abs.parent();
+            while let Some(d) = dir.filter(|d| *d != root) {
+                if std::fs::remove_dir(d).is_err() {
+                    break;
+                }
+                dir = d.parent();
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Create the symlink `rel` (relative to `root`) pointing at blob `hash`.

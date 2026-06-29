@@ -2,12 +2,14 @@
 
 //! `my-beloved-rubble` — the Slint GUI.
 //!
-//! Three tabs: **Blobs** (the annotated file listing, with multi-selection
+//! Four tabs: **Blobs** (the annotated file listing, with multi-selection
 //! and a sidebar acting on the selected blobs), **Remotes** (listing,
-//! scanning, downloading from, setting up and editing remotes) and
+//! scanning, downloading from, setting up and editing remotes),
 //! **Settings** (the master password, and which remotes receive the
-//! encrypted metadata backups). A folder that isn't an mbr folder yet
-//! first asks whether to start anew there or restore a lost folder into it.
+//! encrypted metadata backups) and **Peers** (the other devices the
+//! folder's metadata syncs with, over iroh). A folder that isn't an mbr
+//! folder yet first asks whether to start anew there or restore a lost
+//! folder into it.
 //!
 //! Slow work — rclone operations (push / fetch / list / stat / config) and
 //! the filesystem half of a scan (hashing, moving files into the store) —
@@ -19,13 +21,14 @@ use age::secrecy::{ExposeSecret, SecretString};
 use mbr::backends::{self, Backend, Field, Kind};
 use mbr::db::Remote;
 use mbr::metadata;
+use mbr::peers::{self, Node};
 use mbr::rclone::RemoteBlob;
 use mbr::repo::{self, DropOutcome, LocalHealth, RemoteHealth, Repo};
-use mbr::state::{AppState, BackupRecord, RepoState};
+use mbr::state::{AppState, BackupRecord, Peer, RepoState};
 use mbr::util;
 use slint::{Model, ModelRc, SharedString, VecModel};
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -124,6 +127,8 @@ enum Msg {
         name: String,
         result: Result<(), String>,
     },
+    /// Something happened syncing with the peers.
+    Peer(peers::Event),
 }
 
 /// Which rows of the blob list are selected, by path (so the selection
@@ -240,8 +245,17 @@ struct App {
     edit: RefCell<Option<EditState>>,
     /// Local app state (`state.json` and each folder's `local.json`).
     state: RefCell<AppState>,
-    /// The open folder's master password, saved on this machine.
+    /// The open folder's master password, saved on this machine or typed
+    /// since the folder was opened.
     password: RefCell<Option<SecretString>>,
+    /// Syncing the open folder with its peers, while it has any.
+    node: RefCell<Option<Node>>,
+    /// How the last sync with each peer went: `(text, ok)`.
+    peer_status: RefCell<BTreeMap<String, (String, bool)>>,
+    /// Devices that tried to sync but aren't peers.
+    knocking: RefCell<BTreeSet<String>>,
+    /// A sync brought changes in during a scan: applied once it ends.
+    sync_pending: Cell<bool>,
     /// The remote being set up, while rclone still asks questions.
     setup: RefCell<Option<PendingSetup>>,
     /// A folder that isn't an mbr folder yet, while the user chooses to
@@ -429,6 +443,10 @@ fn main() -> Result<(), slint::PlatformError> {
         edit: RefCell::new(None),
         state: RefCell::new(AppState::load()),
         password: RefCell::new(None),
+        node: RefCell::new(None),
+        peer_status: RefCell::new(BTreeMap::new()),
+        knocking: RefCell::new(BTreeSet::new()),
+        sync_pending: Cell::new(false),
         setup: RefCell::new(None),
         pending_folder: RefCell::new(None),
     });
@@ -453,6 +471,17 @@ fn main() -> Result<(), slint::PlatformError> {
                     app.refresh();
                 }
             },
+        );
+    }
+
+    // ── syncing with the peers, every minute ──
+    let peer_timer = slint::Timer::default();
+    {
+        let app = app.clone();
+        peer_timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_secs(60),
+            move || app.sync_peers(),
         );
     }
 
@@ -697,6 +726,24 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let app = app.clone();
+        w.on_unlock(move |password| app.unlock(&password));
+    }
+
+    // peers
+    {
+        let app = app.clone();
+        w.on_add_peer(move |id, name| app.add_peer(&id, &name));
+    }
+    {
+        let app = app.clone();
+        w.on_remove_peer(move |id| app.remove_peer(&id));
+    }
+    {
+        let app = app.clone();
+        w.on_sync_peers(move || app.sync_peers());
+    }
+    {
+        let app = app.clone();
         w.on_backup_metadata(move || app.backup_metadata());
     }
 
@@ -820,14 +867,21 @@ impl App {
         }
         *self.password.borrow_mut() = saved.map(SecretString::from);
         self.reset_setup_ui();
+        *self.node.borrow_mut() = None;
         *self.repo.borrow_mut() = Some(repo);
         *self.selection.borrow_mut() = Selection::default();
+        self.peer_status.borrow_mut().clear();
+        self.knocking.borrow_mut().clear();
+        self.sync_pending.set(false);
         self.close_editor();
+        self.start_node();
         self.refresh();
         self.rescan();
     }
 
     fn close_repo(&self) {
+        // The node shares the database: it stops first.
+        *self.node.borrow_mut() = None;
         *self.repo.borrow_mut() = None;
         *self.password.borrow_mut() = None;
         *self.selection.borrow_mut() = Selection::default();
@@ -917,21 +971,27 @@ impl App {
 
     /// Make the pending folder the one a decrypted backup describes.
     fn finish_restore(&self, dir: &Path, dump: &[u8], password: SecretString) {
-        let (repo, report) = match metadata::restore(dir, dump, password.expose_secret()) {
+        let (mut repo, report) = match metadata::restore(dir, dump, password.expose_secret()) {
             Ok(restored) => restored,
             Err(e) => {
                 self.status(format!("Restore failed: {e}"));
                 return;
             }
         };
+        // A backup made before the check was part of the metadata.
+        let checked = repo.password_check().and_then(|check| match check {
+            Some(_) => Ok(()),
+            None => repo.set_password(password.expose_secret()),
+        });
+        if let Err(e) = checked {
+            log::warn!("cannot record the master password: {e}");
+        }
         {
             // Nothing this machine knew about a folder at that path holds.
             let mut state = self.state.borrow_mut();
             let repo_state = state.repo_mut(&repo.root);
             *repo_state = RepoState::default();
-            if let Err(e) = repo_state.set_password(password.expose_secret()) {
-                log::warn!("cannot save the master password: {e}");
-            }
+            repo_state.keep_password(password.expose_secret());
         }
         self.open_repo(repo);
         let mut text = format!("Restored {} file(s)", report.files);
@@ -1300,13 +1360,9 @@ impl App {
         self.repo.borrow().as_ref().map(|r| r.root.clone())
     }
 
-    /// Set the folder's master password once.
+    /// Set the folder's master password once (for every device).
     fn set_password(&self, password: &str, repeat: &str) {
         let Some(root) = self.root() else { return };
-        if self.state.borrow().repo(&root).password_check.is_some() {
-            self.status("The master password is already set and cannot be changed");
-            return;
-        }
         if let Err(e) = metadata::check_new_password(password) {
             self.status(format!("Error: {e}"));
             return;
@@ -1316,13 +1372,17 @@ impl App {
             return;
         }
         {
-            let mut state = self.state.borrow_mut();
-            let repo_state = state.repo_mut(&root);
-            if let Err(e) = repo_state.set_password(password) {
-                drop(state);
+            let mut repo = self.repo.borrow_mut();
+            let Some(repo) = repo.as_mut() else { return };
+            if let Err(e) = repo.set_password(password) {
                 self.status(format!("Error: {e}"));
                 return;
             }
+        }
+        {
+            let mut state = self.state.borrow_mut();
+            let repo_state = state.repo_mut(&root);
+            repo_state.keep_password(password);
             // Backups made so far are encrypted with the old password.
             repo_state.metadata_backups.clear();
         }
@@ -1335,31 +1395,282 @@ impl App {
     }
 
     fn test_password(&self, password: &str) {
-        let Some(root) = self.root() else { return };
-        let Some(check) = self.state.borrow().repo(&root).password_check else {
-            return;
+        let verified = match self.repo.borrow_mut().as_mut() {
+            Some(repo) => repo.verify_password(password),
+            None => return,
         };
-        if !metadata::password_matches(&check, password) {
-            self.status("Wrong master password");
+        if let Err(e) = verified {
+            self.status(format!("Error: {e}"));
             return;
-        }
-        if self.password.borrow().is_none() {
-            if let Err(e) = self
-                .state
-                .borrow_mut()
-                .repo_mut(&root)
-                .remember_password(password)
-            {
-                self.status(format!("Error: {e}"));
-                return;
-            }
-            self.save_state();
-            *self.password.borrow_mut() = Some(SecretString::from(password.to_owned()));
         }
         self.window.set_testing_password(false);
         self.window.set_test_password_entry(SharedString::default());
         self.status("Master password is correct");
         self.refresh();
+    }
+
+    /// Check the master password typed on this computer (set on another
+    /// device), and save it here. Remotes synced from another device get
+    /// their rclone settings now.
+    fn unlock(&self, password: &str) {
+        let Some(root) = self.root() else { return };
+        let ready = match self.repo.borrow_mut().as_mut() {
+            Some(repo) => repo.verify_password(password).and_then(|()| {
+                if repo.rclone_config_incomplete()? {
+                    repo.write_rclone_config(Some(password))?;
+                }
+                Ok(())
+            }),
+            None => return,
+        };
+        if let Err(e) = ready {
+            self.status(format!("Error: {e}"));
+            return;
+        }
+        self.state
+            .borrow_mut()
+            .repo_mut(&root)
+            .keep_password(password);
+        self.save_state();
+        *self.password.borrow_mut() = Some(SecretString::from(password.to_owned()));
+        self.window.set_unlock_entry(SharedString::default());
+        self.status("Master password is correct");
+        self.refresh();
+    }
+
+    // ── peers ──
+
+    /// Start syncing the open folder with its peers, if it has any.
+    fn start_node(&self) {
+        *self.node.borrow_mut() = None;
+        let Some(root) = self.root() else { return };
+        let (key, ids) = {
+            let mut state = self.state.borrow_mut();
+            let repo_state = state.repo_mut(&root);
+            let key = peers::node_key(repo_state);
+            (key, repo_state.peers.keys().cloned().collect::<Vec<_>>())
+        };
+        self.save_state();
+        // No network activity for folders that aren't synced.
+        if ids.is_empty() {
+            return;
+        }
+        let Some(shared) = self.repo.borrow().as_ref().map(|r| r.db.shared()) else {
+            return;
+        };
+        let tx = self.tx.clone();
+        match Node::start(key, shared, &ids, move |event| {
+            tx.send(Msg::Peer(event)).ok();
+        }) {
+            Ok(node) => {
+                *self.node.borrow_mut() = Some(node);
+                self.sync_peers();
+            }
+            Err(e) => self.status(format!("Cannot sync with the peers: {e}")),
+        }
+    }
+
+    /// Sync with every peer, in the background.
+    fn sync_peers(&self) {
+        let Some(root) = self.root() else { return };
+        {
+            let node = self.node.borrow();
+            let Some(node) = node.as_ref() else { return };
+            for id in self.state.borrow().repo(&root).peers.keys() {
+                node.sync(id);
+                self.peer_status
+                    .borrow_mut()
+                    .entry(id.clone())
+                    .or_insert_with(|| ("syncing…".to_owned(), true));
+            }
+        }
+        self.refresh_peers();
+    }
+
+    fn add_peer(&self, id: &str, name: &str) {
+        let Some(root) = self.root() else { return };
+        let id = match peers::check_device_id(id) {
+            Ok(id) => id,
+            Err(e) => {
+                self.status(format!("Error: {e}"));
+                return;
+            }
+        };
+        let name = match name.trim() {
+            "" => format!("device {}", &id[..8]),
+            name => name.to_owned(),
+        };
+        {
+            let mut state = self.state.borrow_mut();
+            let repo_state = state.repo_mut(&root);
+            if peers::device_id(&peers::node_key(repo_state)) == id {
+                drop(state);
+                self.status("Error: that is this computer's own id");
+                return;
+            }
+            repo_state
+                .peers
+                .insert(id.clone(), Peer { name: name.clone() });
+        }
+        self.save_state();
+        self.knocking.borrow_mut().remove(&id);
+        self.window.set_peer_new_id(SharedString::default());
+        self.window.set_peer_new_name(SharedString::default());
+        self.status(format!(
+            "Added {name}: syncing starts once it adds this computer too"
+        ));
+        let ids: Vec<String> = self
+            .state
+            .borrow()
+            .repo(&root)
+            .peers
+            .keys()
+            .cloned()
+            .collect();
+        if let Some(node) = self.node.borrow().as_ref() {
+            node.set_peers(&ids);
+        }
+        if self.node.borrow().is_some() {
+            self.sync_peers();
+        } else {
+            self.start_node();
+        }
+        self.refresh_peers();
+    }
+
+    fn remove_peer(&self, id: &str) {
+        let Some(root) = self.root() else { return };
+        let removed = self.state.borrow_mut().repo_mut(&root).peers.remove(id);
+        self.save_state();
+        self.peer_status.borrow_mut().remove(id);
+        let ids: Vec<String> = self
+            .state
+            .borrow()
+            .repo(&root)
+            .peers
+            .keys()
+            .cloned()
+            .collect();
+        if ids.is_empty() {
+            *self.node.borrow_mut() = None;
+        } else if let Some(node) = self.node.borrow().as_ref() {
+            node.set_peers(&ids);
+        }
+        if let Some(peer) = removed {
+            self.status(format!("No longer syncing with {}", peer.name));
+        }
+        self.refresh_peers();
+    }
+
+    fn peer_event(&self, event: peers::Event) {
+        match event {
+            peers::Event::Synced { peer, report } => {
+                if report.joined {
+                    // The folder is now another device's: what this one
+                    // knew of its own is moot, the password included.
+                    if let Some(root) = self.root() {
+                        self.state.borrow_mut().repo_mut(&root).forget_folder();
+                        self.save_state();
+                    }
+                    *self.password.borrow_mut() = None;
+                    self.status(
+                        "This folder joined the peer's; type its master password in Settings",
+                    );
+                }
+                let text = format!("synced {}", util::format_time(util::now()));
+                self.peer_status.borrow_mut().insert(peer, (text, true));
+                if report.received > 0 || report.joined {
+                    if self.scanning.get() {
+                        self.sync_pending.set(true);
+                    } else {
+                        self.apply_synced();
+                    }
+                }
+            }
+            peers::Event::Failed { peer, error } => {
+                self.peer_status.borrow_mut().insert(peer, (error, false));
+            }
+            peers::Event::Refused { peer } => {
+                let known = self
+                    .root()
+                    .is_some_and(|root| self.state.borrow().repo(&root).peers.contains_key(&peer));
+                if !known {
+                    self.knocking.borrow_mut().insert(peer);
+                }
+            }
+        }
+    }
+
+    /// Bring the folder in line with what syncs brought in.
+    fn apply_synced(&self) {
+        self.sync_pending.set(false);
+        let password = self.password.borrow().clone();
+        self.with_repo("apply the sync", |repo| {
+            let applied = repo.apply_synced()?;
+            let mut text = format!("Synced: {} file(s) updated", applied.updated.len());
+            if !applied.kept.is_empty() {
+                text += &format!(
+                    "; {} changed here kept for the next scan",
+                    applied.kept.len()
+                );
+            }
+            if !applied.skipped.is_empty() {
+                text += &format!("; {} skipped", applied.skipped.len());
+            }
+            if applied.remotes_changed {
+                let password = password.as_ref().map(|p| p.expose_secret());
+                if repo.write_rclone_config(password).is_err() {
+                    text += "; type the master password in Settings to use the synced remotes";
+                }
+            }
+            Ok(text)
+        });
+    }
+
+    /// Rebuild the Peers tab.
+    fn refresh_peers(&self) {
+        let w = &self.window;
+        let Some(root) = self.root() else {
+            w.set_device_id(SharedString::default());
+            w.set_peer_rows(ModelRc::default());
+            w.set_peer_count(0);
+            return;
+        };
+        let (key, known) = {
+            let mut state = self.state.borrow_mut();
+            let repo_state = state.repo_mut(&root);
+            (peers::node_key(repo_state), repo_state.peers.clone())
+        };
+        w.set_device_id(peers::device_id(&key).into());
+        let status = self.peer_status.borrow();
+        let mut rows: Vec<PeerRow> = self
+            .knocking
+            .borrow()
+            .iter()
+            .filter(|id| !known.contains_key(*id))
+            .map(|id| PeerRow {
+                id: id.as_str().into(),
+                name: SharedString::default(),
+                status: SharedString::default(),
+                ok: false,
+                knocking: true,
+            })
+            .collect();
+        rows.extend(known.iter().map(|(id, peer)| {
+            let (text, ok) = status
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| ("not synced yet".to_owned(), true));
+            PeerRow {
+                id: id.as_str().into(),
+                name: peer.name.as_str().into(),
+                status: text.into(),
+                ok,
+                knocking: false,
+            }
+        }));
+        w.set_peer_count(known.len() as i32);
+        w.set_peer_rows(ModelRc::new(VecModel::from(rows)));
     }
 
     /// Snapshot the metadata here, then encrypt and upload it to every
@@ -2368,12 +2679,18 @@ impl App {
                     }),
                     Err(e) => self.status(format!("Scan failed: {e}")),
                 }
+                if self.sync_pending.get() {
+                    self.apply_synced();
+                }
+                // What the scan found goes to the peers.
+                self.sync_peers();
             }
             Msg::Done => {
                 let left = self.tasks.get().saturating_sub(1);
                 self.tasks.set(left);
                 self.window.set_busy(left > 0);
             }
+            Msg::Peer(event) => self.peer_event(event),
         }
     }
 
@@ -2381,8 +2698,8 @@ impl App {
 
     /// Rebuild every model from the repo (cheap; local data only).
     fn refresh(&self) {
-        let mut repo = self.repo.borrow_mut();
-        let Some(repo) = repo.as_mut() else {
+        let mut guard = self.repo.borrow_mut();
+        let Some(repo) = guard.as_mut() else {
             let w = &self.window;
             w.set_folder(SharedString::default());
             self.files.set_vec(Vec::new());
@@ -2390,6 +2707,8 @@ impl App {
             w.set_remotes(ModelRc::default());
             w.set_remote_names(ModelRc::default());
             w.set_metadata_rows(ModelRc::default());
+            drop(guard);
+            self.refresh_peers();
             return;
         };
         self.window
@@ -2457,6 +2776,8 @@ impl App {
         }
 
         self.refresh_metadata(repo);
+        drop(guard);
+        self.refresh_peers();
         self.show_selection();
     }
 
@@ -2464,7 +2785,7 @@ impl App {
     fn refresh_metadata(&self, repo: &mut Repo) {
         let w = &self.window;
         let state = self.state.borrow().repo(&repo.root);
-        w.set_password_set(state.password_check.is_some());
+        w.set_password_set(repo.password_check().is_ok_and(|c| c.is_some()));
         w.set_password_available(self.password.borrow().is_some());
 
         let (remotes, chosen) = match repo.db.list_remotes().and_then(|all| {

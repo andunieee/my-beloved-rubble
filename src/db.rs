@@ -1,19 +1,22 @@
 //! The metadata store of a rubble folder: an [iroh-docs] replica whose
 //! entry values live in an [iroh-blobs] store, both under `.mbr/db/`, laid
-//! out as iroh-docs' own `Docs::persistent` would, so the same files can
-//! later be synced with other devices.
+//! out as iroh-docs' own `Docs::persistent` would. Devices sharing a folder
+//! each keep a replica of the same namespace and sync them ([`Shared`],
+//! [`crate::peers`]).
 //!
 //! An iroh-docs entry is identified by `(key, author)`, each device writing
 //! as its own author, and a newer entry replaces an older one with the same
 //! key and author. Writing an entry also deletes the same author's entries
 //! whose keys it prefixes, so every key segment here ends with a NUL byte:
-//! no key is ever a prefix of another. An empty entry is a deletion.
+//! no key is ever a prefix of another. An empty entry is a deletion. Reads
+//! take the newest entry of each key, whichever device wrote it, so the
+//! last write wins everywhere, deletions included.
 //!
 //! Keys (segments shown separated by `/`, each actually NUL-terminated):
 //!
 //! ```text
 //! setting/<key>                 → value
-//! remote/<name>                 → JSON (RemoteRecord); read from this device's author only
+//! remote/<name>                 → JSON (RemoteRecord)
 //! blob/<sha256>/<size>          → "1"
 //! on/<remote>/<sha256>          → "1"   the blob is stored on the remote
 //! path/<path>/<µs>/<sha256|->   → "1"   from then on, the path names the blob ("-": nothing)
@@ -25,7 +28,8 @@
 //! each event closes the path's previous one.
 //!
 //! The whole store is read into memory on open and kept in step with every
-//! write, so reads never touch the disk.
+//! write, so reads never touch the disk; entries a sync brought in show
+//! once the store is read again ([`Db::reload`]).
 //!
 //! [iroh-docs]: https://docs.rs/iroh-docs
 //! [iroh-blobs]: https://docs.rs/iroh-blobs
@@ -33,10 +37,12 @@
 use iroh_blobs::store::fs::FsStore;
 use iroh_docs::store::Query;
 use iroh_docs::store::fs::Store as DocStore;
-use iroh_docs::{Author, AuthorId, NamespaceId, NamespaceSecret};
+use iroh_docs::sync::ProtocolMessage;
+use iroh_docs::{Author, AuthorId, Capability, NamespaceId, NamespaceSecret, SyncOutcome};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Arc;
 
 /// The iroh-docs store, inside the database directory.
 const DOCS_FILE: &str = "docs.redb";
@@ -46,14 +52,14 @@ const AUTHOR_FILE: &str = "default-author";
 const BLOBS_DIR: &str = "blobs";
 /// The value of entries that carry everything in their key.
 const MARKER: &[u8] = b"1";
+/// The blob store tag keeping [`MARKER`].
+const MARKER_TAG: &[u8] = b"marker";
 /// The path event segment meaning "the path names nothing any more".
 const REMOVED: &str = "-";
 
 pub struct Db {
     rt: tokio::runtime::Runtime,
-    docs: DocStore,
-    blobs: FsStore,
-    namespace: NamespaceId,
+    shared: Shared,
     author: Author,
     /// The hash of [`MARKER`], stored once.
     marker: iroh_blobs::Hash,
@@ -143,6 +149,20 @@ pub struct Dump {
     pub locations: BTreeMap<String, BTreeSet<String>>,
     /// Every path's history, oldest event first.
     pub paths: BTreeMap<String, Vec<PathEvent>>,
+}
+
+/// The store as a sync with another device sees it: shared between the
+/// [`Db`] and the threads syncing it (see [`crate::peers`]).
+#[derive(Clone)]
+pub struct Shared {
+    docs: Arc<tokio::sync::Mutex<Docs>>,
+    blobs: FsStore,
+}
+
+struct Docs {
+    store: DocStore,
+    /// The folder's namespace: its only replica.
+    namespace: NamespaceId,
 }
 
 /// The store, in memory.
@@ -255,14 +275,18 @@ impl Db {
         };
 
         let marker = rt
-            .block_on(blobs.add_bytes(MARKER).with_named_tag(b"marker"))
+            .block_on(blobs.add_bytes(MARKER).with_named_tag(MARKER_TAG))
             .map_err(err)?
             .hash;
         let mut db = Self {
             rt,
-            docs,
-            blobs,
-            namespace,
+            shared: Shared {
+                docs: Arc::new(tokio::sync::Mutex::new(Docs {
+                    store: docs,
+                    namespace,
+                })),
+                blobs,
+            },
             author,
             marker,
             cache: Cache::default(),
@@ -273,18 +297,30 @@ impl Db {
         Ok(db)
     }
 
+    /// The shared half of the store, for syncing it with other devices.
+    pub fn shared(&self) -> Shared {
+        self.shared.clone()
+    }
+
+    fn docs(&self) -> tokio::sync::MutexGuard<'_, Docs> {
+        self.shared.docs.blocking_lock()
+    }
+
     /// Read the whole store into memory again.
     pub fn reload(&mut self) -> Result<(), String> {
         let mut cache = Cache::default();
         let mut values: Vec<(String, iroh_blobs::Hash)> = Vec::new();
-        // The newest entry of every key, whoever wrote it, except remotes:
-        // each device sees its own version of those.
-        let entries = self
-            .docs
-            .get_many(self.namespace, Query::single_latest_per_key().build())
-            .map_err(err)?;
+        // The newest entry of every key, whoever wrote it.
+        let entries: Vec<_> = {
+            let mut docs = self.docs();
+            let namespace = docs.namespace;
+            docs.store
+                .get_many(namespace, Query::single_latest_per_key().build())
+                .map_err(err)?
+                .collect::<Result<_, _>>()
+                .map_err(err)?
+        };
         for entry in entries {
-            let entry = entry.map_err(err)?;
             let Some(parts) = segments(entry.key()) else {
                 continue;
             };
@@ -292,6 +328,7 @@ impl Db {
                 ["setting", name] => {
                     values.push((format!("setting\0{name}"), entry.content_hash()))
                 }
+                ["remote", name] => values.push((format!("remote\0{name}"), entry.content_hash())),
                 ["blob", hash, size] => {
                     if let Ok(size) = size.parse() {
                         cache.blobs.entry(hash.to_owned()).or_default().insert(size);
@@ -313,24 +350,17 @@ impl Db {
                 _ => {}
             }
         }
-        let own = self
-            .docs
-            .get_many(
-                self.namespace,
-                Query::author(self.author.id())
-                    .key_prefix(key(&["remote"]))
-                    .build(),
-            )
-            .map_err(err)?;
-        for entry in own {
-            let entry = entry.map_err(err)?;
-            if let Some(["remote", name]) = segments(entry.key()).as_deref() {
-                values.push((format!("remote\0{name}"), entry.content_hash()));
-            }
-        }
 
         for (what, hash) in values {
-            let bytes = self.rt.block_on(self.blobs.get_bytes(hash)).map_err(err)?;
+            // A value whose entry a sync just brought in may not have
+            // arrived yet: it shows once it has.
+            let bytes = match self.rt.block_on(self.shared.blobs.get_bytes(hash)) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    log::debug!("value of {what:?} not available yet: {e}");
+                    continue;
+                }
+            };
             let text = String::from_utf8_lossy(&bytes).into_owned();
             match what.split_once('\0') {
                 Some(("setting", name)) => {
@@ -361,26 +391,39 @@ impl Db {
             self.marker
         } else {
             self.rt
-                .block_on(self.blobs.add_bytes(value.to_vec()).with_named_tag(key))
+                .block_on(
+                    self.shared
+                        .blobs
+                        .add_bytes(value.to_vec())
+                        .with_named_tag(key),
+                )
                 .map_err(err)?
                 .hash
         };
-        let mut replica = self.docs.open_replica(&self.namespace).map_err(err)?;
-        self.rt
-            .block_on(replica.insert(key, &self.author, hash, value.len() as u64))
-            .map_err(err)?;
+        {
+            let mut docs = self.docs();
+            let namespace = docs.namespace;
+            let mut replica = docs.store.open_replica(&namespace).map_err(err)?;
+            self.rt
+                .block_on(replica.insert(key, &self.author, hash, value.len() as u64))
+                .map_err(err)?;
+        }
         self.commit()
     }
 
     /// Delete `key` (for every device: the deletion is the newest entry).
     fn delete(&mut self, key: &[u8]) -> Result<(), String> {
-        let mut replica = self.docs.open_replica(&self.namespace).map_err(err)?;
-        self.rt
-            .block_on(replica.delete_prefix(key, &self.author))
-            .map_err(err)?;
+        {
+            let mut docs = self.docs();
+            let namespace = docs.namespace;
+            let mut replica = docs.store.open_replica(&namespace).map_err(err)?;
+            self.rt
+                .block_on(replica.delete_prefix(key, &self.author))
+                .map_err(err)?;
+        }
         if value_tagged(key) {
             self.rt
-                .block_on(self.blobs.tags().delete(key))
+                .block_on(self.shared.blobs.tags().delete(key))
                 .map_err(err)?;
         }
         self.commit()
@@ -391,8 +434,8 @@ impl Db {
         if self.batching {
             return Ok(());
         }
-        self.docs.flush().map_err(err)?;
-        self.rt.block_on(self.blobs.sync_db()).map_err(err)
+        self.docs().store.flush().map_err(err)?;
+        self.rt.block_on(self.shared.blobs.sync_db()).map_err(err)
     }
 
     /// Run `f`, committing its writes once at the end (much faster than
@@ -761,7 +804,169 @@ impl Drop for Db {
         if let Err(e) = self.commit() {
             log::warn!("cannot commit the database: {e}");
         }
-        self.rt.block_on(self.blobs.shutdown()).ok();
+        self.rt.block_on(self.shared.blobs.shutdown()).ok();
+    }
+}
+
+// ── syncing with other devices ──
+
+/// The store's half of a sync (see [`crate::peers`]): iroh-docs' set
+/// reconciliation over the entries, then the values some entries name
+/// (settings, remotes) that one side lacks. Callable from any thread; the
+/// [`Db`] sees what a sync brought in after [`Db::reload`].
+impl Shared {
+    /// The folder's namespace.
+    pub async fn namespace(&self) -> NamespaceId {
+        self.docs.lock().await.namespace
+    }
+
+    /// The namespace's secret: whoever holds it can write to the folder.
+    pub async fn secret(&self) -> Result<[u8; 32], String> {
+        let mut docs = self.docs.lock().await;
+        let namespace = docs.namespace;
+        let replica = docs.store.open_replica(&namespace).map_err(err)?;
+        Ok(replica.secret_key().map_err(err)?.to_bytes())
+    }
+
+    /// Whether the store records anything besides settings: files, blobs or
+    /// remotes. A folder that doesn't can join another device's.
+    pub async fn holds_files(&self) -> Result<bool, String> {
+        let mut docs = self.docs.lock().await;
+        let namespace = docs.namespace;
+        let entries = docs
+            .store
+            .get_many(namespace, Query::single_latest_per_key().build())
+            .map_err(err)?;
+        for entry in entries {
+            if !entry.map_err(err)?.key().starts_with(b"setting\0") {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Make the namespace `secret` opens the folder's, dropping the old one
+    /// and everything in it: the folder joins another device's.
+    pub async fn adopt(&self, secret: [u8; 32]) -> Result<(), String> {
+        let secret = NamespaceSecret::from_bytes(&secret);
+        let mut docs = self.docs.lock().await;
+        let old = docs.namespace;
+        if secret.id() == old {
+            return Ok(());
+        }
+        let id = secret.id();
+        docs.store
+            .import_namespace(Capability::Write(secret))
+            .map_err(err)?;
+        docs.store.close_replica(old);
+        docs.store.remove_replica(&old).map_err(err)?;
+        docs.namespace = id;
+        docs.store.flush().map_err(err)
+    }
+
+    /// The first message of a set reconciliation.
+    pub async fn initial_message(&self) -> Result<ProtocolMessage, String> {
+        let mut docs = self.docs.lock().await;
+        let namespace = docs.namespace;
+        let mut replica = docs.store.open_replica(&namespace).map_err(err)?;
+        replica.sync_initial_message().map_err(err)
+    }
+
+    /// Take in a reconciliation message from the device `from`: the reply,
+    /// if the reconciliation isn't over. (iroh-docs' processing can't move
+    /// between threads, so it runs on a blocking one.)
+    pub async fn process(
+        &self,
+        message: ProtocolMessage,
+        from: [u8; 32],
+        outcome: &mut SyncOutcome,
+    ) -> Result<Option<ProtocolMessage>, String> {
+        let docs = self.docs.clone();
+        let mut progress = std::mem::take(outcome);
+        let (reply, progress) = tokio::task::spawn_blocking(move || {
+            let mut docs = docs.blocking_lock();
+            let namespace = docs.namespace;
+            let mut replica = docs.store.open_replica(&namespace).map_err(err)?;
+            let reply = tokio::runtime::Handle::current()
+                .block_on(replica.sync_process_message(message, from, &mut progress))
+                .map_err(err)?;
+            Ok::<_, String>((reply, progress))
+        })
+        .await
+        .map_err(err)??;
+        *outcome = progress;
+        Ok(reply)
+    }
+
+    /// The key and value hash of every entry whose value is kept in the
+    /// blob store (the newest of each key).
+    async fn values(&self) -> Result<Vec<(Vec<u8>, iroh_blobs::Hash)>, String> {
+        let mut docs = self.docs.lock().await;
+        let namespace = docs.namespace;
+        let mut values = Vec::new();
+        let entries = docs
+            .store
+            .get_many(namespace, Query::single_latest_per_key().build())
+            .map_err(err)?;
+        for entry in entries {
+            let entry = entry.map_err(err)?;
+            if value_tagged(entry.key()) {
+                values.push((entry.key().to_vec(), entry.content_hash()));
+            }
+        }
+        Ok(values)
+    }
+
+    /// The values entries name that are missing here: `(key, hash)`.
+    pub async fn missing_values(&self) -> Result<Vec<(Vec<u8>, iroh_blobs::Hash)>, String> {
+        let mut missing = Vec::new();
+        for (key, hash) in self.values().await? {
+            if !self.blobs.has(hash).await.map_err(err)? {
+                missing.push((key, hash));
+            }
+        }
+        Ok(missing)
+    }
+
+    /// The values among `hashes` that entries here name, and that are here.
+    pub async fn read_values(
+        &self,
+        hashes: &[iroh_blobs::Hash],
+    ) -> Result<Vec<(iroh_blobs::Hash, Vec<u8>)>, String> {
+        let named: BTreeSet<iroh_blobs::Hash> =
+            self.values().await?.into_iter().map(|(_, h)| h).collect();
+        let mut found = Vec::new();
+        for hash in hashes.iter().filter(|h| named.contains(*h)) {
+            if let Ok(bytes) = self.blobs.get_bytes(*hash).await {
+                found.push((*hash, bytes.to_vec()));
+            }
+        }
+        Ok(found)
+    }
+
+    /// Keep `value` as the value of `key`, if it is the one named: its
+    /// hash must be `hash`.
+    pub async fn write_value(
+        &self,
+        key: &[u8],
+        hash: iroh_blobs::Hash,
+        value: Vec<u8>,
+    ) -> Result<(), String> {
+        if iroh_blobs::Hash::new(&value) != hash || !value_tagged(key) {
+            return Err("received a value that doesn't match its entry".to_owned());
+        }
+        self.blobs
+            .add_bytes(value)
+            .with_named_tag(key)
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// Commit what a sync wrote.
+    pub async fn flush(&self) -> Result<(), String> {
+        self.docs.lock().await.store.flush().map_err(err)?;
+        self.blobs.sync_db().await.map_err(err)
     }
 }
 

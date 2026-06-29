@@ -1,6 +1,6 @@
 +++
 title = "Command line"
-weight = 6
+weight = 7
 [extra]
 nav = "command line"
 +++
@@ -41,7 +41,14 @@ mbr gc [--purge [--older-than DAYS] [--yes]]
                                   free up (or delete everywhere) old versions
                                   and deleted files
 mbr config min-copies [N]         show or set how many copies to keep
-mbr config password               set the master password (before any remote)
+mbr config password               set the master password (before any
+                                  remote), or type it on this device
+mbr peer id                       this device's id, to add it elsewhere
+mbr peer add <id> [--name NAME]   sync with a device (which adds this one too)
+mbr peer rm <id|name>             stop syncing with a device
+mbr peer ls                       list the peers
+mbr sync [--watch]                scan, then sync with every peer; --watch
+                                  keeps syncing every minute
 mbr metadata status               where metadata is backed up, and when
 mbr metadata add|rm <remote>...   choose the remotes for metadata backups
 mbr metadata backup               encrypt and upload the metadata

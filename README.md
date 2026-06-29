@@ -23,6 +23,7 @@ folder/
     db/                               metadata (an iroh-docs replica)
     rclone.conf                       repository-local rclone config
     local.json                        per-machine state, never synced
+                                      (password in base64, peers, device key)
     corrupt/                          blobs that failed verification
     tmp/                              scratch space
   fruits.png -> .mbr/blobs/fa/2e/fa2e38…
@@ -35,7 +36,7 @@ folder/
 - **remotes** — named rclone targets (e.g. `backup` → `s3:bucket/mbr`).
 - **blob_remotes** — which blobs are known to live on which remotes.
 - **metadata_remotes** — remotes chosen to hold metadata backups.
-- **settings** — folder settings, such as the minimum number of copies.
+- **settings** — folder settings, such as the minimum number of copies, and the master password's check.
 
 For each file the UIs show: size, hash, whether the content is present locally (the filesystem is the source of truth for that), which remotes store it, other names — current or past — pointing at the same blob, and previous versions of the name with where those old blobs still live.
 
@@ -67,7 +68,7 @@ and the mbr remote `drive` targets `_crypt-mbr-drive:`, so blobs and their names
 
 The folder id is 6 random bytes in hex, made once and kept in the database, so each folder stores in its own `mbr-<id>` directory and several folders can share one storage account. Metadata backups go on `_root-mbr-drive`, next to `mbr-<id>`.
 
-The master password is set once, before the first remote is added, and can't change. It is saved, with a check, in the folder's `.mbr/local.json` (mode 0600), which is never synced or backed up.
+The master password is set once, before the first remote is added, and can't change. Its check (Argon2) is part of the metadata, so every device syncing the folder can verify the password typed there. The password itself is saved in the folder's `.mbr/local.json` (mode 0600), which is never synced or backed up, in base64 so it doesn't show at a glance (an encoding, not encryption; `.mbr/rclone.conf` also holds it obscured, rclone's reversible encoding).
 
 ### Scanning remotes
 
@@ -98,11 +99,17 @@ A backup is restored into a folder that isn't an mbr folder yet, instead of `mbr
 
 The backup's database and rclone config become the folder's, so its remotes, folder id and all come back as they were. Every file reappears as a dangling symlink (a file already in the way is kept, and the next scan records it as a new version), and the content can then be downloaded. There is no merging into a folder in use.
 
+## Syncing between devices
+
+A folder can live on several devices that sync its metadata over [iroh](https://iroh.computer) (the Peers tab, or `mbr peer` and `mbr sync`). Each device has an id per folder (an iroh endpoint key kept in `local.json`); two devices sync once each has added the other's id. A new device starts an empty folder, which *joins* the other's: it is handed the iroh-docs namespace secret and adopts it. Two folders that both hold files never merge.
+
+A sync is iroh-docs set reconciliation of the entries, then an exchange of the few values entries point at (settings, remotes); the newest entry of each key wins, whichever device wrote it. Synced changes become links in the folder (dangling until downloaded from a remote), except for files changed locally since the last scan, which the next scan records as the newest change. Blob content never travels between devices, and neither does the master password: each device types it, checked against the check in the metadata.
+
 ## Future plans
 
 The goal is to have a bunch more options to make it easier to deal with large numbers of files and automate their backups, checking and custom rules.
 
-In the meantime, we hope to get multi-machine and Android support: phones and machines would sync the metadata using _iroh_, then type the password and gain access to all the files, downloading them directly from the remotes. Syncing is bidirectional and conflicts would be rare and easy to handle, so phones can also easily add new files by just reusing the rclone configurations of the other machines to upload them, then syncing the metadata.
+Android support would build on syncing: phones would sync the metadata, then type the password and gain access to all the files, downloading them directly from the remotes, and add new files by reusing the rclone configurations of the other machines to upload them.
 
 `mbr` is designed for power-users, but eventually a "simple mode" app can be developed that allows a non-tech family member, for example, to just share a bunch of pictures and they get all uploaded and synced.
 

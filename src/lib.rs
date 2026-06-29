@@ -26,6 +26,7 @@
 pub mod backends;
 pub mod db;
 pub mod metadata;
+pub mod peers;
 pub mod rclone;
 pub mod remotes;
 pub mod repo;

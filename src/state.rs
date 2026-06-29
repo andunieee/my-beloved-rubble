@@ -1,8 +1,9 @@
 //! Local, per-machine app state. The last folder opened lives in
 //! `<config dir>/mbr/state.json`, loaded on every start. Each folder's own
-//! state — its master password and when its metadata was last backed up to
-//! which remote — lives in `<folder>/.mbr/local.json`, so it goes away with
-//! the folder. Unlike the database in `.mbr/db`, none of it is ever pushed
+//! state — its master password, when
+//! its metadata was last backed up to which remote, this device's key for
+//! syncing it and the peers it syncs with — lives in
+//! `<folder>/.mbr/local.json`, so it goes away with the folder. Unlike the database in `.mbr/db`, none of it is ever pushed
 //! or backed up anywhere: it records facts about *this* machine.
 
 use serde::{Deserialize, Serialize};
@@ -24,17 +25,66 @@ pub const LOCAL_STATE_FILE: &str = ".mbr/local.json";
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct RepoState {
-    /// Argon2 hash of the master password (PHC string), so a mistyped
-    /// password is caught before anything is encrypted with it.
-    #[serde(default)]
+    /// Where earlier versions kept the check of the master password, which
+    /// now lives in the folder's metadata, synced with its peers
+    /// ([`crate::Repo::password_check`]). Only read, to carry it over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_check: Option<String>,
     /// The master password itself, so it is asked for only once per
     /// machine: remotes are encrypted with it and need it at every setup.
-    #[serde(default)]
+    /// Written in base64, so it doesn't show at a glance: that hides it
+    /// from someone looking over your shoulder, not from anyone who can
+    /// read the file.
+    #[serde(
+        rename = "password_base64",
+        with = "base64_password",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub password: Option<String>,
+    /// Where earlier versions kept the password, in the clear. Only read,
+    /// to carry it over (see [`read_local`]).
+    #[serde(rename = "password", default, skip_serializing)]
+    plain_password: Option<String>,
     /// The last successful metadata backup, per remote name.
     #[serde(default)]
     pub metadata_backups: BTreeMap<String, BackupRecord>,
+    /// This device's secret key for syncing the folder (hex), which its
+    /// peers know it by; made on first use (see [`crate::peers`]).
+    #[serde(default)]
+    pub node_key: Option<String>,
+    /// The devices this one syncs the folder with, by their id (an iroh
+    /// endpoint id). Syncing starts once both have added each other.
+    #[serde(default)]
+    pub peers: BTreeMap<String, Peer>,
+}
+
+/// The master password as `local.json` stores it: base64.
+mod base64_password {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(password: &Option<String>, s: S) -> Result<S::Ok, S::Error> {
+        match password {
+            Some(password) => s.serialize_some(&STANDARD.encode(password)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+        let Some(encoded) = Option::<String>::deserialize(d)? else {
+            return Ok(None);
+        };
+        let bytes = STANDARD.decode(encoded).map_err(D::Error::custom)?;
+        String::from_utf8(bytes).map(Some).map_err(D::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Peer {
+    /// What the user calls the device.
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,27 +97,18 @@ pub struct BackupRecord {
 }
 
 impl RepoState {
-    /// Make `password` the folder's master password, saved on this machine.
-    pub fn set_password(&mut self, password: &str) -> Result<(), String> {
-        if self.password_check.is_some() {
-            return Err("the master password is already set and cannot be changed".to_owned());
-        }
-        self.password_check = Some(crate::metadata::password_check(password)?);
+    /// Save the (verified) master password on this machine.
+    pub fn keep_password(&mut self, password: &str) {
         self.password = Some(password.to_owned());
-        Ok(())
     }
 
-    /// Remember a password after verifying it against an existing check.
-    pub fn remember_password(&mut self, password: &str) -> Result<(), String> {
-        let check = self
-            .password_check
-            .as_deref()
-            .ok_or_else(|| "the master password is not set".to_owned())?;
-        if !crate::metadata::password_matches(check, password) {
-            return Err("wrong master password".to_owned());
-        }
-        self.password = Some(password.to_owned());
-        Ok(())
+    /// Forget what this machine knew about the folder's contents: it now
+    /// holds another device's folder (see [`crate::peers`]). Its key and
+    /// its peers stay.
+    pub fn forget_folder(&mut self) {
+        self.password_check = None;
+        self.password = None;
+        self.metadata_backups.clear();
     }
 }
 
@@ -132,15 +173,20 @@ impl AppState {
     }
 }
 
-fn read_local(root: &Path) -> RepoState {
+pub(crate) fn read_local(root: &Path) -> RepoState {
     let file = root.join(LOCAL_STATE_FILE);
-    match std::fs::read_to_string(&file) {
+    let mut state = match std::fs::read_to_string(&file) {
         Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
             log::warn!("ignoring unreadable {}: {e}", file.display());
             RepoState::default()
         }),
         Err(_) => RepoState::default(),
+    };
+    // Written in base64 from the next save on.
+    if let Some(plain) = state.plain_password.take() {
+        state.password.get_or_insert(plain);
     }
+    state
 }
 
 fn write_private(path: &Path, value: &impl Serialize) -> Result<(), String> {
@@ -206,13 +252,31 @@ mod tests {
     }
 
     #[test]
-    fn master_password_can_only_be_set_once() {
-        let mut repo = RepoState::default();
-        repo.set_password("first password").unwrap();
-        assert!(repo.set_password("second password").is_err());
-        assert_eq!(repo.password.as_deref(), Some("first password"));
-        assert!(repo.remember_password("wrong password").is_err());
-        repo.remember_password("first password").unwrap();
-        assert_eq!(repo.password.as_deref(), Some("first password"));
+    fn the_password_is_stored_in_base64() {
+        let dir = std::env::temp_dir().join(format!("mbr-state-b64-{}", std::process::id()));
+        let path = dir.join("state.json");
+        let folder = dir.join("folder");
+        std::fs::create_dir_all(folder.join(".mbr")).unwrap();
+
+        let mut state = AppState::default();
+        state.repo_mut(&folder).keep_password("correct horse");
+        state.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(folder.join(LOCAL_STATE_FILE)).unwrap();
+        assert!(!text.contains("correct horse"), "{text}");
+        assert!(text.contains("Y29ycmVjdCBob3JzZQ=="), "{text}");
+        assert_eq!(
+            AppState::load_from(&path).repo(&folder).password.as_deref(),
+            Some("correct horse")
+        );
+
+        // Earlier versions wrote it in the clear: read, then rewritten.
+        std::fs::write(folder.join(LOCAL_STATE_FILE), r#"{"password": "old one"}"#).unwrap();
+        let mut state = AppState::load_from(&path);
+        assert_eq!(state.repo_mut(&folder).password.as_deref(), Some("old one"));
+        state.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(folder.join(LOCAL_STATE_FILE)).unwrap();
+        assert!(!text.contains("old one"), "{text}");
+        assert_eq!(read_local(&folder).password.as_deref(), Some("old one"));
+        std::fs::remove_dir_all(dir).ok();
     }
 }

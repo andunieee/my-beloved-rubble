@@ -3,12 +3,14 @@
 use clap::{Parser, Subcommand};
 use mbr::db::Remote;
 use mbr::metadata;
+use mbr::peers::{self, Event, Node};
 use mbr::rclone::SetupOutcome;
 use mbr::repo::{LocalHealth, RemoteHealth, Repo};
-use mbr::state::{AppState, BackupRecord, RepoState};
+use mbr::state::{AppState, BackupRecord, Peer, RepoState};
 use mbr::util;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
@@ -115,6 +117,38 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// devices this folder syncs with
+    Peer {
+        #[command(subcommand)]
+        command: PeerCommand,
+    },
+    /// scan, then sync the metadata with every peer (over iroh)
+    Sync {
+        /// keep running: accept the peers' syncs, and sync every minute
+        #[arg(long)]
+        watch: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PeerCommand {
+    /// show this device's id, to add it as a peer on the others
+    Id,
+    /// sync with a device (which has to add this one too)
+    Add {
+        /// its id (`mbr peer id` there)
+        id: String,
+        /// what to call it
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// stop syncing with a device
+    Rm {
+        /// its id or name
+        peer: String,
+    },
+    /// list the peers
+    Ls,
 }
 
 #[derive(Subcommand)]
@@ -139,7 +173,8 @@ enum MetadataCommand {
 enum ConfigCommand {
     /// copies of each file to keep (local + remotes); shows it without N
     MinCopies { n: Option<u32> },
-    /// set the master password once (needed before adding remotes)
+    /// set the master password once (needed before adding remotes), or
+    /// type it on this device if it is already set
     Password,
 }
 
@@ -244,6 +279,13 @@ fn run(cli: Cli) -> Result<(), String> {
             ConfigCommand::MinCopies { n } => config_min_copies(&mut open()?, n),
             ConfigCommand::Password => config_password(&mut open()?),
         },
+        Command::Peer { command } => match command {
+            PeerCommand::Id => peer_id(&open()?),
+            PeerCommand::Add { id, name } => peer_add(&open()?, &id, name),
+            PeerCommand::Rm { peer } => peer_rm(&open()?, &peer),
+            PeerCommand::Ls => peer_ls(&open()?),
+        },
+        Command::Sync { watch } => sync(&mut open()?, watch),
     }
 }
 
@@ -254,8 +296,12 @@ fn open() -> Result<Repo, String> {
     let mut repo = Repo::discover(&std::env::current_dir().map_err(|e| e.to_string())?)?;
     if repo.rclone_config_incomplete()? {
         let password = AppState::load().repo(&repo.root).password;
-        if let Err(e) = repo.write_rclone_config(password.as_deref()) {
-            eprintln!("warning: cannot write the rclone settings: {e}");
+        match repo.write_rclone_config(password.as_deref()) {
+            Err(_) if password.is_none() && repo.password_check()?.is_some() => eprintln!(
+                "warning: the remotes need the master password on this device: `mbr config password`"
+            ),
+            Err(e) => eprintln!("warning: cannot write the rclone settings: {e}"),
+            Ok(()) => {}
         }
     }
     Ok(repo)
@@ -1023,10 +1069,10 @@ fn metadata_status(repo: &mut Repo) -> Result<(), String> {
     let state = AppState::load().repo(&repo.root);
     println!(
         "master password: {}",
-        if state.password_check.is_some() {
-            "set"
-        } else {
-            "not set (`mbr config password`)"
+        match (repo.password_check()?.is_some(), state.password.is_some()) {
+            (false, _) => "not set (`mbr config password`)",
+            (true, true) => "set, saved on this device",
+            (true, false) => "set on another device: type it here with `mbr config password`",
         }
     );
     let remotes = repo.db.metadata_remotes()?;
@@ -1078,37 +1124,52 @@ fn prompt_new_password() -> Result<String, String> {
 }
 
 /// The master password of this folder: saved on this machine, or asked
-/// for once (and saved) if only its check is known.
-fn master_password(repo: &Repo, state: &mut AppState) -> Result<String, String> {
-    let saved = state.repo(&repo.root);
-    if let Some(password) = saved.password {
+/// for (and saved) if it was set on another device.
+fn master_password(repo: &mut Repo, state: &mut AppState) -> Result<String, String> {
+    if let Some(password) = state.repo(&repo.root).password {
         return Ok(password);
     }
-    let Some(check) = saved.password_check else {
+    if repo.password_check()?.is_none() {
         return Err("set a master password first: `mbr config password`".to_owned());
-    };
-    let password = rpassword::prompt_password("master password: ").map_err(|e| e.to_string())?;
-    if !metadata::password_matches(&check, &password) {
-        return Err("wrong master password".to_owned());
     }
-    state.repo_mut(&repo.root).remember_password(&password)?;
-    state.save()?;
+    let password = rpassword::prompt_password("master password: ").map_err(|e| e.to_string())?;
+    unlock(repo, state, &password)?;
     Ok(password)
+}
+
+/// Check `password` is the master password, save it on this machine, and
+/// set up the remotes that wait for it (synced from another device).
+fn unlock(repo: &mut Repo, state: &mut AppState, password: &str) -> Result<(), String> {
+    repo.verify_password(password)?;
+    state.repo_mut(&repo.root).keep_password(password);
+    state.save()?;
+    if repo.rclone_config_incomplete()? {
+        repo.write_rclone_config(Some(password))?;
+    }
+    Ok(())
 }
 
 fn config_password(repo: &mut Repo) -> Result<(), String> {
     let mut state = AppState::load();
-    if state.repo(&repo.root).password_check.is_some() {
-        return Err("the master password is already set and cannot be changed".to_owned());
+    if repo.password_check()?.is_some() {
+        println!(
+            "The master password is already set (it cannot be changed): type it to use it here."
+        );
+        let password =
+            rpassword::prompt_password("master password: ").map_err(|e| e.to_string())?;
+        unlock(repo, &mut state, &password)?;
+        println!("master password correct, and saved on this device");
+        return Ok(());
     }
     let password = prompt_new_password()?;
+    repo.set_password(&password)?;
     let repo_state = state.repo_mut(&repo.root);
-    repo_state.set_password(&password)?;
+    repo_state.keep_password(&password);
     // Existing backups still use the old password until replaced.
     let stale = !repo_state.metadata_backups.is_empty();
     repo_state.metadata_backups.clear();
     state.save()?;
-    println!("master password set and saved on this machine");
+    println!("master password set and saved on this device");
     if stale {
         println!("existing backups still use the old one: run `mbr metadata backup`");
     }
@@ -1185,10 +1246,15 @@ fn restore(dir: &Path, source: Source) -> Result<(), String> {
     let (repo, report) = metadata::restore(dir, &dump, &password)?;
 
     // Nothing this machine knew about the folder at that path still holds.
+    let mut repo = repo;
+    if repo.password_check()?.is_none() {
+        // A backup made before the check was part of the metadata.
+        repo.set_password(&password)?;
+    }
     let mut state = AppState::load();
     let repo_state = state.repo_mut(&repo.root);
     *repo_state = RepoState::default();
-    repo_state.set_password(&password)?;
+    repo_state.keep_password(&password);
     state.save()?;
 
     println!(
@@ -1251,4 +1317,161 @@ fn download_backup(dir: &Path, backend: &str) -> Result<(Vec<u8>, String), Strin
     std::fs::remove_file(&config).ok();
     println!("decrypting…");
     Ok((metadata::unseal(&sealed?, &password)?, password))
+}
+
+// ── peers ──
+
+fn peer_id(repo: &Repo) -> Result<(), String> {
+    let mut state = AppState::load();
+    let key = peers::node_key(state.repo_mut(&repo.root));
+    state.save()?;
+    println!("{}", peers::device_id(&key));
+    Ok(())
+}
+
+fn peer_add(repo: &Repo, id: &str, name: Option<String>) -> Result<(), String> {
+    let id = peers::check_device_id(id)?;
+    let mut state = AppState::load();
+    let repo_state = state.repo_mut(&repo.root);
+    if peers::device_id(&peers::node_key(repo_state)) == id {
+        return Err("that is this device's own id".to_owned());
+    }
+    let name = name.unwrap_or_else(|| format!("device {}", &id[..8]));
+    repo_state
+        .peers
+        .insert(id.clone(), Peer { name: name.clone() });
+    state.save()?;
+    println!("added {name} ({id})");
+    println!(
+        "syncing starts once it adds this device too: `mbr peer add {}` there",
+        { peers::device_id(&peers::node_key(state.repo_mut(&repo.root))) }
+    );
+    Ok(())
+}
+
+fn peer_rm(repo: &Repo, peer: &str) -> Result<(), String> {
+    let mut state = AppState::load();
+    let peers = &mut state.repo_mut(&repo.root).peers;
+    let id = peers
+        .iter()
+        .find(|(id, p)| *id == peer || p.name == peer)
+        .map(|(id, _)| id.clone())
+        .ok_or_else(|| format!("no peer '{peer}' (see `mbr peer ls`)"))?;
+    let removed = peers.remove(&id).expect("just found");
+    state.save()?;
+    println!("no longer syncing with {}", removed.name);
+    Ok(())
+}
+
+fn peer_ls(repo: &Repo) -> Result<(), String> {
+    let state = AppState::load().repo(&repo.root);
+    if state.peers.is_empty() {
+        println!("no peers (`mbr peer add <id>`; `mbr peer id` shows this device's)");
+    }
+    for (id, peer) in &state.peers {
+        println!("{:<20} {id}", peer.name);
+    }
+    Ok(())
+}
+
+/// How often `mbr sync --watch` scans and syncs.
+const SYNC_EVERY: Duration = Duration::from_secs(60);
+
+fn sync(repo: &mut Repo, watch: bool) -> Result<(), String> {
+    let mut state = AppState::load();
+    let known = state.repo(&repo.root).peers;
+    if known.is_empty() && !watch {
+        return Err(
+            "no peers yet: `mbr peer add <id>` (`mbr peer id` shows this device's)".to_owned(),
+        );
+    }
+    let key = peers::node_key(state.repo_mut(&repo.root));
+    state.save()?;
+    let ids: Vec<String> = known.keys().cloned().collect();
+    let name = |id: &str| known.get(id).map_or(id.to_owned(), |p| p.name.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let node = Node::start(key, repo.db.shared(), &ids, move |event| {
+        tx.send(event).ok();
+    })?;
+
+    if !watch {
+        print_scan_report(&repo.scan()?);
+        let mut joined = false;
+        for id in &ids {
+            match node.sync_now(id) {
+                Ok(report) => {
+                    joined |= report.joined;
+                    println!("{}: {}", name(id), describe_sync(&report));
+                }
+                Err(e) => println!("{}: {e}", name(id)),
+            }
+        }
+        drop(node);
+        return apply_sync(repo, &mut state, joined);
+    }
+
+    println!("syncing as {} (Ctrl+C to stop)", node.id());
+    let mut next_round = std::time::Instant::now();
+    loop {
+        if std::time::Instant::now() >= next_round {
+            print_scan_report(&repo.scan()?);
+            for id in &ids {
+                node.sync(id);
+            }
+            next_round = std::time::Instant::now() + SYNC_EVERY;
+        }
+        let wait = next_round.saturating_duration_since(std::time::Instant::now());
+        let Ok(event) = rx.recv_timeout(wait) else {
+            continue;
+        };
+        match event {
+            Event::Synced { peer, report } => {
+                println!("{}: {}", name(&peer), describe_sync(&report));
+                if let Err(e) = apply_sync(repo, &mut state, report.joined) {
+                    println!("error: {e}");
+                }
+            }
+            Event::Failed { peer, error } => println!("{}: {error}", name(&peer)),
+            Event::Refused { peer } => {
+                println!("device {peer} tried to sync: `mbr peer add {peer}` to sync with it")
+            }
+        }
+    }
+}
+
+fn describe_sync(report: &peers::SyncReport) -> String {
+    let mut text = format!(
+        "synced ({} entries received, {} sent)",
+        report.received, report.sent
+    );
+    if report.joined {
+        text += "; this folder joined theirs";
+    }
+    text
+}
+
+/// Bring the folder in line with what syncs brought in.
+fn apply_sync(repo: &mut Repo, state: &mut AppState, joined: bool) -> Result<(), String> {
+    if joined {
+        // The folder is now another device's: what this one knew is moot.
+        state.repo_mut(&repo.root).forget_folder();
+        state.save()?;
+    }
+    let applied = repo.apply_synced()?;
+    for path in &applied.updated {
+        println!("updated  {path}");
+    }
+    for path in &applied.kept {
+        println!("kept     {path}  (changed here: `mbr scan` records it)");
+    }
+    for (path, why) in &applied.skipped {
+        println!("skipped  {path}: {why}");
+    }
+    if applied.remotes_changed {
+        let password = state.repo(&repo.root).password;
+        if repo.write_rclone_config(password.as_deref()).is_err() {
+            println!("the remotes synced need the master password here: `mbr config password`");
+        }
+    }
+    Ok(())
 }

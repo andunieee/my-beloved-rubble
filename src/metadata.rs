@@ -36,6 +36,10 @@ use std::path::{Component, Path};
 
 /// Shortest master password accepted.
 pub const MIN_PASSWORD_LEN: usize = 8;
+/// Database setting holding the master password's check
+/// ([`password_check`]): in the metadata, so every device syncing the
+/// folder can tell the password typed there is the right one.
+pub const PASSWORD_CHECK_SETTING: &str = "password_check";
 /// The metadata's name inside the tarball.
 pub const DUMP_ENTRY: &str = "mbr-metadata.json";
 
@@ -266,6 +270,32 @@ fn recreate_link(root: &Path, path: &str, hash: &str) -> Result<bool, String> {
 // ── the repository side ──
 
 impl Repo {
+    /// The check of the folder's master password, once it is set.
+    pub fn password_check(&mut self) -> Result<Option<String>, String> {
+        self.db.setting(PASSWORD_CHECK_SETTING)
+    }
+
+    /// Make `password` the folder's master password, for every device
+    /// syncing it. It can be set only once.
+    pub fn set_password(&mut self, password: &str) -> Result<(), String> {
+        if self.password_check()?.is_some() {
+            return Err("the master password is already set and cannot be changed".to_owned());
+        }
+        self.db
+            .set_setting(PASSWORD_CHECK_SETTING, &password_check(password)?)
+    }
+
+    /// Whether `password` is the folder's master password (slow: Argon2).
+    pub fn verify_password(&mut self, password: &str) -> Result<(), String> {
+        let check = self
+            .password_check()?
+            .ok_or("the master password is not set")?;
+        if !password_matches(&check, password) {
+            return Err("wrong master password".to_owned());
+        }
+        Ok(())
+    }
+
     /// Where sealed backups are staged before upload.
     pub fn scratch_dir(&self) -> std::path::PathBuf {
         self.root.join(repo::TMP_DIR)

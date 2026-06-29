@@ -190,6 +190,40 @@ pub fn run(out: &Path) -> Result<(), slint::PlatformError> {
         .set_status_text("One backup is up to date; one is older than the latest change".into());
     s.shoot("settings");
 
+    // ── the Peers tab ──
+    s.resize(WINDOW);
+    let root = app.root().expect("a folder is open");
+    let [laptop, phone, desktop] = [1u8, 2, 3].map(|b| peers::device_id(&[b; 32]));
+    {
+        let mut state = app.state.borrow_mut();
+        let peers = &mut state.repo_mut(&root).peers;
+        peers.insert(
+            laptop.clone(),
+            Peer {
+                name: "laptop".into(),
+            },
+        );
+        peers.insert(
+            phone.clone(),
+            Peer {
+                name: "phone".into(),
+            },
+        );
+    }
+    let synced = format!("synced {}", util::format_time(util::now() - 120));
+    app.peer_status.borrow_mut().insert(laptop, (synced, true));
+    app.peer_status.borrow_mut().insert(
+        phone,
+        ("unreachable (offline, or not running mbr)".into(), false),
+    );
+    app.knocking.borrow_mut().insert(desktop);
+    app.refresh();
+    app.window.set_folder(DISPLAY_PATH.into());
+    app.window.set_active_tab(3);
+    app.window
+        .set_status_text("Synced: 3 file(s) updated".into());
+    s.shoot("peers");
+
     // ── a folder that isn't an mbr folder yet ──
     s.resize(WINDOW);
     *app.repo.borrow_mut() = None;
@@ -226,6 +260,10 @@ fn new_app() -> App {
         edit: RefCell::new(None),
         state: RefCell::new(AppState::default()),
         password: RefCell::new(None),
+        node: RefCell::new(None),
+        peer_status: RefCell::new(BTreeMap::new()),
+        knocking: RefCell::new(BTreeSet::new()),
+        sync_pending: Cell::new(false),
         setup: RefCell::new(None),
         pending_folder: RefCell::new(None),
     };
@@ -342,12 +380,15 @@ fn demo(dir: &Path) -> (Repo, AppState) {
     let midsummer = repo.resolve_spec("videos/midsummer.mp4").unwrap();
     std::fs::remove_file(repo.blob_path(&midsummer)).unwrap();
 
+    repo.set_password(PASSWORD).unwrap();
     let current = repo.db_hash().unwrap();
     let now = util::now();
     let mut state = AppState::default();
     {
         let repo_state = state.repo_mut(&root);
-        repo_state.set_password(PASSWORD).unwrap();
+        repo_state.keep_password(PASSWORD);
+        // A fixed key, so this computer's id is the same in every render.
+        repo_state.node_key = Some("07".repeat(32));
         repo_state.metadata_backups.insert(
             "backup".into(),
             BackupRecord {
