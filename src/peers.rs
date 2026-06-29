@@ -139,9 +139,6 @@ pub struct Node {
     known: MemoryLookup,
     shared: Shared,
     peers: Arc<Mutex<BTreeSet<EndpointId>>>,
-    /// One sync at a time: a folder joining another changes the namespace
-    /// every other sync works on.
-    syncing: Arc<tokio::sync::Mutex<()>>,
     listener: Listener,
 }
 
@@ -187,7 +184,6 @@ impl Node {
             known,
             shared,
             peers: Arc::default(),
-            syncing: Arc::default(),
             listener: Arc::new(listener),
         };
         node.set_peers(peers);
@@ -195,7 +191,6 @@ impl Node {
             node.endpoint.clone(),
             node.shared.clone(),
             node.peers.clone(),
-            node.syncing.clone(),
             node.listener.clone(),
         ));
         Ok(node)
@@ -229,14 +224,13 @@ impl Node {
         let Ok(id) = peer.parse::<EndpointId>() else {
             return;
         };
-        let (endpoint, shared, syncing, listener) = (
+        let (endpoint, shared, listener) = (
             self.endpoint.clone(),
             self.shared.clone(),
-            self.syncing.clone(),
             self.listener.clone(),
         );
         self.rt.spawn(async move {
-            let result = dial(&endpoint, &shared, &syncing, id).await;
+            let result = dial(&endpoint, &shared, id).await;
             listener(outcome(id, result));
         });
     }
@@ -247,9 +241,7 @@ impl Node {
         let id = peer
             .parse::<EndpointId>()
             .map_err(|_| format!("'{peer}' is not a device id"))?;
-        let result = self
-            .rt
-            .block_on(dial(&self.endpoint, &self.shared, &self.syncing, id));
+        let result = self.rt.block_on(dial(&self.endpoint, &self.shared, id));
         (self.listener)(outcome(id, result.clone()));
         result
     }
@@ -278,16 +270,10 @@ async fn accept_loop(
     endpoint: Endpoint,
     shared: Shared,
     peers: Arc<Mutex<BTreeSet<EndpointId>>>,
-    syncing: Arc<tokio::sync::Mutex<()>>,
     listener: Listener,
 ) {
     while let Some(incoming) = endpoint.accept().await {
-        let (shared, peers, syncing, listener) = (
-            shared.clone(),
-            peers.clone(),
-            syncing.clone(),
-            listener.clone(),
-        );
+        let (shared, peers, listener) = (shared.clone(), peers.clone(), listener.clone());
         tokio::spawn(async move {
             let connection = match incoming.await {
                 Ok(connection) => connection,
@@ -308,7 +294,8 @@ async fn accept_loop(
                 });
                 return;
             }
-            let _turn = syncing.lock().await;
+            // Syncs run side by side: two devices commonly dial each
+            // other at once, and waiting for one another would deadlock.
             let result = tokio::time::timeout(SYNC_TIMEOUT, accept(&shared, &connection))
                 .await
                 .unwrap_or_else(|_| Err("the sync took too long".to_owned()));
@@ -321,10 +308,8 @@ async fn accept_loop(
 async fn dial(
     endpoint: &Endpoint,
     shared: &Shared,
-    syncing: &tokio::sync::Mutex<()>,
     peer: EndpointId,
 ) -> Result<SyncReport, String> {
-    let _turn = syncing.lock().await;
     let connection = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(peer, ALPN))
         .await
         .map_err(|_| "unreachable (offline, or not running mbr)".to_owned())?

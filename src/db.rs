@@ -846,13 +846,24 @@ impl Shared {
     }
 
     /// Make the namespace `secret` opens the folder's, dropping the old one
-    /// and everything in it: the folder joins another device's.
+    /// and everything in it: the folder joins another device's. Refused
+    /// once the folder records files (a sync running alongside may have
+    /// brought some in since this one looked).
     pub async fn adopt(&self, secret: [u8; 32]) -> Result<(), String> {
         let secret = NamespaceSecret::from_bytes(&secret);
         let mut docs = self.docs.lock().await;
         let old = docs.namespace;
         if secret.id() == old {
             return Ok(());
+        }
+        let entries = docs
+            .store
+            .get_many(old, Query::single_latest_per_key().build())
+            .map_err(err)?;
+        for entry in entries {
+            if !entry.map_err(err)?.key().starts_with(b"setting\0") {
+                return Err("this folder has files now: it can't join another".to_owned());
+            }
         }
         let id = secret.id();
         docs.store

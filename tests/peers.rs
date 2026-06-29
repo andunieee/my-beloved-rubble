@@ -197,3 +197,43 @@ fn two_folders_with_files_never_merge() {
     b.repo.apply_synced().unwrap();
     assert_eq!(active_paths(&mut b.repo), ["y.txt"]);
 }
+
+#[test]
+fn devices_dialing_each_other_at_once_both_sync() {
+    let (ta, tb) = (TempDir::new("peers-both-a"), TempDir::new("peers-both-b"));
+    fs::write(ta.0.join("a.txt"), "a").unwrap();
+    let mut a = Device::new(&ta.0);
+    let mut b = Device::new(&tb.0);
+    a.repo.scan().unwrap();
+    a.trust(&b);
+    b.trust(&a);
+
+    // Each dials the other while the other's dial is under way.
+    a.node.sync(&b.node.id());
+    b.node.sync(&a.node.id());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let finished = |d: &Device| {
+        d.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, Event::Synced { .. } | Event::Failed { .. }))
+            .count()
+    };
+    // Every sync ends twice: once on the side that dialed, once on the other.
+    while finished(&a) < 2 || finished(&b) < 2 {
+        assert!(std::time::Instant::now() < deadline, "the syncs are stuck");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let failures: Vec<String> = [&a, &b]
+        .iter()
+        .flat_map(|d| d.events.lock().unwrap().clone())
+        .filter_map(|e| match e {
+            Event::Failed { error, .. } => Some(error),
+            _ => None,
+        })
+        .collect();
+    assert!(failures.is_empty(), "{failures:?}");
+    b.repo.apply_synced().unwrap();
+    assert_eq!(active_paths(&mut b.repo), ["a.txt"]);
+}
