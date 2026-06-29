@@ -1,5 +1,5 @@
-# Builds the GUI (my-beloved-rubble) and CLI (mbr) for Linux and macOS, and
-# publishes them as a GitHub release when a v* tag is pushed.
+# Builds the GUI (my-beloved-rubble) and CLI (mbr) for Linux, macOS and
+# Windows, and publishes them as a GitHub release when a v* tag is pushed.
 name: release
 
 on:
@@ -50,6 +50,8 @@ jobs:
             os: macos-15-intel
           - target: aarch64-apple-darwin
             os: macos-14
+          - target: x86_64-pc-windows-gnu
+            os: windows-2025
     runs-on: ${{ matrix.os }}
     env:
       CARGO_TERM_COLOR: always
@@ -74,6 +76,20 @@ jobs:
         if: runner.os == 'macOS'
         run: echo "LIBCLANG_PATH=$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib" >> "$GITHUB_ENV"
 
+      # Go's c-archive is MinGW-flavoured on Windows, so build a GNU Rust
+      # binary to match it. The runner's MinGW GCC also compiles cgo.
+      - name: configure Windows toolchain
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          rustup target add x86_64-pc-windows-gnu
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=gcc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CC_x86_64_pc_windows_gnu=gcc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "AR_x86_64_pc_windows_gnu=ar" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CC=gcc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CGO_ENABLED=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       # librclone embeds rclone by building it with `go build`.
       - uses: actions/setup-go@v7
         with:
@@ -87,6 +103,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: build
+        shell: bash
         run: |
           cargo build --release --locked --target "$TARGET" \
             --bin mbr --bin my-beloved-rubble
@@ -94,11 +111,31 @@ jobs:
       - name: package
         shell: bash
         run: |
+          mkdir -p dist
+
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            iscc="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
+            if [[ ! -x "$iscc" ]]; then
+              iscc="/c/Program Files/Inno Setup 6/ISCC.exe"
+            fi
+            args=(
+              "/DAppVersion=$VERSION"
+              "/DSourceDir=$(cygpath -w "$PWD/target/$TARGET/release")"
+              "/DOutputDir=$(cygpath -w "$PWD/dist")"
+            )
+            if [[ -f "target/$TARGET/release/librclone.dll" ]]; then
+              args+=(/DBundleDll=1)
+            fi
+            "$iscc" "${args[@]}" packaging/windows/mbr.iss
+            exit 0
+          fi
+
           name="mbr-v${VERSION}-${TARGET}"
           dir="dist/$name"
           mkdir -p "$dir"
-          install -m 755 "target/$TARGET/release/mbr" "$dir/mbr"
-          install -m 755 "target/$TARGET/release/my-beloved-rubble" "$dir/my-beloved-rubble"
+          cp "target/$TARGET/release/mbr" "$dir/mbr"
+          cp "target/$TARGET/release/my-beloved-rubble" "$dir/my-beloved-rubble"
+          chmod +x "$dir/mbr" "$dir/my-beloved-rubble"
           cp README.md LICENSE "$dir/"
 
           if [[ "$RUNNER_OS" == macOS ]]; then
@@ -144,7 +181,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: mbr-${{ matrix.target }}
-          path: dist/*.tar.gz
+          path: dist/*
           if-no-files-found: error
 
   release:
@@ -161,17 +198,18 @@ jobs:
           merge-multiple: true
 
       - name: checksums
-        run: cd dist && sha256sum *.tar.gz > SHA256SUMS
+        run: cd dist && sha256sum * > SHA256SUMS
 
       - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
           name: ${{ needs.prepare.outputs.tag }}
           body: |
-            Linux and macOS archives for x86_64 and arm64. Each one contains the
+            Linux and macOS archives for x86_64 and arm64, each containing the
             `mbr` command-line tool and the `my-beloved-rubble` GUI (and a
-            `My Beloved Rubble.app` bundle on macOS). Check downloads with
-            `SHA256SUMS`.
+            `My Beloved Rubble.app` bundle on macOS), plus a Windows x86_64
+            installer. On Windows, enable Developer Mode before using mbr: it
+            stores files as symlinks. Check downloads with `SHA256SUMS`.
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: dist/*

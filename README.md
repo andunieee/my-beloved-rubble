@@ -122,6 +122,8 @@ Rclone is embedded through `librclone`; building requires a Go toolchain and C c
 
 ## Releases
 
-Pushing a `v*` tag builds and publishes a GitHub release with archives for Linux and macOS (x86_64 and arm64). Each archive holds both binaries, `mbr` and `my-beloved-rubble` (and a `My Beloved Rubble.app` bundle on macOS); the release also carries a `SHA256SUMS` file. Running the `release` workflow by hand builds the same archives as downloadable artifacts without publishing a release.
+Pushing a `v*` tag builds and publishes a GitHub release with archives for Linux and macOS (x86_64 and arm64), plus a Windows x86_64 installer. Each archive holds both binaries, `mbr` and `my-beloved-rubble` (and a `My Beloved Rubble.app` bundle on macOS); the release also carries a `SHA256SUMS` file. Running the `release` workflow by hand builds the same artifacts without publishing a release.
+
+On Windows, enable **Developer Mode** (Settings → System → For developers) before using mbr: tracked files are stored as symlinks, which normal users can only create with that setting.
 
 On Linux the build needs `pkg-config`, `clang`/`libclang-dev` (for bindgen), and the fontconfig, freetype, X11, xkbcommon, OpenGL and Wayland development packages.
