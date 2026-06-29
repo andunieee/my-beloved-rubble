@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 //! `my-beloved-rubble` — the Slint GUI.
 //!
 //! Three tabs: **Blobs** (the annotated file listing, with multi-selection
