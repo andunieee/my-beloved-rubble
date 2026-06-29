@@ -4748,6 +4748,7 @@ dependencies = [
  "dirs",
  "env_logger",
  "flate2",
+ "image",
  "iroh",
  "iroh-blobs",
  "iroh-docs",

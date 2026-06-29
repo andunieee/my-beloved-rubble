@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 
 /// The demo folder's screen size, in logical pixels, rendered at twice that.
 const WINDOW: (u32, u32) = (1100, 720);
+/// A phone's screen, in logical pixels.
+const PHONE: (u32, u32) = (400, 860);
 const SCALE: f32 = 2.0;
 const PASSWORD: &str = "correct horse battery staple";
 /// What the title bar shows instead of the temp directory holding the demo.
@@ -146,11 +148,15 @@ pub fn run(out: &Path) -> Result<(), slint::PlatformError> {
         out: out.to_path_buf(),
     };
     s.resize(WINDOW);
+    load_thumbs(&app);
 
     // ── the Blobs tab ──
     app.window
         .set_status_text("Scan finished: 14 added, 1 replaced, 2 removed".into());
     s.shoot("blobs");
+
+    select_picture(&app, "photos/2024-06 Lisbon/beach.jpg");
+    s.shoot("blob-preview");
 
     select(&app, &["notes/recipes.md"]);
     s.shoot("blob-detail");
@@ -224,6 +230,32 @@ pub fn run(out: &Path) -> Result<(), slint::PlatformError> {
         .set_status_text("Synced: 3 file(s) updated".into());
     s.shoot("peers");
 
+    // ── on a phone ──
+    s.resize(PHONE);
+    app.window.set_desktop(false);
+    app.window.set_active_tab(0);
+    app.selection.borrow_mut().clear();
+    app.show_selection();
+    app.window.set_show_panel(false);
+    app.window
+        .set_status_text("Synced: 3 file(s) updated".into());
+    s.shoot("phone-files");
+    select_picture(&app, "photos/2024-06 Lisbon/beach.jpg");
+    app.window.set_show_panel(true);
+    s.shoot("phone-detail");
+    app.window.set_viewer_open(true);
+    s.shoot("phone-viewer");
+    app.window.set_viewer_open(false);
+    app.window.set_active_tab(1);
+    s.shoot("phone-remotes");
+    app.window.set_show_panel(true);
+    s.shoot("phone-add-remote");
+    app.window.set_active_tab(3);
+    app.window.set_show_panel(true);
+    s.shoot("phone-add-peer");
+    app.window.set_active_tab(0);
+    app.window.set_desktop(true);
+
     // ── a folder that isn't an mbr folder yet ──
     s.resize(WINDOW);
     *app.repo.borrow_mut() = None;
@@ -264,6 +296,10 @@ fn new_app() -> App {
         peer_status: RefCell::new(BTreeMap::new()),
         knocking: RefCell::new(BTreeSet::new()),
         sync_pending: Cell::new(false),
+        thumbs: RefCell::default(),
+        no_thumb: RefCell::default(),
+        thumbs_pending: RefCell::default(),
+        previewed: RefCell::new(None),
         setup: RefCell::new(None),
         pending_folder: RefCell::new(None),
     };
@@ -414,6 +450,107 @@ fn write_sized(path: &Path, size: u64, prefix: &str) {
         std::fs::create_dir_all(parent).unwrap();
     }
     let mut file = std::fs::File::create(path).unwrap();
-    file.write_all(prefix.as_bytes()).unwrap();
+    match picture(prefix, path) {
+        // Decoders stop at the image's end: the padding goes unread.
+        Some(bytes) => file.write_all(&bytes).unwrap(),
+        None => file.write_all(prefix.as_bytes()).unwrap(),
+    }
     file.set_len(size).unwrap();
+}
+
+/// A made-up picture for the photos, so they have previews: encoded as
+/// the file's extension says.
+fn picture(subject: &str, path: &Path) -> Option<Vec<u8>> {
+    use image::{Rgb, RgbImage};
+    let (w, h) = (480u32, 320u32);
+    let mix = |a: [u8; 3], b: [u8; 3], t: f32| {
+        Rgb([0, 1, 2].map(|i| (a[i] as f32 + (b[i] as f32 - a[i] as f32) * t) as u8))
+    };
+    let near = |x: u32, y: u32, cx: f32, cy: f32, r: f32| {
+        let (dx, dy) = (x as f32 - cx, y as f32 - cy);
+        dx * dx + dy * dy < r * r
+    };
+    let picture = match subject {
+        "beach" => RgbImage::from_fn(w, h, |x, y| {
+            let t = y as f32 / h as f32;
+            if near(x, y, 380.0, 70.0, 34.0) {
+                Rgb([255, 214, 102])
+            } else if t < 0.55 {
+                mix([92, 160, 222], [190, 225, 245], t / 0.55)
+            } else if (t - 0.62) * 40.0 < ((x as f32) / 30.0).sin() {
+                mix([28, 110, 160], [60, 160, 190], (t - 0.55) / 0.15)
+            } else {
+                mix([236, 214, 168], [214, 186, 132], (t - 0.6) / 0.4)
+            }
+        }),
+        "pasteis" => RgbImage::from_fn(w, h, |x, y| {
+            let tarts = [(130.0, 120.0), (300.0, 110.0), (210.0, 230.0), (380.0, 230.0)];
+            match tarts.iter().find(|(cx, cy)| near(x, y, *cx, *cy, 72.0)) {
+                Some((cx, cy)) if near(x, y, *cx, *cy, 50.0) => {
+                    let burnt = ((x * 7 + y * 13) % 97) < 9;
+                    if burnt { Rgb([96, 52, 18]) } else { Rgb([238, 186, 72]) }
+                }
+                Some(_) => Rgb([205, 140, 60]),
+                None => mix([240, 236, 228], [214, 206, 196], y as f32 / h as f32),
+            }
+        }),
+        "tram" => RgbImage::from_fn(w, h, |x, y| {
+            let body = (110..370).contains(&x) && (110..250).contains(&y);
+            let window = body && (130..350).contains(&x) && (130..180).contains(&y) && (x - 130) % 55 < 44;
+            if window {
+                Rgb([60, 78, 96])
+            } else if body {
+                if y < 200 { Rgb([246, 200, 40]) } else { Rgb([236, 236, 226]) }
+            } else if y > 250 {
+                mix([120, 116, 110], [80, 78, 74], (y - 250) as f32 / 70.0)
+            } else {
+                mix([170, 200, 230], [235, 230, 220], y as f32 / 250.0)
+            }
+        }),
+        "cat" => RgbImage::from_fn(w, h, |x, y| {
+            let ear = |cx: f32| {
+                let (dx, dy) = ((x as f32 - cx).abs(), 150.0 - y as f32);
+                dy > 0.0 && dy < 70.0 && dx < 40.0 - dy * 0.55
+            };
+            if near(x, y, 240.0, 200.0, 95.0) || ear(185.0) || ear(295.0) {
+                if near(x, y, 205.0, 185.0, 12.0) || near(x, y, 275.0, 185.0, 12.0) {
+                    Rgb([40, 120, 60])
+                } else if (x / 14) % 3 == 0 {
+                    Rgb([200, 110, 40])
+                } else {
+                    Rgb([232, 146, 64])
+                }
+            } else if y > 270 {
+                Rgb([50, 52, 58])
+            } else {
+                mix([200, 210, 222], [150, 160, 176], y as f32 / 270.0)
+            }
+        }),
+        _ => return None,
+    };
+    let format = match path.extension()?.to_str()? {
+        "png" => image::ImageFormat::Png,
+        _ => image::ImageFormat::Jpeg,
+    };
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    picture.write_to(&mut bytes, format).ok()?;
+    Some(bytes.into_inner())
+}
+
+/// Make every thumbnail right away (the app makes them in the background).
+fn load_thumbs(app: &App) {
+    let root = app.root().expect("a folder is open");
+    let hashes: Vec<String> = app.statuses.borrow().iter().map(|s| s.hash.clone()).collect();
+    for hash in hashes {
+        let outcome = thumbs::thumbnail(&root, &hash);
+        app.thumb_made(&root, hash, outcome);
+    }
+}
+
+/// Select `path` and show its large preview right away.
+fn select_picture(app: &App, path: &str) {
+    select(app, &[path]);
+    let root = app.root().expect("a folder is open");
+    let hash = app.repo.borrow_mut().as_mut().unwrap().resolve_spec(path).unwrap();
+    app.preview_made(hash.clone(), thumbs::preview(&root, &hash, PREVIEW_SIZE));
 }

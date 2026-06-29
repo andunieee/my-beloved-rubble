@@ -1,0 +1,21 @@
+#!/bin/sh
+# Stands in for `go` while building the Android app (see android/build.sh).
+#
+# librclone-sys builds rclone with
+#   go build --buildmode=c-archive -o <out>/librclone.a <package>
+# which Go can't do for Android: it only builds shared libraries there.
+# So build librclonego.so instead, into $RCLONE_LIB_DIR where the app
+# links and packages it, and leave librclone-sys what it expects next to
+# its own output: the header, and an (empty) librclone.a.
+set -eu
+if [ "${GOOS:-}" = android ] && [ "${1:-}" = build ] && [ "${2:-}" = --buildmode=c-archive ]; then
+    out=$(dirname "$4")
+    "$REAL_GO" build -buildmode=c-shared -o "$out/librclonego.so" "$5"
+    cp "$out/librclonego.h" "$out/librclone.h"
+    mkdir -p "$RCLONE_LIB_DIR"
+    cp "$out/librclonego.so" "$RCLONE_LIB_DIR/"
+    rm -f "$out/librclone.a"
+    "$AR_FOR_RCLONE" rcs "$out/librclone.a"
+    exit 0
+fi
+exec "$REAL_GO" "$@"

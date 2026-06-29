@@ -16,6 +16,9 @@ export struct FileRow {
     // folder's minimum.
     copies: int,
     at-risk: bool,
+    // A preview, for images.
+    thumb: image,
+    has-thumb: bool,
 }
 
 export struct RemoteRow {
@@ -475,6 +478,25 @@ export component AppWindow inherits Window {
 
     // ── State ──
     in-out property <string> folder: "";
+    // Running on a desktop (false on Android): folders and files can be
+    // picked, and the window is usually wide.
+    in property <bool> desktop: true;
+    // A phone-sized window: the main area and the side panel take turns
+    // filling it, `show-panel` saying which.
+    out property <bool> compact: root.width < 720px;
+    in-out property <bool> show-panel: false;
+    changed compact => { root.sidebar-width = root.compact ? root.width : 460px; }
+    changed width => {
+        if (root.compact) {
+            root.sidebar-width = root.width;
+        }
+    }
+    // The one file selected, as an image (see has-detail-preview).
+    in-out property <image> detail-preview;
+    in-out property <bool> has-detail-preview: false;
+    // The detail preview, filling the window.
+    in-out property <bool> viewer-open: false;
+    changed active-tab => { root.show-panel = false; }
     in-out property <[FileRow]> files: [];
     in-out property <[RemoteRow]> remotes: [];
     in-out property <[string]> remote-names: [];
@@ -574,6 +596,8 @@ export component AppWindow inherits Window {
     // blob selection: `toggle` is Ctrl/Cmd, `extend` is Shift
     callback row-pressed(index: int, toggle: bool, extend: bool);
     callback row-dragged(index: int);
+    // open a listed file (if it is here) with the system's app for it
+    callback open-file(index: int);
     callback select-all();
     callback clear-selection();
     // actions on the selected blobs
@@ -634,22 +658,22 @@ export component AppWindow inherits Window {
                 padding-bottom: 10px;
                 spacing: 10px;
 
-                Text {
+                if !root.compact: Text {
                     text: "My Beloved Rubble";
                     font-weight: 700;
                     font-size: 16px;
                     vertical-alignment: center;
                 }
                 HorizontalLayout {
-                    spacing: 4px;
-                    padding-left: 8px;
+                    spacing: root.compact ? 2px : 4px;
+                    padding-left: root.compact ? 0px : 8px;
                     TabButton {
-                        text: "Blobs (" + root.files.length + ")";
+                        text: root.compact ? "Files" : "Blobs (" + root.files.length + ")";
                         active: root.active-tab == 0;
                         clicked => { root.active-tab = 0; }
                     }
                     TabButton {
-                        text: "Remotes (" + root.remotes.length + ")";
+                        text: root.compact ? "Remotes" : "Remotes (" + root.remotes.length + ")";
                         active: root.active-tab == 1;
                         clicked => { root.active-tab = 1; }
                     }
@@ -659,13 +683,13 @@ export component AppWindow inherits Window {
                         clicked => { root.active-tab = 2; }
                     }
                     TabButton {
-                        text: "Peers (" + root.peer-count + ")";
+                        text: root.compact ? "Peers" : "Peers (" + root.peer-count + ")";
                         active: root.active-tab == 3;
                         clicked => { root.active-tab = 3; }
                     }
                 }
                 Text {
-                    text: root.folder;
+                    text: root.compact ? "" : root.folder;
                     font-size: 12px;
                     color: Palette.foreground.transparentize(40%);
                     vertical-alignment: center;
@@ -673,12 +697,12 @@ export component AppWindow inherits Window {
                     overflow: elide;
                     horizontal-stretch: 1;
                 }
-                Button {
-                    text: "Open Folder…";
+                if root.desktop: Button {
+                    text: root.compact ? "Open…" : "Open Folder…";
                     clicked => { root.open-folder(); }
                 }
                 Button {
-                    text: "Rescan";
+                    text: root.compact ? "↻" : "Rescan";
                     enabled: root.folder != "" && !root.busy;
                     clicked => { root.rescan(); }
                 }
@@ -687,15 +711,47 @@ export component AppWindow inherits Window {
 
         Rectangle { height: 1px; background: Palette.border; }
 
+        // ══ On a phone: the main area or the side panel ══
+        if root.compact && root.folder != "": HorizontalLayout {
+            height: 44px;
+            padding: 6px;
+            spacing: 4px;
+            TabButton {
+                text: root.active-tab == 0 ? "Files (" + root.files.length + ")"
+                    : root.active-tab == 1 ? "Remotes (" + root.remotes.length + ")"
+                    : root.active-tab == 2 ? "Backups"
+                    : "Peers (" + root.peer-count + ")";
+                active: !root.show-panel;
+                clicked => { root.show-panel = false; }
+            }
+            TabButton {
+                text: root.active-tab == 0
+                        ? (root.selected-count == 0 ? "Actions"
+                            : root.selected-count == 1 ? "Details"
+                            : "Selected (" + root.selected-count + ")")
+                    : root.active-tab == 1 ? (root.editing ? "Edit remote" : "Add a remote")
+                    : root.active-tab == 2 ? "Password"
+                    : "Add a peer";
+                active: root.show-panel;
+                clicked => { root.show-panel = true; }
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+        if root.compact && root.folder != "": Rectangle { height: 1px; background: Palette.border; }
+
         // ══ Content ══
-        HorizontalLayout {
+        // Placed by hand rather than by a layout: on a phone the main area
+        // and the side panel each fill the width, in turn.
+        content := Rectangle {
             vertical-stretch: 1;
-            padding: 0px;
-            spacing: 0px;
 
             // ── Main area ──
             main-area := Rectangle {
-                horizontal-stretch: 1;
+                x: 0;
+                y: 0;
+                height: parent.height;
+                width: root.compact ? parent.width : parent.width - root.sidebar-width - 7px;
+                visible: !root.compact || !root.show-panel;
                 background: Palette.background;
 
                 VerticalLayout {
@@ -716,7 +772,7 @@ export component AppWindow inherits Window {
                             HorizontalLayout {
                                 alignment: center;
                                 spacing: 8px;
-                                Button {
+                                if root.desktop: Button {
                                     text: "Open Folder…";
                                     primary: true;
                                     clicked => { root.open-folder(); }
@@ -784,7 +840,7 @@ export component AppWindow inherits Window {
                                             enabled: !root.busy;
                                             clicked => { root.restore-mode = 3; }
                                         }
-                                        Button {
+                                        if root.desktop: Button {
                                             text: "From a backup file";
                                             enabled: !root.busy;
                                             clicked => { root.restore-mode = 2; }
@@ -918,6 +974,13 @@ export component AppWindow inherits Window {
                                 border-radius: 6px;
 
                                 row-touch := TouchArea {
+                                    double-clicked => { root.open-file(idx); }
+                                    // On a phone, a tap shows the file.
+                                    clicked => {
+                                        if (root.compact) {
+                                            root.show-panel = true;
+                                        }
+                                    }
                                     pointer-event(event) => {
                                         if (event.kind == PointerEventKind.down
                                             && event.button == PointerEventButton.left) {
@@ -930,7 +993,8 @@ export component AppWindow inherits Window {
                                     }
                                     // Dragging across rows selects them.
                                     moved => {
-                                        if (self.pressed) {
+                                        // (On a phone, dragging scrolls.)
+                                        if (self.pressed && !root.compact) {
                                             root.row-dragged(idx + floor(self.mouse-y / root.row-height));
                                         }
                                     }
@@ -951,6 +1015,15 @@ export component AppWindow inherits Window {
                                         vertical-alignment: center;
                                         width: 14px;
                                     }
+                                    Rectangle {
+                                        width: 32px;
+                                        if file.has-thumb: Image {
+                                            source: file.thumb;
+                                            width: 32px;
+                                            height: 32px;
+                                            image-fit: contain;
+                                        }
+                                    }
                                     Text {
                                         text: file.path;
                                         font-size: 13px;
@@ -969,7 +1042,7 @@ export component AppWindow inherits Window {
                                             ? Palette.accent-foreground.transparentize(20%)
                                             : Palette.foreground.transparentize(35%);
                                     }
-                                    Text {
+                                    if !root.compact: Text {
                                         text: file.remotes == "" ? (file.present ? "only here" : "nowhere") : file.remotes;
                                         font-size: 12px;
                                         vertical-alignment: center;
@@ -981,7 +1054,7 @@ export component AppWindow inherits Window {
                                                 ? Palette.accent-foreground.transparentize(20%)
                                                 : Palette.foreground.transparentize(35%);
                                     }
-                                    Text {
+                                    if !root.compact: Text {
                                         text: file.short-hash;
                                         font-size: 11px;
                                         vertical-alignment: center;
@@ -1100,10 +1173,28 @@ export component AppWindow inherits Window {
                                             enabled: !root.busy;
                                             clicked => { root.push-all(remote.name); }
                                         }
-                                        Button {
+                                        if !root.compact: Button {
                                             text: "Edit";
                                             enabled: !root.busy;
                                             clicked => { root.edit-remote(remote.name); }
+                                        }
+                                        if !root.compact: Button {
+                                            text: "Remove";
+                                            enabled: !root.busy;
+                                            clicked => { root.remove-remote(remote.name); }
+                                        }
+                                    }
+                                    // On a phone, on a row of their own.
+                                    if root.compact: HorizontalLayout {
+                                        spacing: 6px;
+                                        alignment: start;
+                                        Button {
+                                            text: "Edit";
+                                            enabled: !root.busy;
+                                            clicked => {
+                                                root.edit-remote(remote.name);
+                                                root.show-panel = true;
+                                            }
                                         }
                                         Button {
                                             text: "Remove";
@@ -1259,7 +1350,11 @@ export component AppWindow inherits Window {
 
             // Draggable divider between main area and side panel.
             Rectangle {
+                x: main-area.width;
+                y: 0;
+                height: parent.height;
                 width: 7px;
+                visible: !root.compact;
                 background: Palette.background;
 
                 Rectangle {
@@ -1282,7 +1377,11 @@ export component AppWindow inherits Window {
 
             // ── Side panel ──
             Rectangle {
-                width: root.sidebar-width;
+                x: root.compact ? 0 : parent.width - root.sidebar-width;
+                y: 0;
+                height: parent.height;
+                width: root.compact ? parent.width : root.sidebar-width;
+                visible: !root.compact || root.show-panel;
                 background: Palette.background.darker(0.03);
 
                 side-scroll := ScrollView {
@@ -1339,12 +1438,38 @@ export component AppWindow inherits Window {
                         if root.active-tab == 0 && root.selected-count == 1 && root.has-detail: VerticalLayout {
                             spacing: 6px;
 
+                            if root.has-detail-preview: Rectangle {
+                                // The image's own shape, up to a limit.
+                                height: min(
+                                    Side.text-width * root.detail-preview.height / max(1, root.detail-preview.width),
+                                    360px);
+                                background: Palette.background.darker(0.08);
+                                border-radius: 6px;
+                                Image {
+                                    source: root.detail-preview;
+                                    width: parent.width;
+                                    height: parent.height;
+                                    image-fit: contain;
+                                }
+                                TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.open-file(root.detail-index); }
+                                }
+                            }
                             Text {
                                 text: root.files[root.detail-index].path;
                                 font-size: 15px;
                                 font-weight: 700;
                                 wrap: word-wrap;
-width: Side.text-width;
+                                width: Side.text-width;
+                            }
+                            if root.files[root.detail-index].present: HorizontalLayout {
+                                alignment: start;
+                                Button {
+                                    text: "Open";
+                                    primary: true;
+                                    clicked => { root.open-file(root.detail-index); }
+                                }
                             }
                             DetailLine { label: "hash"; value: root.files[root.detail-index].hash; }
                             DetailLine { label: "size"; value: root.files[root.detail-index].size; }
@@ -1776,6 +1901,34 @@ width: Side.text-width;
                     horizontal-stretch: 1;
                 }
             }
+        }
+    }
+
+    // ══ An image, filling the window ══
+    if root.viewer-open: Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: black;
+        Image {
+            x: 8px;
+            y: 8px;
+            width: parent.width - 16px;
+            height: parent.height - 16px;
+            source: root.detail-preview;
+            image-fit: contain;
+        }
+        // Anywhere closes it.
+        TouchArea {
+            clicked => { root.viewer-open = false; }
+        }
+        Text {
+            x: parent.width - self.width - 16px;
+            y: 12px;
+            text: "✕";
+            font-size: 22px;
+            color: white;
         }
     }
 }

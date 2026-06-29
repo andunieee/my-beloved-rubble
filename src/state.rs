@@ -112,9 +112,27 @@ impl RepoState {
     }
 }
 
+/// The app's own storage, where it has no config directory of its own
+/// (Android): see [`AppState::use_app_dir`].
+static APP_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 impl AppState {
-    /// `<config dir>/mbr/state.json`.
+    /// Keep the app state, and the app's folder, in `dir`: the app's own
+    /// storage on Android, which has no config directory.
+    pub fn use_app_dir(dir: PathBuf) {
+        APP_DIR.set(dir).ok();
+    }
+
+    /// The folder the app keeps in its own storage (Android), if any.
+    pub fn folder_dir() -> Option<PathBuf> {
+        Some(APP_DIR.get()?.join("folder"))
+    }
+
+    /// `<config dir>/mbr/state.json` (or in the app's own storage).
     pub fn default_path() -> Option<PathBuf> {
+        if let Some(dir) = APP_DIR.get() {
+            return Some(dir.join("state.json"));
+        }
         Some(dirs::config_dir()?.join("mbr").join("state.json"))
     }
 

@@ -31,6 +31,7 @@ pub mod rclone;
 pub mod remotes;
 pub mod repo;
 pub mod state;
+pub mod thumbs;
 pub mod util;
 
 pub use repo::Repo;

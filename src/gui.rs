@@ -25,10 +25,11 @@ use mbr::peers::{self, Node};
 use mbr::rclone::RemoteBlob;
 use mbr::repo::{self, DropOutcome, LocalHealth, RemoteHealth, Repo};
 use mbr::state::{AppState, BackupRecord, Peer, RepoState};
+use mbr::thumbs;
 use mbr::util;
 use slint::{Model, ModelRc, SharedString, VecModel};
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -129,6 +130,26 @@ enum Msg {
     },
     /// Something happened syncing with the peers.
     Peer(peers::Event),
+    /// A thumbnail for the file list was made (or not) in the folder at
+    /// `root`.
+    Thumb {
+        root: PathBuf,
+        hash: String,
+        outcome: thumbs::Outcome,
+    },
+    /// The large preview of the selected file was made (or not).
+    Preview {
+        hash: String,
+        outcome: thumbs::Outcome,
+    },
+}
+
+impl Msg {
+    /// Whether handling the message may change what the views show
+    /// beyond what it updates itself.
+    fn changes_the_folder(&self) -> bool {
+        !matches!(self, Msg::Thumb { .. } | Msg::Preview { .. })
+    }
 }
 
 /// Which rows of the blob list are selected, by path (so the selection
@@ -256,6 +277,14 @@ struct App {
     knocking: RefCell<BTreeSet<String>>,
     /// A sync brought changes in during a scan: applied once it ends.
     sync_pending: Cell<bool>,
+    /// Previews of image files, by blob hash, for the file list.
+    thumbs: RefCell<HashMap<String, slint::Image>>,
+    /// Blobs with no thumbnail: not images, or neither here nor cached.
+    no_thumb: RefCell<HashSet<String>>,
+    /// Blobs whose thumbnail is being made.
+    thumbs_pending: RefCell<HashSet<String>>,
+    /// The blob the detail panel shows (or is making) a preview of.
+    previewed: RefCell<Option<String>>,
     /// The remote being set up, while rclone still asks questions.
     setup: RefCell<Option<PendingSetup>>,
     /// A folder that isn't an mbr folder yet, while the user chooses to
@@ -418,13 +447,86 @@ fn docs_url(page: &str) -> String {
     }
 }
 
+#[cfg(not(target_os = "android"))]
+#[allow(dead_code)]
 fn main() -> Result<(), slint::PlatformError> {
     env_logger::init();
+    run()
+}
 
+/// What differs between the desktop and Android: how links open, and
+/// how folders and files are picked.
+mod platform {
+    use std::path::PathBuf;
+
+    /// Open `url` in the browser.
+    #[cfg(not(target_os = "android"))]
+    pub fn open_url(url: &str) -> Result<(), String> {
+        open::that_detached(url).map_err(|e| e.to_string())
+    }
+
+    /// Open `url` in the browser, through an Android intent.
+    #[cfg(target_os = "android")]
+    pub fn open_url(url: &str) -> Result<(), String> {
+        use jni::objects::{JObject, JValue};
+        let fail = |e: jni::errors::Error| e.to_string();
+        let ctx = ndk_context::android_context();
+        let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.map_err(fail)?;
+        let mut env = vm.attach_current_thread().map_err(fail)?;
+        let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
+        let url = env.new_string(url).map_err(fail)?;
+        let uri = env
+            .call_static_method(
+                "android/net/Uri",
+                "parse",
+                "(Ljava/lang/String;)Landroid/net/Uri;",
+                &[JValue::Object(&url)],
+            )
+            .and_then(|v| v.l())
+            .map_err(fail)?;
+        let action = env.new_string("android.intent.action.VIEW").map_err(fail)?;
+        let intent = env
+            .new_object(
+                "android/content/Intent",
+                "(Ljava/lang/String;Landroid/net/Uri;)V",
+                &[JValue::Object(&action), JValue::Object(&uri)],
+            )
+            .map_err(fail)?;
+        env.call_method(
+            &activity,
+            "startActivity",
+            "(Landroid/content/Intent;)V",
+            &[JValue::Object(&intent)],
+        )
+        .map_err(fail)?;
+        Ok(())
+    }
+
+    /// Ask for a folder (none on Android: the app has its own).
+    pub fn pick_folder() -> Option<PathBuf> {
+        #[cfg(not(target_os = "android"))]
+        return rfd::FileDialog::new().pick_folder();
+        #[cfg(target_os = "android")]
+        None
+    }
+
+    /// Ask for a file (none on Android yet).
+    pub fn pick_file() -> Option<PathBuf> {
+        #[cfg(not(target_os = "android"))]
+        return rfd::FileDialog::new().pick_file();
+        #[cfg(target_os = "android")]
+        None
+    }
+}
+
+/// Run the app: on the desktop from `main`, on Android once the activity
+/// is set up (see `android/`).
+pub fn run() -> Result<(), slint::PlatformError> {
     let window = AppWindow::new()?;
+    window.set_desktop(cfg!(not(target_os = "android")));
     window.global::<Docs>().on_open(|page| {
         let url = docs_url(&page);
-        if let Err(e) = open::that_detached(&url) {
+        if let Err(e) = platform::open_url(&url) {
             log::warn!("cannot open {url}: {e}");
         }
     });
@@ -447,6 +549,10 @@ fn main() -> Result<(), slint::PlatformError> {
         peer_status: RefCell::new(BTreeMap::new()),
         knocking: RefCell::new(BTreeSet::new()),
         sync_pending: Cell::new(false),
+        thumbs: RefCell::default(),
+        no_thumb: RefCell::default(),
+        thumbs_pending: RefCell::default(),
+        previewed: RefCell::new(None),
         setup: RefCell::new(None),
         pending_folder: RefCell::new(None),
     });
@@ -461,8 +567,8 @@ fn main() -> Result<(), slint::PlatformError> {
             move || {
                 let mut refresh_needed = false;
                 while let Ok(msg) = rx.try_recv() {
+                    refresh_needed |= msg.changes_the_folder();
                     app.handle(msg);
-                    refresh_needed = true;
                 }
                 if refresh_needed {
                     app.absorb_rclone_config();
@@ -489,8 +595,12 @@ fn main() -> Result<(), slint::PlatformError> {
     let w = &app.window;
     {
         let app = app.clone();
+        w.on_open_file(move |index| app.open_file(index as usize));
+    }
+    {
+        let app = app.clone();
         w.on_open_folder(move || {
-            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+            if let Some(dir) = platform::pick_folder() {
                 app.attach(dir);
             }
         });
@@ -621,7 +731,7 @@ fn main() -> Result<(), slint::PlatformError> {
         w.on_cancel_remote_setup(move || app.cancel_remote_setup());
     }
     w.on_open_url(|url| {
-        if let Err(e) = open::that_detached(url.as_str()) {
+        if let Err(e) = platform::open_url(url.as_str()) {
             log::warn!("cannot open {url}: {e}");
         }
     });
@@ -786,6 +896,10 @@ fn main() -> Result<(), slint::PlatformError> {
     let last = app.state.borrow().last_folder.clone();
     if let Some(dir) = last.filter(|dir| Repo::is_initialized(dir)) {
         app.attach(dir);
+    } else if let Some(dir) = AppState::folder_dir() {
+        // Android: the app keeps its folder in its own storage.
+        std::fs::create_dir_all(&dir).ok();
+        app.attach(dir);
     }
 
     app.window.run()
@@ -908,7 +1022,7 @@ impl App {
 
     /// Pick the encrypted backup file to restore from.
     fn pick_restore_file(&self) {
-        if let Some(file) = rfd::FileDialog::new().pick_file() {
+        if let Some(file) = platform::pick_file() {
             self.window
                 .set_restore_backup_file(file.display().to_string().into());
         }
@@ -1114,6 +1228,154 @@ impl App {
             summary += &format!("\n{unstored} not stored on any remote");
         }
         self.window.set_selection_summary(summary.into());
+        drop(statuses);
+        drop(selection);
+        self.show_detail_preview();
+    }
+
+    // ── previews ──
+
+    /// Make the thumbnails the file list lacks, in the background.
+    fn make_thumbs(&self) {
+        let Some(root) = self.root() else { return };
+        let wanted: Vec<String> = {
+            let thumbs = self.thumbs.borrow();
+            let none = self.no_thumb.borrow();
+            let pending = self.thumbs_pending.borrow();
+            let mut seen = HashSet::new();
+            self.statuses
+                .borrow()
+                .iter()
+                .map(|s| s.hash.clone())
+                .filter(|h| {
+                    !thumbs.contains_key(h)
+                        && !none.contains(h)
+                        && !pending.contains(h)
+                        && seen.insert(h.clone())
+                })
+                .collect()
+        };
+        if wanted.is_empty() {
+            return;
+        }
+        self.thumbs_pending
+            .borrow_mut()
+            .extend(wanted.iter().cloned());
+        // Not a task: the buttons stay usable while previews come in.
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            for hash in wanted {
+                let outcome = thumbs::thumbnail(&root, &hash);
+                let sent = tx.send(Msg::Thumb {
+                    root: root.clone(),
+                    hash,
+                    outcome,
+                });
+                if sent.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    fn thumb_made(&self, root: &Path, hash: String, outcome: thumbs::Outcome) {
+        self.thumbs_pending.borrow_mut().remove(&hash);
+        if self.root().as_deref() != Some(root) {
+            return;
+        }
+        let image = match outcome {
+            thumbs::Outcome::Ready(preview) => to_image(&preview),
+            _ => {
+                self.no_thumb.borrow_mut().insert(hash);
+                return;
+            }
+        };
+        for i in 0..self.files.row_count() {
+            if let Some(mut row) = self.files.row_data(i)
+                && row.hash.as_str() == hash
+            {
+                row.thumb = image.clone();
+                row.has_thumb = true;
+                self.files.set_row_data(i, row);
+            }
+        }
+        let detail = self.previewed.borrow().as_deref() == Some(hash.as_str());
+        if detail && !self.window.get_has_detail_preview() {
+            self.window.set_detail_preview(image.clone());
+            self.window.set_has_detail_preview(true);
+        }
+        self.thumbs.borrow_mut().insert(hash, image);
+    }
+
+    /// Show a large preview of the one file selected, if it is an image:
+    /// its thumbnail at once, then the image itself once decoded.
+    fn show_detail_preview(&self) {
+        let hash = match self.window.get_detail_index() {
+            i if i >= 0 => self
+                .statuses
+                .borrow()
+                .get(i as usize)
+                .map(|s| (s.hash.clone(), s.present_locally)),
+            _ => None,
+        };
+        if self.previewed.borrow().as_ref() == hash.as_ref().map(|(h, _)| h) {
+            return;
+        }
+        *self.previewed.borrow_mut() = hash.as_ref().map(|(h, _)| h.clone());
+        let thumb = hash
+            .as_ref()
+            .and_then(|(h, _)| self.thumbs.borrow().get(h).cloned());
+        self.window.set_has_detail_preview(thumb.is_some());
+        self.window.set_detail_preview(thumb.unwrap_or_default());
+        let (Some((hash, true)), Some(root)) = (hash, self.root()) else {
+            return;
+        };
+        if self.no_thumb.borrow().contains(&hash) {
+            return;
+        }
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let outcome = thumbs::preview(&root, &hash, PREVIEW_SIZE);
+            tx.send(Msg::Preview { hash, outcome }).ok();
+        });
+    }
+
+    fn preview_made(&self, hash: String, outcome: thumbs::Outcome) {
+        if self.previewed.borrow().as_deref() != Some(hash.as_str()) {
+            return;
+        }
+        if let thumbs::Outcome::Ready(preview) = outcome {
+            self.window.set_detail_preview(to_image(&preview));
+            self.window.set_has_detail_preview(true);
+        }
+    }
+
+    /// Open the file listed at `index`: with the app the system chooses
+    /// on the desktop; images in the app's own viewer on Android, where
+    /// other apps can't read the folder.
+    fn open_file(&self, index: usize) {
+        let Some(status) = self.statuses.borrow().get(index).cloned() else {
+            return;
+        };
+        if !status.present_locally {
+            self.status(format!(
+                "{} isn't on this device: download it first",
+                status.path
+            ));
+            return;
+        }
+        #[cfg(target_os = "android")]
+        if self.window.get_detail_index() == index as i32 && self.window.get_has_detail_preview() {
+            self.window.set_viewer_open(true);
+        } else {
+            self.status("Only images can be opened on Android for now");
+        }
+        #[cfg(not(target_os = "android"))]
+        if let Some(root) = self.root()
+            && let Err(e) = open::that_detached(root.join(&status.path))
+        {
+            self.status(format!("Cannot open {}: {e}", status.path));
+        }
     }
 
     fn upload_selected(&self, remote: &str) {
@@ -2431,12 +2693,22 @@ impl App {
                 Err(e) => self.status(format!("Upload to {remote} failed: {e}")),
             },
             Msg::Fetched { hash, result } => match result {
-                Ok(remote) => self.status(format!(
+                Ok(remote) => {
+                    // Here now: its preview can be made.
+                    self.no_thumb.borrow_mut().remove(&hash);
+                    self.status(format!(
                     "Downloaded {} from {remote}",
                     util::short_hash(&hash)
-                )),
+                    ))
+                }
                 Err(e) => self.status(format!("Download failed: {e}")),
             },
+            Msg::Thumb {
+                root,
+                hash,
+                outcome,
+            } => self.thumb_made(&root, hash, outcome),
+            Msg::Preview { hash, outcome } => self.preview_made(hash, outcome),
             Msg::Checked {
                 remote,
                 hash,
@@ -2721,10 +2993,20 @@ impl App {
                 let mut selection = self.selection.borrow_mut();
                 let listed: HashSet<&str> = statuses.iter().map(|s| s.path.as_str()).collect();
                 selection.paths.retain(|p| listed.contains(p.as_str()));
+                let thumbs = self.thumbs.borrow();
                 let rows: Vec<FileRow> = statuses
                     .iter()
-                    .map(|s| file_row(s, selection.paths.contains(&s.path), min_copies))
+                    .map(|s| {
+                        let mut row =
+                            file_row(s, selection.paths.contains(&s.path), min_copies);
+                        if let Some(thumb) = thumbs.get(&s.hash) {
+                            row.thumb = thumb.clone();
+                            row.has_thumb = true;
+                        }
+                        row
+                    })
                     .collect();
+                drop(thumbs);
                 self.window
                     .set_at_risk_count(rows.iter().filter(|r| r.at_risk).count() as i32);
                 // Same model, new contents: the list keeps its scroll position.
@@ -2779,6 +3061,7 @@ impl App {
         drop(guard);
         self.refresh_peers();
         self.show_selection();
+        self.make_thumbs();
     }
 
     /// Rebuild the Settings tab.
@@ -2851,6 +3134,17 @@ impl App {
         w.set_metadata_chosen(chosen_rows.len() as i32);
         w.set_metadata_rows(ModelRc::new(VecModel::from(rows)));
     }
+}
+
+/// The longest side of the detail panel's preview, in pixels.
+const PREVIEW_SIZE: u32 = 1600;
+
+fn to_image(preview: &thumbs::Preview) -> slint::Image {
+    slint::Image::from_rgba8(slint::SharedPixelBuffer::clone_from_slice(
+        &preview.rgba,
+        preview.width,
+        preview.height,
+    ))
 }
 
 /// One form row for `field`, prefilled with `value` (for choices: the
@@ -2927,6 +3221,8 @@ fn file_row(s: &repo::FileStatus, selected: bool, min_copies: u32) -> FileRow {
         selected,
         copies: s.copies() as i32,
         at_risk: s.copies() < min_copies as usize,
+        thumb: slint::Image::default(),
+        has_thumb: false,
     }
 }
 
