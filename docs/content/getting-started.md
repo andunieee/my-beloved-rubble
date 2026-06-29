@@ -13,6 +13,9 @@ folder the next time it starts.
 
 To bring back a folder you lost instead, pick **Restore a lost folder**: see [restoring](../metadata/#restoring-a-lost-folder).
 
+Before adding a [remote](../remotes/), set the folder's master password in the **Settings** tab. Every remote is
+encrypted with it, and it cannot be changed afterwards: see [the master password](../settings/#the-master-password).
+
 ## Adding files
 
 Put files into the folder however you like: copy them in, save them from another program, move whole folders of

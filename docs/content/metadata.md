@@ -44,3 +44,14 @@ only the files you need. A file already in the folder under a restored name is k
 new version.
 
 A backup is only ever restored into a folder that isn't an mbr folder yet, never merged into one in use.
+
+## Local state
+
+Some things are true only of this computer and are deliberately kept out of the backed-up database: the master
+password (and a check for it), and when each remote last received a backup. They live in the folder's
+`.mbr/local.json`, readable only by you. The file is never synced or included in a metadata backup, so it goes away
+with the folder.
+
+The last folder opened is kept separately, in the app's configuration directory (for example
+`~/.config/mbr/state.json`), and is reopened on the next start. A remote whose last backup is older than the latest
+database change is shown as out of date.
