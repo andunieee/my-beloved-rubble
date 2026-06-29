@@ -78,6 +78,7 @@ jobs:
 
       # Go's c-archive is MinGW-flavoured on Windows, so build a GNU Rust
       # binary to match it. The runner's MinGW GCC also compiles cgo.
+      # crt-static keeps the result independent of MinGW's runtime DLLs.
       - name: configure Windows toolchain
         if: runner.os == 'Windows'
         shell: pwsh
@@ -85,6 +86,7 @@ jobs:
           rustup target add x86_64-pc-windows-gnu
           "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=gcc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS=-C target-feature=+crt-static" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "CC_x86_64_pc_windows_gnu=gcc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "AR_x86_64_pc_windows_gnu=ar" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "CC=gcc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
@@ -107,6 +109,19 @@ jobs:
         run: |
           cargo build --release --locked --target "$TARGET" \
             --bin mbr --bin my-beloved-rubble
+
+      - name: verify Windows runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          foreach ($bin in @("mbr", "my-beloved-rubble")) {
+            $imports = & objdump -p "target/$env:TARGET/release/$bin.exe" |
+              Select-String 'DLL Name'
+            $imports
+            if ($imports -match 'libgcc|libstdc|libwinpthread|libssp') {
+              throw "$bin.exe depends on a MinGW runtime DLL"
+            }
+          }
 
       - name: package (Linux/macOS)
         if: runner.os != 'Windows'
