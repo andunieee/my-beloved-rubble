@@ -13,6 +13,7 @@
 //!     db/                   metadata: paths, blobs, remotes, settings
 //!                           (an iroh-docs replica, see [`db`])
 //!     rclone.conf           rclone configuration, written from the metadata
+//!     local.json            this machine's master password and backup records
 //!   fruits.png -> .mbr/blobs/fa/2e/fa2e38…
 //! ```
 //!

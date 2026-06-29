@@ -23,14 +23,14 @@ over the name works, and is recorded as a new version):
 folder/
   .mbr/
     blobs/fa/2e/fa2e38…(full sha256)   the actual content
-    mbr.db                            sqlite metadata
+    db/                               metadata (an iroh-docs replica)
     rclone.conf                       repository-local rclone config
     corrupt/                          blobs that failed verification
     tmp/                              scratch space
   fruits.png -> .mbr/blobs/fa/2e/fa2e38…
 ```
 
-`.mbr/mbr.db` tracks:
+`.mbr/db` tracks:
 
 - **paths** — every name the folder ever held: which blob it pointed to,
   when it was added, when it was removed. Replacing a file's content
@@ -110,7 +110,7 @@ go there too, next to `mbr-<id>`, through `_root-mbr-drive`.
 
 The master password is chosen when creating a folder or restoring from
 plain database/config files, then can't change. It is saved, with a check,
-in the per-machine `state.json` (mode 0600).
+in the folder's `.mbr/local.json` (mode 0600), which is never synced.
 
 ### Scanning remotes
 
@@ -147,7 +147,7 @@ at risk.
 ## Metadata backups
 
 Remotes store blobs by hash only: the names, folders and history of the
-files live in `.mbr/mbr.db`. If the folder is lost, its remotes alone would
+files live in `.mbr/db`. If the folder is lost, its remotes alone would
 come back as a heap of nameless files. So the database is backed up
 separately. It is not content-addressed like a blob, but encrypted with
 the folder's **master password** and uploaded to every remote chosen for
@@ -157,8 +157,8 @@ it, replacing the previous backup:
 <bucket or folder>/mbr-metadata-<backup id>.tar.gz.encrypted
 ```
 
-holding `mbr.db` and `rclone.conf` (so every remote can be reached from a
-new computer) in a tar.gz. The backup id is 8 bytes of an Argon2id hash
+holding `mbr-metadata.json`, the whole database including the remote
+settings, in a tar.gz. The backup id is 8 bytes of an Argon2id hash
 of the master password, in hex: the backup is found again knowing only
 the password and where the remote is, and the name makes the password no
 easier to guess than the content does. It is an
@@ -188,11 +188,12 @@ There is no merging into a folder in use.
 ### Local state
 
 When each remote last received a backup is per-machine state, never synced:
-`<config dir>/mbr/state.json` (e.g. `~/.config/mbr/state.json`), loaded on
-every start. It also holds the last opened folder and, per folder, an
-Argon2 hash of the master password, so a mistyped password is caught
-before anything is encrypted with it. A remote whose last backup predates
-a database change shows as out of date.
+`<folder>/.mbr/local.json`, outside the synced database, so it goes away
+with the folder. It also holds the master password and an Argon2 hash of
+it, so a mistyped password is caught before anything is encrypted with it.
+The last opened folder is in `<config dir>/mbr/state.json` (e.g.
+`~/.config/mbr/state.json`), loaded on every start. A remote whose last
+backup predates a database change shows as out of date.
 
 ## CLI
 

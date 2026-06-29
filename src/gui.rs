@@ -231,7 +231,7 @@ struct App {
     files: Rc<VecModel<FileRow>>,
     selection: RefCell<Selection>,
     edit: RefCell<Option<EditState>>,
-    /// Local app state (`state.json`), loaded on start.
+    /// Local app state (`state.json` and each folder's `local.json`).
     state: RefCell<AppState>,
     /// The open folder's master password, saved on this machine.
     password: RefCell<Option<SecretString>>,
