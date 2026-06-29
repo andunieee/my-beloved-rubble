@@ -31,6 +31,11 @@ use std::sync::{Arc, mpsc};
 
 slint::include_modules!();
 
+/// Screenshots for the README and the user guide, rendered offscreen over
+/// made-up data: `cargo run --features screenshots --bin screenshots`.
+#[cfg(feature = "screenshots")]
+pub mod screenshots;
+
 /// Completion messages from background threads.
 enum Msg {
     /// One blob finished uploading; on success, record it in the db.

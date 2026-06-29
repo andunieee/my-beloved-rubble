@@ -4644,6 +4644,7 @@ dependencies = [
  "librclone",
  "log",
  "open",
+ "png",
  "rfd",
  "rpassword",
  "serde",

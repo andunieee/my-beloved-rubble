@@ -11,6 +11,9 @@ can bring back the whole folder, names and all, if the computer it was on is los
 
 The folder stays a normal folder: files open like before, from any program.
 
+<a href="screenshots/blobs.png"><img src="screenshots/blobs.png" alt="The Blobs tab: files, the remotes holding them, and old versions"></a>
+<a href="screenshots/remotes.png"><img src="screenshots/remotes.png" alt="The Remotes tab, with three remotes and the form for a new one"></a>
+
 > **Two copies is the minimum.** A file that exists in only one place is one broken disk away from being gone. The app
 > marks those files in red until they are stored somewhere else too.
 

@@ -4,6 +4,14 @@ Content-addressed folders in the spirit of git-annex, with rclone remotes.
 
 `mbr` comes with a GUI written in [Slint](https://slint.dev) and a CLI. It is licensed under [AGPL](LICENSE).
 
+<p align="center">
+  <img src="docs/static/screenshots/blobs.png" alt="The Blobs tab: files, the remotes holding them, and old versions">
+</p>
+
+<p align="center">
+  <img src="docs/static/screenshots/remotes.png" alt="The Remotes tab, with three remotes and the form for a new one">
+</p>
+
 ## The model
 
 Attach mbr to any folder (`mbr init`, or "Open Folder" in the GUI). From then on, whenever the folder is inspected (a scan), every regular file in it is moved into a hidden content-addressed store and replaced by a symlink, so it still opens like a normal file. Stored blobs are read-only: a program that writes into a file in place gets an error instead of silently changing content stored under its old hash (saving a new file over the name works, and is recorded as a new version):
@@ -102,6 +110,12 @@ In the meantime, we hope to get multi-machine and Android support: phones and ma
 
 ```
 cargo build --release   # target/release/mbr and target/release/my-beloved-rubble
+```
+
+The screenshots in `docs/static/screenshots` are rendered from the real UI over made-up data:
+
+```
+cargo run --release --features screenshots --bin screenshots
 ```
 
 Rclone is embedded through `librclone`; building requires a Go toolchain and C compiler, but no separate `rclone` executable is required at runtime.

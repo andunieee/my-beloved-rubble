@@ -51,6 +51,7 @@ blockquote p { margin: 0; }
 pre { overflow-x: auto; padding: 12px 16px; background: var(--tint); border-radius: 8px; font-size: 0.85rem; line-height: 1.5; }
 pre code { background: none; padding: 0; }
 code { font-size: 0.9em; background: var(--tint); padding: 1px 5px; border-radius: 4px; }
+img { display: block; max-width: 100%; height: auto; margin: 20px 0; border: 1px solid var(--line); border-radius: 8px; cursor: zoom-in; }
 ul, ol { padding-left: 1.3em; }
 li { margin: 4px 0; }
 .next { margin-top: 40px; }

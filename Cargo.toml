@@ -16,6 +16,15 @@ path = "src/cli.rs"
 name = "my-beloved-rubble"
 path = "src/gui.rs"
 
+# Renders the screenshots in docs/static/screenshots, see src/screenshots.rs
+[[bin]]
+name = "screenshots"
+path = "src/bin/screenshots.rs"
+required-features = ["screenshots"]
+
+[features]
+screenshots = ["slint/software-renderer-systemfonts", "dep:png"]
+
 [build-dependencies]
 slint-build = "1.11"
 
@@ -39,6 +48,7 @@ flate2 = "1.1.10"
 iroh-docs = { version = "0.101", default-features = false, features = ["fs-store"] }
 iroh-blobs = { version = "0.103", default-features = false, features = ["fs-store"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+png = { version = "0.18", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
