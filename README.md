@@ -119,3 +119,9 @@ cargo run --release --features screenshots --bin screenshots
 ```
 
 Rclone is embedded through `librclone`; building requires a Go toolchain and C compiler, but no separate `rclone` executable is required at runtime.
+
+## Releases
+
+Pushing a `v*` tag builds and publishes a GitHub release with archives for Linux and macOS (x86_64 and arm64). Each archive holds both binaries, `mbr` and `my-beloved-rubble` (and a `My Beloved Rubble.app` bundle on macOS); the release also carries a `SHA256SUMS` file. Running the `release` workflow by hand builds the same archives as downloadable artifacts without publishing a release.
+
+On Linux the build needs `pkg-config`, `clang`/`libclang-dev` (for bindgen), and the fontconfig, freetype, X11, xkbcommon, OpenGL and Wayland development packages.

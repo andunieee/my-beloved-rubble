@@ -1,0 +1,177 @@
+# Builds the GUI (my-beloved-rubble) and CLI (mbr) for Linux and macOS, and
+# publishes them as a GitHub release when a v* tag is pushed.
+name: release
+
+on:
+  push:
+    tags: [v*]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            tag="$GITHUB_REF_NAME"
+            version="${tag#v}"
+          else
+            version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+            tag="v$version"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.target }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: aarch64-apple-darwin
+            os: macos-14
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TERM_COLOR: always
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Slint's femtovg renderer needs fontconfig, freetype, X11/GL, and
+      # librclone's build script needs a C compiler plus libclang for bindgen.
+      - name: install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libclang-dev clang \
+            libfontconfig1-dev libfreetype6-dev libx11-dev libxkbcommon-dev \
+            libgl1-mesa-dev libwayland-dev
+
+      # bindgen (used by librclone) needs a hand finding Xcode's libclang.
+      - name: locate libclang
+        if: runner.os == 'macOS'
+        run: echo "LIBCLANG_PATH=$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib" >> "$GITHUB_ENV"
+
+      # librclone embeds rclone by building it with `go build`.
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.x'
+          cache: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: build
+        run: |
+          cargo build --release --locked --target "$TARGET" \
+            --bin mbr --bin my-beloved-rubble
+
+      - name: package
+        shell: bash
+        run: |
+          name="mbr-v${VERSION}-${TARGET}"
+          dir="dist/$name"
+          mkdir -p "$dir"
+          install -m 755 "target/$TARGET/release/mbr" "$dir/mbr"
+          install -m 755 "target/$TARGET/release/my-beloved-rubble" "$dir/my-beloved-rubble"
+          cp README.md LICENSE "$dir/"
+
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            app="$dir/My Beloved Rubble.app"
+            mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+            cp "target/$TARGET/release/my-beloved-rubble" "$app/Contents/MacOS/"
+            cat > "$app/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDevelopmentRegion</key>
+            <string>en</string>
+            <key>CFBundleExecutable</key>
+            <string>my-beloved-rubble</string>
+            <key>CFBundleIdentifier</key>
+            <string>dev.mbr.my-beloved-rubble</string>
+            <key>CFBundleName</key>
+            <string>My Beloved Rubble</string>
+            <key>CFBundleDisplayName</key>
+            <string>My Beloved Rubble</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${VERSION}</string>
+            <key>CFBundleVersion</key>
+            <string>${VERSION}</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>11.0</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+            # Ad-hoc signature; the app is not notarized, but this keeps
+            # Gatekeeper from calling the bundle damaged.
+            codesign --force --sign - "$app"
+          fi
+
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          rm -rf "$dir"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mbr-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: [prepare, build]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: checksums
+        run: cd dist && sha256sum *.tar.gz > SHA256SUMS
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.tag }}
+          body: |
+            Linux and macOS archives for x86_64 and arm64. Each one contains the
+            `mbr` command-line tool and the `my-beloved-rubble` GUI (and a
+            `My Beloved Rubble.app` bundle on macOS). Check downloads with
+            `SHA256SUMS`.
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: dist/*
