@@ -12,6 +12,93 @@ Content-addressed folders in the spirit of git-annex, with rclone remotes.
   <img src="docs/static/screenshots/remotes.png" alt="The Remotes tab, with three remotes and the form for a new one">
 </p>
 
+## Installation
+
+Grab the files from the [latest release](https://github.com/andunieee/my-beloved-rubble/releases/latest), or use the commands below, which all download the latest one. Every desktop release has both `mbr` (the CLI) and `my-beloved-rubble` (the GUI).
+
+<details>
+<summary>Linux</summary>
+
+x86_64 and arm64, glibc 2.35+ (Ubuntu 22.04, Debian 12, Fedora 36 or newer). The GUI also needs fontconfig and freetype, and X11 or Wayland, which any desktop already has.
+
+**One-liner**, extracts both binaries into `~/.local/bin`:
+```
+mkdir -p ~/.local/bin && curl -fL "$(curl -s https://api.github.com/repos/andunieee/my-beloved-rubble/releases/latest | grep -o "https://[^\"]*$(uname -m)-unknown-linux-gnu\.tar\.gz")" | tar -xz -C ~/.local/bin --strip-components=1 --wildcards '*/mbr' '*/my-beloved-rubble'
+```
+
+**Manually**: download the `x86_64-unknown-linux-gnu` (or `aarch64-unknown-linux-gnu`) `.tar.gz`, extract it and put `mbr` and `my-beloved-rubble` somewhere in your `PATH`.
+
+**With cargo**, builds from source into `~/.cargo/bin` (see [Building from source](#building-from-source) for the dependencies):
+```
+cargo install --locked --git https://github.com/andunieee/my-beloved-rubble mybelovedrubble
+```
+
+**From a clone**, same as cargo, but also adds the GUI to the application menu:
+```
+git clone https://github.com/andunieee/my-beloved-rubble && cd my-beloved-rubble && just desktop-install
+```
+</details>
+
+<details>
+<summary>Windows</summary>
+
+x86_64, Windows 10 or newer. Before using mbr, enable **Developer Mode** (Settings → System → For developers): tracked files are stored as symlinks, which normal users can only create with that setting.
+
+**Manually**: download the `x86_64-windows-setup` `.exe` from the [releases page](https://github.com/andunieee/my-beloved-rubble/releases) and run it. It installs for your user (no administrator needed) and adds a Start menu entry and an uninstaller. `mbr.exe` sits next to the GUI, in `%LOCALAPPDATA%\Programs\My Beloved Rubble`.
+
+**One-liner** (PowerShell), does the same: downloads the installer and runs it.
+```
+$u=(irm https://api.github.com/repos/andunieee/my-beloved-rubble/releases/latest).assets.browser_download_url -match 'x86_64-windows-setup\.exe$'; iwr $u -OutFile $env:TEMP\mbr-setup.exe; Start-Process $env:TEMP\mbr-setup.exe
+```
+
+**Silently** (PowerShell), the same without the installer's windows, for scripts:
+```
+$u=(irm https://api.github.com/repos/andunieee/my-beloved-rubble/releases/latest).assets.browser_download_url -match 'x86_64-windows-setup\.exe$'; iwr $u -OutFile $env:TEMP\mbr-setup.exe; Start-Process -Wait $env:TEMP\mbr-setup.exe '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART'
+```
+</details>
+
+<details>
+<summary>macOS</summary>
+
+Apple Silicon and Intel, macOS 11 or newer. The app is ad-hoc signed but not notarized.
+
+**One-liner** (Terminal), puts `My Beloved Rubble.app` in `/Applications` and `mbr` in `/usr/local/bin` (asks for your password for the latter):
+```
+a=$([ "$(uname -m)" = arm64 ] && echo aarch64 || echo x86_64); d=$(mktemp -d) && curl -fL "$(curl -s https://api.github.com/repos/andunieee/my-beloved-rubble/releases/latest | grep -o "https://[^\"]*$a-apple-darwin\.tar\.gz")" | tar -xz -C "$d" --strip-components=1 && rm -rf "/Applications/My Beloved Rubble.app" && mv "$d/My Beloved Rubble.app" /Applications/ && sudo mkdir -p /usr/local/bin && sudo install -m755 "$d/mbr" /usr/local/bin/mbr
+```
+
+**Manually**: download the `aarch64-apple-darwin` (Apple Silicon) or `x86_64-apple-darwin` (Intel) `.tar.gz`, double-click it in Finder to extract it, and drag `My Beloved Rubble.app` to `Applications`. On first launch right-click it and choose Open. If macOS still refuses to open it, run:
+```
+xattr -dr com.apple.quarantine "/Applications/My Beloved Rubble.app"
+```
+
+**With cargo**, builds from source into `~/.cargo/bin` (see [Building from source](#building-from-source)):
+```
+cargo install --locked --git https://github.com/andunieee/my-beloved-rubble mybelovedrubble
+```
+</details>
+
+<details>
+<summary>Android</summary>
+
+arm64 phones and tablets, Android 8.0 or newer. The APK isn't on any store, so Android asks you to allow installing apps from the browser (or file manager) you open it with.
+
+**On the device**: open the [latest release](https://github.com/andunieee/my-beloved-rubble/releases/latest) in the browser, download the `android-arm64` `.apk` and open it.
+
+**With [Obtainium](https://obtainium.imranr.dev)**, which installs it from the GitHub releases and keeps it updated: add an app with the URL `https://github.com/andunieee/my-beloved-rubble`.
+
+**From a computer**, with adb: downloads the APK and installs it on every device connected through adb (with USB debugging on):
+```
+curl -fL "$(curl -s https://api.github.com/repos/andunieee/my-beloved-rubble/releases/latest | grep -o 'https://[^"]*android-arm64\.apk')" -o /tmp/mbr.apk && adb devices | awk 'NR > 1 && $2 == "device" { print $1 }' | xargs -I{} adb -s {} install -r /tmp/mbr.apk
+```
+
+**From source**, builds the APK and installs it on every device connected through adb (see [Building from source](#building-from-source)):
+```
+git clone https://github.com/andunieee/my-beloved-rubble && cd my-beloved-rubble && just android-install
+```
+An APK built this way is signed with your own key, so it can't replace an install of the release APK: uninstall that first.
+</details>
+
 ## The model
 
 Attach mbr to any folder (`mbr init`, or "Open Folder" in the GUI). From then on, whenever the folder is inspected (a scan), every regular file in it is moved into a hidden content-addressed store and replaced by a symlink, so it still opens like a normal file. Stored blobs are read-only: a program that writes into a file in place gets an error instead of silently changing content stored under its old hash (saving a new file over the name works, and is recorded as a new version):
@@ -113,26 +200,49 @@ Android support would build on syncing: phones would sync the metadata, then typ
 
 `mbr` is designed for power-users, but eventually a "simple mode" app can be developed that allows a non-tech family member, for example, to just share a bunch of pictures and they get all uploaded and synced.
 
-## Building
+## Releases
+
+Pushing a `v*` tag (`just release` tags the version in `Cargo.toml`) builds and publishes a GitHub release with `.tar.gz` archives for Linux and macOS (x86_64 and arm64), a Windows x86_64 installer, and an Android arm64 APK. Each archive holds both binaries, `mbr` and `my-beloved-rubble` (and a `My Beloved Rubble.app` bundle on macOS); the release also carries a `SHA256SUMS` file. Running the `release` workflow by hand builds the same artifacts without publishing a release.
+
+The Android APK is signed with a throwaway key unless the repository has `ANDROID_KEYSTORE_BASE64` (a base64-encoded keystore) and `ANDROID_KEYSTORE_PASSWORD` secrets, in which case that key is used so new APKs can upgrade earlier installs.
+
+## Building from source
+
+### Dependencies
+
+* Rust (stable)
+* Go: rclone is embedded through `librclone`, which builds it with `go build`; no separate `rclone` executable is needed at runtime
+* A C compiler and libclang (for bindgen)
+* On Linux, `pkg-config` and the fontconfig, freetype, X11, xkbcommon, OpenGL and Wayland development packages, e.g. on Debian/Ubuntu:
+  ```
+  sudo apt install pkg-config clang libclang-dev libfontconfig1-dev libfreetype6-dev libx11-dev libxkbcommon-dev libgl1-mesa-dev libwayland-dev
+  ```
+* On Windows, the `x86_64-pc-windows-gnu` Rust target and MinGW's GCC, since Go's C archive is MinGW-flavoured (see `.github/workflows/release.yml`)
+* For Android, the Android SDK and NDK (`ANDROID_HOME`, `ANDROID_NDK_ROOT`), a JDK, the `aarch64-linux-android` Rust target and `cargo install cargo-apk`
+* [just](https://just.systems), for the recipes below (optional, they are short)
+
+### Running
 
 ```
+just gui           # the GUI
+just cli --help    # the CLI
 cargo build --release   # target/release/mbr and target/release/my-beloved-rubble
 ```
+
+### Installing
+
+```
+just install          # both of the below
+just desktop-install  # mbr and my-beloved-rubble into ~/.cargo/bin, and the application menu on Linux
+just android-install  # builds the APK and installs it on every device connected through adb
+```
+
+`just android-install` signs the APK with the keystore in `CARGO_APK_RELEASE_KEYSTORE` (password in `CARGO_APK_RELEASE_KEYSTORE_PASSWORD`) if set, or else with `~/.android/debug.keystore`, which it creates if missing.
+
+### Screenshots
 
 The screenshots in `docs/static/screenshots` are rendered from the real UI over made-up data:
 
 ```
-cargo run --release --features screenshots --bin screenshots
+just screenshots
 ```
-
-Rclone is embedded through `librclone`; building requires a Go toolchain and C compiler, but no separate `rclone` executable is required at runtime.
-
-## Releases
-
-Pushing a `v*` tag builds and publishes a GitHub release with archives for Linux and macOS (x86_64 and arm64), a Windows x86_64 installer, and an Android arm64 APK. Each archive holds both binaries, `mbr` and `my-beloved-rubble` (and a `My Beloved Rubble.app` bundle on macOS); the release also carries a `SHA256SUMS` file. Running the `release` workflow by hand builds the same artifacts without publishing a release.
-
-The Android APK is signed with a throwaway key unless the repository has `ANDROID_KEYSTORE_BASE64` (a base64-encoded keystore) and `ANDROID_KEYSTORE_PASSWORD` secrets, in which case that key is used so new APKs can upgrade earlier installs.
-
-On Windows, enable **Developer Mode** (Settings → System → For developers) before using mbr: tracked files are stored as symlinks, which normal users can only create with that setting.
-
-On Linux the build needs `pkg-config`, `clang`/`libclang-dev` (for bindgen), and the fontconfig, freetype, X11, xkbcommon, OpenGL and Wayland development packages.
