@@ -22,13 +22,16 @@ desktop-install:
     if [ "$(uname -s)" = Linux ]; then
         apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
         mkdir -p "$apps"
+        icons="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps"
+        mkdir -p "$icons"
+        cp assets/icon.svg "$icons/computer.mybelovedrubble.svg"
         cat > "$apps/computer.mybelovedrubble.desktop" <<EOF
     [Desktop Entry]
     Type=Application
     Name=My Beloved Rubble
     Comment=Content-addressed folders with rclone remotes
     Exec=$bin/my-beloved-rubble
-    Icon=folder
+    Icon=computer.mybelovedrubble
     Terminal=false
     Categories=Utility;FileTools;
     EOF
@@ -109,3 +112,21 @@ release:
     git tag "$tag"
     git push origin "$tag"
     echo "pushed $tag"
+
+# render assets/icon.svg into the png and ico files every platform takes
+icons:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    resvg -w 512 assets/icon.svg assets/icon.png
+    tmp=$(mktemp -d)
+    for size in 16 24 32 48 64 128 256; do
+        resvg -w "$size" assets/icon.svg "$tmp/$size.png"
+    done
+    magick "$tmp"/{16,24,32,48,64,128,256}.png assets/icon.ico
+    rm -r "$tmp"
+    for density in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+        dir="android/res/mipmap-${density%:*}"
+        mkdir -p "$dir"
+        resvg -w "${density#*:}" assets/icon.svg "$dir/ic_launcher.png"
+    done
+    cp assets/icon.svg docs/static/icon.svg

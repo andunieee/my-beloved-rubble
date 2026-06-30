@@ -35,6 +35,8 @@ apk_name = "my-beloved-rubble"
 build_targets = ["aarch64-linux-android"]
 # rclone's shared library (see the android-build recipe in the justfile).
 runtime_libs = "runtime-libs"
+# The launcher icon, rendered from assets/icon.svg by `just icons`.
+resources = "res"
 
 [package.metadata.android.sdk]
 min_sdk_version = 26
@@ -42,6 +44,7 @@ target_sdk_version = 34
 
 [package.metadata.android.application]
 label = "My Beloved Rubble"
+icon = "@mipmap/ic_launcher"
 
 [package.metadata.android.application.activity]
 config_changes = "orientation|screenSize|screenLayout|keyboardHidden"

@@ -41,6 +41,7 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\my-beloved-rubble.exe
+SetupIconFile=..\..\assets\icon.ico
 MinVersion=10.0
 
 [Languages]

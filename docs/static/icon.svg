@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2f3542"/>
+      <stop offset="1" stop-color="#1c2029"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <!-- the rubble: each stone gets a dark rim first, so it stands apart from the ones behind it -->
+  <g stroke-linejoin="round">
+    <g id="a"><path d="M92 408 L104 344 L160 318 L222 334 L236 408 Z" stroke="#232833" stroke-width="30"/><path d="M92 408 L104 344 L160 318 L222 334 L236 408 Z" fill="#8a8f99" stroke="#8a8f99" stroke-width="18"/><path d="M104 344 L160 318 L222 334 L160 354 Z" fill="#fff" opacity="0.12"/></g>
+    <g><path d="M376 408 L384 352 L420 336 L436 372 L428 408 Z" stroke="#232833" stroke-width="30"/><path d="M376 408 L384 352 L420 336 L436 372 L428 408 Z" fill="#767b85" stroke="#767b85" stroke-width="18"/><path d="M384 352 L420 336 L436 372 L410 366 Z" fill="#fff" opacity="0.10"/></g>
+    <g><path d="M246 408 L238 330 L292 300 L352 312 L372 360 L364 408 Z" stroke="#232833" stroke-width="30"/><path d="M246 408 L238 330 L292 300 L352 312 L372 360 L364 408 Z" fill="#a39a8c" stroke="#a39a8c" stroke-width="18"/><path d="M238 330 L292 300 L352 312 L296 336 Z" fill="#fff" opacity="0.12"/></g>
+    <g><path d="M148 312 L156 262 L208 236 L262 252 L272 300 L226 322 Z" stroke="#232833" stroke-width="30"/><path d="M148 312 L156 262 L208 236 L262 252 L272 300 L226 322 Z" fill="#b8ad9c" stroke="#b8ad9c" stroke-width="18"/><path d="M156 262 L208 236 L262 252 L206 274 Z" fill="#fff" opacity="0.14"/></g>
+    <g><path d="M282 294 L276 248 L318 224 L362 240 L370 290 L330 304 Z" stroke="#232833" stroke-width="30"/><path d="M282 294 L276 248 L318 224 L362 240 L370 290 L330 304 Z" fill="#8f949e" stroke="#8f949e" stroke-width="18"/><path d="M276 248 L318 224 L362 240 L318 260 Z" fill="#fff" opacity="0.12"/></g>
+  </g>
+  <!-- the beloved one, resting on top -->
+  <path d="M262 226 C 220 198, 198 164, 220 138 C 238 118, 258 128, 262 144 C 266 128, 286 118, 304 138 C 326 164, 304 198, 262 226 Z" fill="#e0a94f" stroke="#e0a94f" stroke-width="10" stroke-linejoin="round"/>
+  <path d="M228 146 C 238 134, 250 138, 254 150" fill="none" stroke="#fff" stroke-opacity="0.35" stroke-width="8" stroke-linecap="round"/>
+</svg>
