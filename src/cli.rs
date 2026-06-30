@@ -361,7 +361,7 @@ fn ls(repo: &mut Repo) -> Result<(), String> {
         };
         let mut notes = Vec::new();
         if s.copies() < min_copies {
-            notes.push(format!("AT RISK: {} of {min_copies} copies", s.copies()));
+            notes.push(format!("{} of {min_copies} copies", s.copies()));
         }
         if !s.other_names.is_empty() {
             notes.push(format!("={}", s.other_names.join("=")));

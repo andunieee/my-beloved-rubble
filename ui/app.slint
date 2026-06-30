@@ -1543,8 +1543,7 @@ export component AppWindow inherits Window {
                             }
                             DetailLine {
                                 label: "copies";
-                                value: root.files[root.detail-index].copies + " of " + root.min-copies + " wanted"
-                                    + (root.files[root.detail-index].at-risk ? " — AT RISK" : "");
+                                value: root.files[root.detail-index].copies + " of " + root.min-copies + " wanted";
                             }
                             if root.files[root.detail-index].other-names != "": DetailLine {
                                 label: "also as";
@@ -1718,6 +1717,8 @@ width: Side.text-width;
                                 alignment: start;
                                 Button {
                                     text: "Test";
+                                    primary: true;
+                                    enabled: !root.busy;
                                     clicked => { root.testing-password = true; }
                                 }
                             }
