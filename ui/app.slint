@@ -156,6 +156,10 @@ component DetailLine inherits HorizontalLayout {
 // area always resets it), so buttons are drawn here, Fluent-like.
 component Button {
     in property <string> text;
+    // SVG path commands on a 24×24 grid, drawn instead of the text (which
+    // stays the accessible label). Icons are paths, not glyphs: Android's
+    // fonts lack most symbols.
+    in property <string> icon;
     in property <bool> primary;
     in property <bool> enabled: true;
     callback clicked();
@@ -163,7 +167,7 @@ component Button {
     private property <brush> text-color: !root.enabled ? Palette.foreground.transparentize(55%)
         : root.primary ? Palette.accent-foreground : Palette.control-foreground;
 
-    min-width: max(32px, label.preferred-width + 24px);
+    min-width: root.icon != "" ? 32px : max(32px, label.preferred-width + 24px);
     min-height: max(32px, label.preferred-height + 10px);
     preferred-width: self.min-width;
     preferred-height: self.min-height;
@@ -193,10 +197,21 @@ component Button {
 
     label := Text {
         text: root.text;
+        visible: root.icon == "";
         color: root.text-color;
         horizontal-alignment: center;
         vertical-alignment: center;
         accessible-role: none;
+    }
+
+    if root.icon != "": Path {
+        width: 16px;
+        height: 16px;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: root.icon;
+        stroke: root.text-color;
+        stroke-width: 2px;
     }
 
     touch := TouchArea {
@@ -710,7 +725,8 @@ export component AppWindow inherits Window {
                     clicked => { root.open-folder(); }
                 }
                 Button {
-                    text: root.compact ? "↻" : "Rescan";
+                    text: "Rescan";
+                    icon: root.compact ? "M 21 12 A 9 9 0 1 1 12 3 C 14.52 3 16.93 4 18.74 5.74 L 21 8 M 21 3 L 21 8 L 16 8" : "";
                     enabled: root.folder != "" && !root.busy;
                     clicked => { root.rescan(); }
                 }
@@ -1014,14 +1030,16 @@ export component AppWindow inherits Window {
                                     spacing: 10px;
 
                                     // local presence dot
-                                    Text {
-                                        text: file.present ? "●" : "○";
-                                        color: file.present
-                                            ? #2fbf71
-                                            : #e05f5f;
-                                        font-size: 13px;
-                                        vertical-alignment: center;
+                                    Rectangle {
                                         width: 14px;
+                                        Rectangle {
+                                            width: 9px;
+                                            height: 9px;
+                                            border-radius: 4.5px;
+                                            border-width: 1.5px;
+                                            border-color: file.present ? #2fbf71 : #e05f5f;
+                                            background: file.present ? #2fbf71 : transparent;
+                                        }
                                     }
                                     Rectangle {
                                         width: 32px;
@@ -1911,11 +1929,24 @@ width: Side.text-width;
                 padding-right: 16px;
                 spacing: 8px;
 
-                if root.busy: Text {
-                    text: "⧗ working…";
-                    font-size: 12px;
-                    vertical-alignment: center;
-                    color: #e0a94f;
+                if root.busy: HorizontalLayout {
+                    spacing: 4px;
+                    Path {
+                        width: 12px;
+                        height: 12px;
+                        y: (parent.height - self.height) / 2;
+                        viewbox-width: 24;
+                        viewbox-height: 24;
+                        commands: "M 5 2 L 19 2 M 5 22 L 19 22 M 7 2 L 7 6 L 12 12 L 7 18 L 7 22 M 17 2 L 17 6 L 12 12 L 17 18 L 17 22";
+                        stroke: #e0a94f;
+                        stroke-width: 1.5px;
+                    }
+                    Text {
+                        text: "working…";
+                        font-size: 12px;
+                        vertical-alignment: center;
+                        color: #e0a94f;
+                    }
                 }
                 Text {
                     text: root.status-text;
@@ -1947,12 +1978,16 @@ width: Side.text-width;
         TouchArea {
             clicked => { root.viewer-open = false; }
         }
-        Text {
+        Path {
             x: parent.width - self.width - 16px;
-            y: 12px;
-            text: "✕";
-            font-size: 22px;
-            color: white;
+            y: 16px;
+            width: 20px;
+            height: 20px;
+            viewbox-width: 24;
+            viewbox-height: 24;
+            commands: "M 4 4 L 20 20 M 20 4 L 4 20";
+            stroke: white;
+            stroke-width: 2.5px;
         }
     }
 }
