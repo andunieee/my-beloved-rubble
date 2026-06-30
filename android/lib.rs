@@ -23,6 +23,7 @@ fn android_main(app: AndroidApp) {
         unsafe { std::env::set_var("TMPDIR", &tmp) };
         mbr::state::AppState::use_app_dir(dir);
     }
+    gui::use_activity(&app);
     if let Err(e) = slint::android::init(app) {
         log::error!("cannot start: {e}");
         return;

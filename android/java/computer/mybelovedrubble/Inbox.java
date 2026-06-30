@@ -106,9 +106,12 @@ public class Inbox extends Activity {
                     Toast.makeText(this, failures + " file(s) could not be added", Toast.LENGTH_LONG).show();
                 }
                 if (shared) {
+                    // Back to the app's activity, not a second one on top of
+                    // it: shared from the app itself, this one is in its task.
                     Intent app = getPackageManager().getLaunchIntentForPackage(getPackageName());
                     if (app != null) {
-                        startActivity(app.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                        startActivity(app.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                            | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP));
                     }
                 }
                 finish();

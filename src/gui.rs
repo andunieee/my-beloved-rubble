@@ -591,6 +591,12 @@ mod platform {
         objects::{JObject, JValue},
     };
 
+    /// The app's activity (see [`super::use_activity`]): ndk_context only
+    /// knows the Application, which can't start activities in its task.
+    #[cfg(target_os = "android")]
+    pub static ANDROID_APP: std::sync::OnceLock<slint::android::AndroidApp> =
+        std::sync::OnceLock::new();
+
     /// Run `f` with the JNI environment and the activity, turning a Java
     /// exception into an error (cleared, so later calls into Java work).
     #[cfg(target_os = "android")]
@@ -601,7 +607,10 @@ mod platform {
         let ctx = ndk_context::android_context();
         let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.map_err(fail)?;
         let mut env = vm.attach_current_thread().map_err(fail)?;
-        let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
+        let activity = ANDROID_APP
+            .get()
+            .map_or(ctx.context(), |app| app.activity_as_ptr());
+        let activity = unsafe { JObject::from_raw(activity.cast()) };
         let result = f(&mut env, &activity);
         if let Ok(thrown) = env.exception_occurred()
             && !thrown.is_null()
@@ -676,7 +685,13 @@ mod platform {
             .call_method(&files_dir, "getPath", "()Ljava/lang/String;", &[])?
             .l()?;
         let files_dir = PathBuf::from(String::from(env.get_string(&files_dir.into())?));
-        let relative = path.strip_prefix(&files_dir).unwrap_or(path);
+        // The folders may be under another name of it: /data/data/<app>
+        // rather than /data/user/0/<app>, a link to it.
+        let canonical = files_dir.canonicalize().unwrap_or_default();
+        let relative = path
+            .strip_prefix(&files_dir)
+            .or_else(|_| path.strip_prefix(&canonical))
+            .unwrap_or(path);
         let builder = env.new_object("android/net/Uri$Builder", "()V", &[])?;
         for (method, value) in [
             ("scheme", "content".to_owned()),
@@ -750,16 +765,6 @@ mod platform {
                 "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;",
                 &[JValue::Object(&package), JValue::Object(&class)],
             )?;
-            // The context isn't always the activity itself, which then
-            // can't start one in its own task: the Inbox joins it anyway,
-            // having its affinity.
-            const FLAG_ACTIVITY_NEW_TASK: i32 = 0x1000_0000;
-            env.call_method(
-                &intent,
-                "addFlags",
-                "(I)Landroid/content/Intent;",
-                &[JValue::Int(FLAG_ACTIVITY_NEW_TASK)],
-            )?;
             start_activity(env, activity, &intent)
         })
     }
@@ -781,6 +786,12 @@ fn app_folders() -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// Start other apps, and ask the system for things, from `app`'s activity.
+#[cfg(target_os = "android")]
+pub fn use_activity(app: &slint::android::AndroidApp) {
+    platform::ANDROID_APP.set(app.clone()).ok();
 }
 
 /// Run the app: on the desktop from `main`, on Android once the activity
