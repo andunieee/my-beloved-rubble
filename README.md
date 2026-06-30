@@ -192,14 +192,6 @@ A folder can live on several devices that sync its metadata over [iroh](https://
 
 A sync is iroh-docs set reconciliation of the entries, then an exchange of the few values entries point at (settings, remotes); the newest entry of each key wins, whichever device wrote it. Synced changes become links in the folder (dangling until downloaded from a remote), except for files changed locally since the last scan, which the next scan records as the newest change. Blob content never travels between devices, and neither does the master password: each device types it, checked against the check in the metadata.
 
-## Future plans
-
-The goal is to have a bunch more options to make it easier to deal with large numbers of files and automate their backups, checking and custom rules.
-
-Android support would build on syncing: phones would sync the metadata, then type the password and gain access to all the files, downloading them directly from the remotes, and add new files by reusing the rclone configurations of the other machines to upload them.
-
-`mbr` is designed for power-users, but eventually a "simple mode" app can be developed that allows a non-tech family member, for example, to just share a bunch of pictures and they get all uploaded and synced.
-
 ## Releases
 
 Pushing a `v*` tag (`just release` tags the version in `Cargo.toml`) builds and publishes a GitHub release with `.tar.gz` archives for Linux and macOS (x86_64 and arm64), a Windows x86_64 installer, and an Android arm64 APK. Each archive holds both binaries, `mbr` and `my-beloved-rubble` (and a `My Beloved Rubble.app` bundle on macOS); the release also carries a `SHA256SUMS` file. Running the `release` workflow by hand builds the same artifacts without publishing a release.
