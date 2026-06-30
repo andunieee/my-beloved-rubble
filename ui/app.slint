@@ -511,10 +511,15 @@ export component AppWindow inherits Window {
     in-out property <string> new-folder-name: "";
     // A phone-sized window: the main area and the side panel take turns
     // filling it, `show-panel` saying which.
-    out property <bool> compact: root.width < 720px;
+    // Set from `width` rather than bound to it: a binding would make the
+    // window's layout info depend on `compact` and `compact` on that layout
+    // info, which Slint reports as a binding loop.
+    out property <bool> compact: false;
     in-out property <bool> show-panel: false;
+    init => { root.compact = root.width < 720px; }
     changed compact => { root.sidebar-width = root.compact ? root.width : 460px; }
     changed width => {
+        root.compact = root.width < 720px;
         if (root.compact) {
             root.sidebar-width = root.width;
         }
