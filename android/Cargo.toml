@@ -1,5 +1,5 @@
 # The Android app: the GUI of src/gui.rs as a native activity. Build it
-# with android/build.sh (see the README).
+# with `just android-build` (see the README).
 # Its own workspace: cargo-apk wants a package that isn't part of the
 # main one.
 [workspace]
@@ -33,7 +33,7 @@ slint-build = "1.11"
 package = "computer.mybelovedrubble"
 apk_name = "my-beloved-rubble"
 build_targets = ["aarch64-linux-android"]
-# rclone's shared library (see build.sh).
+# rclone's shared library (see the android-build recipe in the justfile).
 runtime_libs = "runtime-libs"
 
 [package.metadata.android.sdk]

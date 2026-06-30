@@ -1,5 +1,5 @@
 #!/bin/sh
-# Stands in for `go` while building the Android app (see android/build.sh).
+# Stands in for `go` while building the Android app (see the android-build recipe in the justfile).
 #
 # librclone-sys builds rclone with
 #   go build --buildmode=c-archive -o <out>/librclone.a <package>

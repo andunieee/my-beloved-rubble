@@ -36,10 +36,32 @@ desktop-install:
     fi
     echo "installed $bin/mbr and $bin/my-beloved-rubble"
 
-# build the arm64 apk and install it on every android device connected through adb
-android-install:
+# build the arm64 apk, or run it on the connected device with `just android-build run`
+android-build action="build":
     #!/usr/bin/env bash
     set -euo pipefail
+    cd android
+
+    : "${ANDROID_HOME:=/opt/android-sdk}"
+    : "${ANDROID_NDK_ROOT:=$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1)}"
+    export ANDROID_HOME ANDROID_NDK_ROOT
+    api=26
+    toolchain="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+    export GOOS=android GOARCH=arm64 CGO_ENABLED=1
+    export CC="$toolchain/aarch64-linux-android$api-clang"
+    # Go builds rclone as a shared library on Android: go-shim/go turns
+    # librclone-sys's request for a static one into that, here.
+    REAL_GO=$(command -v go)
+    export REAL_GO
+    export RCLONE_LIB_DIR="$PWD/runtime-libs/arm64-v8a"
+    export AR_FOR_RCLONE="$toolchain/llvm-ar"
+    export PATH="$PWD/go-shim:$PATH"
+    # Only Go and the Android target may use the NDK's compiler.
+    export HOST_CC=cc
+    # bindgen reads librclone's header for the Android target.
+    export BINDGEN_EXTRA_CLANG_ARGS="--sysroot=$toolchain/../sysroot"
+
     # signed with CARGO_APK_RELEASE_KEYSTORE if set, otherwise with ~/.android/debug.keystore,
     # which can't upgrade an install of the github release apk (uninstall that first)
     if [ -z "${CARGO_APK_RELEASE_KEYSTORE:-}" ]; then
@@ -52,12 +74,18 @@ android-install:
                 -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
         fi
     fi
+
+    cargo apk {{action}} --release --lib
+
+# build the arm64 apk and install it on every android device connected through adb
+android-install: android-build
+    #!/usr/bin/env bash
+    set -euo pipefail
     devices=$(adb devices | awk 'NR > 1 && $2 == "device" { print $1 }')
     if [ -z "$devices" ]; then
         echo "no android device connected through adb" >&2
         exit 1
     fi
-    android/build.sh build
     target=$(cd android && cargo metadata --no-deps --format-version 1 | jq -r .target_directory)
     apk="$target/release/apk/my-beloved-rubble.apk"
     for device in $devices; do

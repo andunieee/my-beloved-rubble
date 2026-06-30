@@ -215,6 +215,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - uses: extractions/setup-just@v3
+
       # cargo-apk drives the SDK's aapt/apksigner/keytool, which run on a JDK.
       - uses: actions/setup-java@v6
         with:
@@ -273,7 +275,7 @@ jobs:
           echo "CARGO_APK_RELEASE_KEYSTORE_PASSWORD=$password" >> "$GITHUB_ENV"
 
       - name: build APK
-        run: ./android/build.sh build
+        run: just android-build
 
       - name: package APK
         run: |
