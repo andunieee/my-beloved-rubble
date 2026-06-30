@@ -1435,6 +1435,7 @@ fn sync(repo: &mut Repo, watch: bool) -> Result<(), String> {
             Event::Refused { peer } => {
                 println!("device {peer} tried to sync: `mbr peer add {peer}` to sync with it")
             }
+            Event::Discovered { .. } | Event::Gone { .. } => {}
         }
     }
 }

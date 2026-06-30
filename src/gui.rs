@@ -175,7 +175,12 @@ impl Msg {
     /// Whether handling the message may change what the views show
     /// beyond what it updates itself.
     fn changes_the_folder(&self) -> bool {
-        !matches!(self, Msg::Thumb { .. } | Msg::Preview { .. })
+        !matches!(
+            self,
+            Msg::Thumb { .. }
+                | Msg::Preview { .. }
+                | Msg::Peer(peers::Event::Discovered { .. } | peers::Event::Gone { .. })
+        )
     }
 }
 
@@ -302,6 +307,9 @@ struct App {
     peer_status: RefCell<BTreeMap<String, (String, bool)>>,
     /// Devices that tried to sync but aren't peers.
     knocking: RefCell<BTreeSet<String>>,
+    /// mbr devices found on the local network, by id: their suggested
+    /// names, if they say.
+    nearby: RefCell<BTreeMap<String, String>>,
     /// A sync brought changes in during a scan: applied once it ends.
     sync_pending: Cell<bool>,
     /// Previews of image files, by blob hash, for the file list.
@@ -595,6 +603,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
         node: RefCell::new(None),
         peer_status: RefCell::new(BTreeMap::new()),
         knocking: RefCell::new(BTreeSet::new()),
+        nearby: RefCell::new(BTreeMap::new()),
         sync_pending: Cell::new(false),
         thumbs: RefCell::default(),
         no_thumb: RefCell::default(),
@@ -902,6 +911,10 @@ pub fn run() -> Result<(), slint::PlatformError> {
     }
     {
         let app = app.clone();
+        w.on_peers_visible(move |visible| app.peers_visible(visible));
+    }
+    {
+        let app = app.clone();
         w.on_remove_peer(move |id| app.remove_peer(&id));
     }
     {
@@ -1082,6 +1095,7 @@ impl App {
         *self.selection.borrow_mut() = Selection::default();
         self.peer_status.borrow_mut().clear();
         self.knocking.borrow_mut().clear();
+        self.nearby.borrow_mut().clear();
         self.sync_pending.set(false);
         self.close_editor();
         self.start_node();
@@ -1097,6 +1111,9 @@ impl App {
         *self.selection.borrow_mut() = Selection::default();
         self.close_editor();
         self.reset_setup_ui();
+        self.peer_status.borrow_mut().clear();
+        self.knocking.borrow_mut().clear();
+        self.nearby.borrow_mut().clear();
         self.refresh();
     }
 
@@ -1857,7 +1874,30 @@ impl App {
 
     // ── peers ──
 
-    /// Start syncing the open folder with its peers, if it has any.
+    /// Listen for devices on the local network while the Peers tab is
+    /// shown, even with no peers yet, and stop again when it is left (a
+    /// folder with peers keeps syncing regardless).
+    fn peers_visible(&self, visible: bool) {
+        if visible {
+            if self.node.borrow().is_none() {
+                self.start_node();
+            } else {
+                self.refresh_peers();
+            }
+            return;
+        }
+        let has_peers = self
+            .root()
+            .is_some_and(|root| !self.state.borrow().repo(&root).peers.is_empty());
+        if !has_peers {
+            *self.node.borrow_mut() = None;
+            self.nearby.borrow_mut().clear();
+        }
+        self.refresh_peers();
+    }
+
+    /// Start syncing the open folder with its peers (and, while the Peers
+    /// tab is open, listening for devices on the local network).
     fn start_node(&self) {
         *self.node.borrow_mut() = None;
         let Some(root) = self.root() else { return };
@@ -1868,8 +1908,10 @@ impl App {
             (key, repo_state.peers.keys().cloned().collect::<Vec<_>>())
         };
         self.save_state();
-        // No network activity for folders that aren't synced.
-        if ids.is_empty() {
+        // No network activity for folders that aren't synced, unless the
+        // Peers tab is open: then listen for devices to suggest on the
+        // local network.
+        if ids.is_empty() && self.window.get_active_tab() != 3 {
             return;
         }
         let Some(shared) = self.repo.borrow().as_ref().map(|r| r.db.shared()) else {
@@ -1968,7 +2010,7 @@ impl App {
             .keys()
             .cloned()
             .collect();
-        if ids.is_empty() {
+        if ids.is_empty() && self.window.get_active_tab() != 3 {
             *self.node.borrow_mut() = None;
         } else if let Some(node) = self.node.borrow().as_ref() {
             node.set_peers(&ids);
@@ -2015,6 +2057,20 @@ impl App {
                     self.knocking.borrow_mut().insert(peer);
                 }
             }
+            peers::Event::Discovered { peer, name } => {
+                let changed = match self.nearby.borrow_mut().insert(peer, name.clone()) {
+                    None => true,
+                    Some(previous) => previous != name,
+                };
+                if changed {
+                    self.refresh_peers();
+                }
+            }
+            peers::Event::Gone { peer } => {
+                if self.nearby.borrow_mut().remove(&peer).is_some() {
+                    self.refresh_peers();
+                }
+            }
         }
     }
 
@@ -2050,6 +2106,8 @@ impl App {
         let Some(root) = self.root() else {
             w.set_device_id(SharedString::default());
             w.set_peer_rows(ModelRc::default());
+            w.set_nearby_peers(ModelRc::default());
+            w.set_discovering(false);
             w.set_peer_count(0);
             return;
         };
@@ -2088,6 +2146,23 @@ impl App {
         }));
         w.set_peer_count(known.len() as i32);
         w.set_peer_rows(ModelRc::new(VecModel::from(rows)));
+
+        let self_id = peers::device_id(&key);
+        let knocking = self.knocking.borrow();
+        let nearby: Vec<NearbyPeer> = self
+            .nearby
+            .borrow()
+            .iter()
+            .filter(|(id, _)| {
+                **id != self_id && !known.contains_key(*id) && !knocking.contains(*id)
+            })
+            .map(|(id, name)| NearbyPeer {
+                id: id.as_str().into(),
+                name: name.as_str().into(),
+            })
+            .collect();
+        w.set_nearby_peers(ModelRc::new(VecModel::from(nearby)));
+        w.set_discovering(self.node.borrow().is_some() && w.get_active_tab() == 3);
     }
 
     /// Snapshot the metadata here, then encrypt and upload it to every

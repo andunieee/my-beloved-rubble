@@ -52,6 +52,12 @@ export struct PeerRow {
     knocking: bool,
 }
 
+// An mbr device found on the local network, not yet a peer.
+export struct NearbyPeer {
+    id: string,
+    name: string,
+}
+
 // One input of the per-backend setup form.
 export struct FormField {
     key: string,
@@ -521,7 +527,10 @@ export component AppWindow inherits Window {
     in-out property <bool> has-detail-text: false;
     // The detail preview, filling the window.
     in-out property <bool> viewer-open: false;
-    changed active-tab => { root.show-panel = false; }
+    changed active-tab => {
+        root.show-panel = false;
+        root.peers-visible(root.active-tab == 3);
+    }
     in-out property <[FileRow]> files: [];
     in-out property <[RemoteRow]> remotes: [];
     in-out property <[string]> remote-names: [];
@@ -556,6 +565,9 @@ export component AppWindow inherits Window {
     in-out property <string> device-id: "";
     in-out property <[PeerRow]> peer-rows: [];
     in-out property <int> peer-count: 0;
+    // Devices found on this local network, to suggest adding them.
+    in-out property <[NearbyPeer]> nearby-peers: [];
+    in-out property <bool> discovering: false;
     in-out property <string> peer-new-id: "";
     in-out property <string> peer-new-name: "";
 
@@ -663,6 +675,8 @@ export component AppWindow inherits Window {
     callback add-peer(id: string, name: string);
     callback remove-peer(id: string);
     callback sync-peers();
+    // The Peers tab (and so the add-peer screen) was opened or closed.
+    callback peers-visible(visible: bool);
     // a folder that isn't an mbr folder yet
     callback start-new();
     // the encrypted backup to restore from
@@ -1328,7 +1342,7 @@ export component AppWindow inherits Window {
                     if root.folder != "" && root.active-tab == 3 && root.peer-rows.length == 0: Rectangle {
                         vertical-stretch: 1;
                         Text {
-                            text: "Add a device on the right; it has to add this one too.";
+                            text: "Add a device on the right; it has to add this one too. Devices on this local network appear there automatically.";
                             font-size: 14px;
                             horizontal-alignment: center;
                             color: Palette.foreground.transparentize(40%);
@@ -1787,6 +1801,52 @@ width: Side.text-width;
                             SectionTitle { text: "ADD A PEER"; help: "peers/#adding-a-device"; }
                             Hint {
                                 text: "Syncing starts once both devices have added each other. A folder with no files yet joins the other's; two folders that both have files never merge. The master password is not sent: type it on each device.";
+                            }
+                            if root.nearby-peers.length > 0: VerticalLayout {
+                                spacing: 6px;
+                                Text {
+                                    text: "ON THIS LOCAL NETWORK";
+                                    font-size: 11px;
+                                    font-weight: 600;
+                                    color: Palette.foreground.transparentize(30%);
+                                }
+                                for peer in root.nearby-peers: Rectangle {
+                                    border-width: 1px;
+                                    border-color: Palette.border;
+                                    border-radius: 6px;
+                                    background: Palette.background.darker(0.02);
+                                    height: nearby-row.preferred-height;
+
+                                    nearby-row := HorizontalLayout {
+                                        padding: 8px;
+                                        spacing: 8px;
+                                        VerticalLayout {
+                                            horizontal-stretch: 1;
+                                            spacing: 1px;
+                                            Text {
+                                                text: peer.name != "" ? peer.name : "A device on this network";
+                                                font-size: 12px;
+                                                font-weight: 600;
+                                                overflow: elide;
+                                            }
+                                            Text {
+                                                text: peer.id;
+                                                font-size: 11px;
+                                                overflow: elide;
+                                                color: Palette.foreground.transparentize(35%);
+                                            }
+                                        }
+                                        Button {
+                                            text: "Add";
+                                            primary: true;
+                                            enabled: !root.busy;
+                                            clicked => { root.add-peer(peer.id, peer.name); }
+                                        }
+                                    }
+                                }
+                            }
+                            if root.nearby-peers.length == 0 && root.discovering: Hint {
+                                text: "Looking for mbr devices on this local network…";
                             }
                             LineEdit {
                                 placeholder-text: "its id";

@@ -223,9 +223,12 @@ pub fn run(out: &Path) -> Result<(), slint::PlatformError> {
         ("unreachable (offline, or not running mbr)".into(), false),
     );
     app.knocking.borrow_mut().insert(desktop);
+    app.nearby
+        .borrow_mut()
+        .insert(peers::device_id(&[4u8; 32]), "studio-laptop".into());
+    app.window.set_active_tab(3);
     app.refresh();
     app.window.set_folder(DISPLAY_PATH.into());
-    app.window.set_active_tab(3);
     app.window
         .set_status_text("Synced: 3 file(s) updated".into());
     s.shoot("peers");
@@ -295,6 +298,7 @@ fn new_app() -> App {
         node: RefCell::new(None),
         peer_status: RefCell::new(BTreeMap::new()),
         knocking: RefCell::new(BTreeSet::new()),
+        nearby: RefCell::new(BTreeMap::new()),
         sync_pending: Cell::new(false),
         thumbs: RefCell::default(),
         no_thumb: RefCell::default(),

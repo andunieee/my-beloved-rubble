@@ -4756,6 +4756,7 @@ dependencies = [
  "libc",
  "librclone",
  "log",
+ "n0-future",
  "open",
  "png",
  "postcard",

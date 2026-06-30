@@ -28,11 +28,13 @@
 //! [iroh]: https://iroh.computer
 
 use crate::db::Shared;
-use iroh::address_lookup::MemoryLookup;
+use iroh::address_lookup::{MemoryLookup, UserData};
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt, presets};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use iroh_docs::SyncOutcome;
 use iroh_docs::sync::ProtocolMessage;
+use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
+use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -40,6 +42,9 @@ use std::time::Duration;
 
 /// The sync protocol, as iroh negotiates it.
 pub const ALPN: &[u8] = b"mbr/sync/0";
+/// The mDNS service name mbr devices advertise, so discovery finds other
+/// mbr devices rather than every iroh endpoint on the network.
+const MDNS_SERVICE: &str = "mbr";
 /// The largest message accepted.
 const MAX_MESSAGE: usize = 64 << 20;
 /// How long finding and reaching a peer may take.
@@ -68,6 +73,11 @@ pub enum Event {
     Failed { peer: String, error: String },
     /// A device that isn't a peer tried to sync: add it to sync with it.
     Refused { peer: String },
+    /// A device running mbr was found on the local network. `name` is what
+    /// it calls itself, if it says.
+    Discovered { peer: String, name: String },
+    /// A discovered device stopped announcing itself.
+    Gone { peer: String },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -128,6 +138,21 @@ pub fn check_device_id(id: &str) -> Result<String, String> {
         .map_err(|_| format!("'{}' is not a device id", id.trim()))
 }
 
+/// What this device calls itself in discovery, if anything: a hostname,
+/// so other devices can suggest a friendlier name than the id.
+fn local_name() -> Option<UserData> {
+    let name = ["MBR_DEVICE_NAME", "HOSTNAME", "COMPUTERNAME"]
+        .iter()
+        .find_map(|key| std::env::var(key).ok())
+        .or_else(|| std::fs::read_to_string("/proc/sys/kernel/hostname").ok())
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    UserData::try_from(name.to_owned()).ok()
+}
+
 type Listener = Arc<dyn Fn(Event) + Send + Sync>;
 
 /// The folder's iroh endpoint: accepts syncs from its peers, and syncs
@@ -159,24 +184,40 @@ impl Node {
             .build()
             .map_err(|e| e.to_string())?;
         let known = MemoryLookup::new();
-        let endpoint = rt.block_on(async {
-            let endpoint = Endpoint::builder(presets::N0)
+        let (endpoint, mdns) = rt.block_on(async {
+            let mut builder = Endpoint::builder(presets::N0)
                 .secret_key(SecretKey::from_bytes(&key))
                 .alpns(vec![ALPN.to_vec()])
-                .address_lookup(known.clone())
+                .address_lookup(known.clone());
+            if let Some(name) = local_name() {
+                builder = builder.user_data_for_address_lookup(name);
+            }
+            let endpoint = builder
                 .bind()
                 .await
                 .map_err(|e| format!("cannot start syncing: {e}"))?;
             // Peers on the same network find each other without the
             // internet, where the network allows it.
-            match iroh_mdns_address_lookup::MdnsAddressLookup::builder().build(endpoint.id()) {
+            let mdns = match MdnsAddressLookup::builder()
+                .service_name(MDNS_SERVICE)
+                .build(endpoint.id())
+            {
                 Ok(mdns) => match endpoint.address_lookup() {
-                    Ok(lookup) => lookup.add(mdns),
-                    Err(e) => log::warn!("no local network discovery: {e}"),
+                    Ok(lookup) => {
+                        lookup.add(mdns.clone());
+                        Some(mdns)
+                    }
+                    Err(e) => {
+                        log::warn!("no local network discovery: {e}");
+                        None
+                    }
                 },
-                Err(e) => log::warn!("no local network discovery: {e}"),
-            }
-            Ok::<_, String>(endpoint)
+                Err(e) => {
+                    log::warn!("no local network discovery: {e}");
+                    None
+                }
+            };
+            Ok::<_, String>((endpoint, mdns))
         })?;
         let node = Self {
             rt,
@@ -193,6 +234,33 @@ impl Node {
             node.peers.clone(),
             node.listener.clone(),
         ));
+        if let Some(mdns) = mdns {
+            let listener = node.listener.clone();
+            let known = node.known.clone();
+            node.rt.spawn(async move {
+                let mut events = mdns.subscribe().await;
+                while let Some(event) = events.next().await {
+                    match event {
+                        DiscoveryEvent::Discovered { endpoint_info, .. } => {
+                            // Keep the address, so adding the device can
+                            // sync with it even if its mDNS record expires.
+                            known.add_endpoint_info(endpoint_info.to_endpoint_addr());
+                            listener(Event::Discovered {
+                                peer: endpoint_info.endpoint_id.to_string(),
+                                name: endpoint_info
+                                    .user_data()
+                                    .map(|name| name.to_string())
+                                    .unwrap_or_default(),
+                            });
+                        }
+                        DiscoveryEvent::Expired { endpoint_id } => listener(Event::Gone {
+                            peer: endpoint_id.to_string(),
+                        }),
+                        _ => {}
+                    }
+                }
+            });
+        }
         Ok(node)
     }
 
