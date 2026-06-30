@@ -519,6 +519,8 @@ export component AppWindow inherits Window {
     in-out property <[RemoteRow]> remotes: [];
     in-out property <[string]> remote-names: [];
     in-out property <string> status-text: "Open a folder to get started";
+    // 0 = info, 1 = success, 2 = warning, 3 = error.
+    in-out property <int> status-level: 0;
     in-out property <bool> busy: false;
     // 0 = Blobs, 1 = Remotes, 2 = Settings, 3 = Peers.
     in-out property <int> active-tab: 0;
@@ -1920,9 +1922,25 @@ width: Side.text-width;
         Rectangle { height: 1px; background: Palette.border; }
 
         // ══ Status bar ══
-        Rectangle {
+        status-bar := Rectangle {
+            private property <color> level-color: root.status-level == 1 ? #3fa45b
+                : root.status-level == 2 ? #d9822b
+                : root.status-level == 3 ? #d64545
+                : #5b8def;
             height: 30px;
-            background: Palette.background.darker(0.06);
+            background: root.status-text == "" ? Palette.background.darker(0.06)
+                : Palette.background.darker(0.06).mix(self.level-color, 0.88);
+
+            // Tapping the message dismisses it.
+            TouchArea {
+                mouse-cursor: root.status-text == "" ? default : pointer;
+                clicked => { root.status-text = ""; }
+            }
+            if root.status-text != "": Rectangle {
+                x: 0;
+                width: 4px;
+                background: parent.level-color;
+            }
 
             HorizontalLayout {
                 padding-left: 16px;
@@ -1948,12 +1966,20 @@ width: Side.text-width;
                         color: #e0a94f;
                     }
                 }
+                if root.status-text != "": Rectangle {
+                    width: 8px;
+                    height: 8px;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 4px;
+                    background: status-bar.level-color;
+                }
                 Text {
                     text: root.status-text;
                     font-size: 12px;
                     vertical-alignment: center;
                     overflow: elide;
                     horizontal-stretch: 1;
+                    color: root.status-level == 3 ? status-bar.level-color : Palette.foreground;
                 }
             }
         }

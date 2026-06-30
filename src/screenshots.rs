@@ -302,6 +302,7 @@ fn new_app() -> App {
         previewed: RefCell::new(None),
         setup: RefCell::new(None),
         pending_folder: RefCell::new(None),
+        status_timer: slint::Timer::default(),
     };
 
     let titles: Vec<SharedString> = backends::offered()
@@ -484,11 +485,20 @@ fn picture(subject: &str, path: &Path) -> Option<Vec<u8>> {
             }
         }),
         "pasteis" => RgbImage::from_fn(w, h, |x, y| {
-            let tarts = [(130.0, 120.0), (300.0, 110.0), (210.0, 230.0), (380.0, 230.0)];
+            let tarts = [
+                (130.0, 120.0),
+                (300.0, 110.0),
+                (210.0, 230.0),
+                (380.0, 230.0),
+            ];
             match tarts.iter().find(|(cx, cy)| near(x, y, *cx, *cy, 72.0)) {
                 Some((cx, cy)) if near(x, y, *cx, *cy, 50.0) => {
                     let burnt = ((x * 7 + y * 13) % 97) < 9;
-                    if burnt { Rgb([96, 52, 18]) } else { Rgb([238, 186, 72]) }
+                    if burnt {
+                        Rgb([96, 52, 18])
+                    } else {
+                        Rgb([238, 186, 72])
+                    }
                 }
                 Some(_) => Rgb([205, 140, 60]),
                 None => mix([240, 236, 228], [214, 206, 196], y as f32 / h as f32),
@@ -496,11 +506,16 @@ fn picture(subject: &str, path: &Path) -> Option<Vec<u8>> {
         }),
         "tram" => RgbImage::from_fn(w, h, |x, y| {
             let body = (110..370).contains(&x) && (110..250).contains(&y);
-            let window = body && (130..350).contains(&x) && (130..180).contains(&y) && (x - 130) % 55 < 44;
+            let window =
+                body && (130..350).contains(&x) && (130..180).contains(&y) && (x - 130) % 55 < 44;
             if window {
                 Rgb([60, 78, 96])
             } else if body {
-                if y < 200 { Rgb([246, 200, 40]) } else { Rgb([236, 236, 226]) }
+                if y < 200 {
+                    Rgb([246, 200, 40])
+                } else {
+                    Rgb([236, 236, 226])
+                }
             } else if y > 250 {
                 mix([120, 116, 110], [80, 78, 74], (y - 250) as f32 / 70.0)
             } else {
@@ -540,7 +555,12 @@ fn picture(subject: &str, path: &Path) -> Option<Vec<u8>> {
 /// Make every thumbnail right away (the app makes them in the background).
 fn load_thumbs(app: &App) {
     let root = app.root().expect("a folder is open");
-    let hashes: Vec<String> = app.statuses.borrow().iter().map(|s| s.hash.clone()).collect();
+    let hashes: Vec<String> = app
+        .statuses
+        .borrow()
+        .iter()
+        .map(|s| s.hash.clone())
+        .collect();
     for hash in hashes {
         let outcome = thumbs::thumbnail(&root, &hash);
         app.thumb_made(&root, hash, outcome);
@@ -551,6 +571,12 @@ fn load_thumbs(app: &App) {
 fn select_picture(app: &App, path: &str) {
     select(app, &[path]);
     let root = app.root().expect("a folder is open");
-    let hash = app.repo.borrow_mut().as_mut().unwrap().resolve_spec(path).unwrap();
+    let hash = app
+        .repo
+        .borrow_mut()
+        .as_mut()
+        .unwrap()
+        .resolve_spec(path)
+        .unwrap();
     app.preview_made(hash.clone(), thumbs::preview(&root, &hash, PREVIEW_SIZE));
 }

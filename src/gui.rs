@@ -42,6 +42,33 @@ slint::include_modules!();
 #[cfg(feature = "screenshots")]
 pub mod screenshots;
 
+/// How long a status bar message stays up.
+const STATUS_SECONDS: u64 = 10;
+
+/// What a status bar message is about, for its color.
+#[derive(Clone, Copy)]
+enum Level {
+    Info = 0,
+    Success = 1,
+    Warning = 2,
+    Error = 3,
+}
+
+/// A status bar message.
+struct Note(Level, String);
+
+impl From<String> for Note {
+    fn from(text: String) -> Self {
+        Note(Level::Success, text)
+    }
+}
+
+impl From<(Level, String)> for Note {
+    fn from((level, text): (Level, String)) -> Self {
+        Note(level, text)
+    }
+}
+
 /// Completion messages from background threads.
 enum Msg {
     /// One blob finished uploading; on success, record it in the db.
@@ -67,7 +94,7 @@ enum Msg {
         result: Result<Option<u64>, String>,
     },
     /// Final summary of a batch, for the status bar.
-    Status(String),
+    Status(Level, String),
     /// The filesystem half of a scan of `root` finished; on success,
     /// record it in the db.
     Scanned {
@@ -290,6 +317,8 @@ struct App {
     /// A folder that isn't an mbr folder yet, while the user chooses to
     /// start anew there or to restore into it.
     pending_folder: RefCell<Option<PathBuf>>,
+    /// Clears the status bar a while after each message.
+    status_timer: slint::Timer,
 }
 
 /// A remote in the middle of its setup.
@@ -555,6 +584,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
         previewed: RefCell::new(None),
         setup: RefCell::new(None),
         pending_folder: RefCell::new(None),
+        status_timer: slint::Timer::default(),
     });
 
     // ── message pump for background tasks ──
@@ -681,7 +711,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                 match repo.blobs_missing_on_remote(&remote) {
                     Ok(missing) => missing,
                     Err(e) => {
-                        app.status(format!("Error: {e}"));
+                        app.error(format!("Error: {e}"));
                         return;
                     }
                 }
@@ -771,7 +801,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                         .filter(|h| repo.blob_present(h))
                         .collect(),
                     Err(e) => {
-                        app.status(format!("Error: {e}"));
+                        app.error(format!("Error: {e}"));
                         return;
                     }
                 }
@@ -792,7 +822,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                         .map(|u| u.hash)
                         .collect(),
                     Err(e) => {
-                        app.status(format!("Error: {e}"));
+                        app.error(format!("Error: {e}"));
                         return;
                     }
                 }
@@ -906,20 +936,52 @@ pub fn run() -> Result<(), slint::PlatformError> {
 }
 
 impl App {
-    fn status(&self, text: impl Into<SharedString>) {
+    /// Show `text` in the status bar until it is tapped, or for
+    /// STATUS_SECONDS.
+    fn notify(&self, level: Level, text: impl Into<SharedString>) {
         self.window.set_status_text(text.into());
+        self.window.set_status_level(level as i32);
+        let window = self.window.as_weak();
+        self.status_timer.start(
+            slint::TimerMode::SingleShot,
+            std::time::Duration::from_secs(STATUS_SECONDS),
+            move || {
+                if let Some(w) = window.upgrade() {
+                    w.set_status_text(SharedString::default());
+                }
+            },
+        );
+    }
+
+    fn status(&self, text: impl Into<SharedString>) {
+        self.notify(Level::Info, text);
+    }
+
+    fn success(&self, text: impl Into<SharedString>) {
+        self.notify(Level::Success, text);
+    }
+
+    fn warn(&self, text: impl Into<SharedString>) {
+        self.notify(Level::Warning, text);
+    }
+
+    fn error(&self, text: impl Into<SharedString>) {
+        self.notify(Level::Error, text);
     }
 
     /// Run a database operation against the open repo, reporting the
     /// outcome in the status bar.
-    fn with_repo(&self, what: &str, f: impl FnOnce(&mut Repo) -> Result<String, String>) {
+    fn with_repo<T: Into<Note>>(&self, what: &str, f: impl FnOnce(&mut Repo) -> Result<T, String>) {
         let mut repo = self.repo.borrow_mut();
         match repo.as_mut() {
             Some(repo) => match f(repo) {
-                Ok(status) => self.status(status),
-                Err(e) => self.status(format!("Error: {e}")),
+                Ok(note) => {
+                    let Note(level, text) = note.into();
+                    self.notify(level, text)
+                }
+                Err(e) => self.error(format!("Error: {e}")),
             },
-            None => self.status(format!("Cannot {what}: no folder open")),
+            None => self.error(format!("Cannot {what}: no folder open")),
         }
     }
 
@@ -929,11 +991,11 @@ impl App {
         match repo.as_mut()?.db.remote(name) {
             Ok(Some(remote)) => Some(remote),
             Ok(None) => {
-                self.status(format!("No remote named '{name}'"));
+                self.error(format!("No remote named '{name}'"));
                 None
             }
             Err(e) => {
-                self.status(format!("Error: {e}"));
+                self.error(format!("Error: {e}"));
                 None
             }
         }
@@ -950,7 +1012,7 @@ impl App {
         if Repo::is_initialized(&dir) {
             match Repo::init(&dir) {
                 Ok(repo) => self.open_repo(repo),
-                Err(e) => self.status(format!("Error: {e}")),
+                Err(e) => self.error(format!("Error: {e}")),
             }
             return;
         }
@@ -977,7 +1039,7 @@ impl App {
             Ok(())
         });
         if let Err(e) = rewritten {
-            self.status(format!("Cannot write the rclone settings: {e}"));
+            self.error(format!("Cannot write the rclone settings: {e}"));
         }
         *self.password.borrow_mut() = saved.map(SecretString::from);
         self.reset_setup_ui();
@@ -1014,9 +1076,9 @@ impl App {
             Ok(repo) => {
                 self.open_repo(repo);
                 self.window.set_active_tab(2);
-                self.status(format!("{} is now an mbr folder", dir.display()));
+                self.success(format!("{} is now an mbr folder", dir.display()));
             }
-            Err(e) => self.status(format!("Error: {e}")),
+            Err(e) => self.error(format!("Error: {e}")),
         }
     }
 
@@ -1062,7 +1124,7 @@ impl App {
         let config_path = dir.join(repo::TMP_DIR).join("restore-rclone.conf");
         std::fs::remove_file(&config_path).ok();
         if let Err(e) = repo::ensure_rclone_config(&config_path) {
-            self.status(format!("Error: {e}"));
+            self.error(format!("Error: {e}"));
             return;
         }
         let pending = PendingSetup {
@@ -1088,7 +1150,7 @@ impl App {
         let (mut repo, report) = match metadata::restore(dir, dump, password.expose_secret()) {
             Ok(restored) => restored,
             Err(e) => {
-                self.status(format!("Restore failed: {e}"));
+                self.error(format!("Restore failed: {e}"));
                 return;
             }
         };
@@ -1118,7 +1180,7 @@ impl App {
         if !report.skipped.is_empty() {
             text += &format!("; {} skipped", report.skipped.len());
         }
-        self.status(text);
+        self.success(text);
     }
 
     /// Back to choosing how to start in the pending folder.
@@ -1141,11 +1203,11 @@ impl App {
     /// on the UI thread (see [`Msg::Scanned`]).
     fn rescan(&self) {
         let Some(root) = self.repo.borrow().as_ref().map(|r| r.root.clone()) else {
-            self.status("Cannot scan: no folder open");
+            self.error("Cannot scan: no folder open");
             return;
         };
         if self.scanning.replace(true) {
-            self.status("A scan is already running");
+            self.warn("A scan is already running");
             return;
         }
         self.status("Scanning…");
@@ -1365,7 +1427,7 @@ impl App {
             return;
         };
         if !status.present_locally {
-            self.status(format!(
+            self.warn(format!(
                 "{} isn't on this device: download it first",
                 status.path
             ));
@@ -1375,13 +1437,13 @@ impl App {
         if self.window.get_detail_index() == index as i32 && self.window.get_has_detail_preview() {
             self.window.set_viewer_open(true);
         } else {
-            self.status("Only images can be opened on Android for now");
+            self.warn("Only images can be opened on Android for now");
         }
         #[cfg(not(target_os = "android"))]
         if let Some(root) = self.root()
             && let Err(e) = open::that_detached(root.join(&status.path))
         {
-            self.status(format!("Cannot open {}: {e}", status.path));
+            self.error(format!("Cannot open {}: {e}", status.path));
         }
     }
 
@@ -1393,11 +1455,11 @@ impl App {
             hashes.into_iter().partition(|h| repo.blob_present(h))
         };
         if present.is_empty() {
-            self.status("None of the selected blobs is present locally; nothing to upload");
+            self.warn("None of the selected blobs is present locally; nothing to upload");
             return;
         }
         if !absent.is_empty() {
-            self.status(format!(
+            self.warn(format!(
                 "Skipping {} blob(s) not present locally",
                 absent.len()
             ));
@@ -1439,10 +1501,12 @@ impl App {
                 Ok(())
             });
             let mut text = format!("'{}': {stored} stored, {absent} not stored", remote.name);
+            let mut level = Level::Success;
             if let Some(e) = configured.err().or(failed) {
                 text += &format!("; error: {e}");
+                level = Level::Error;
             }
-            tx.send(Msg::Status(text)).ok();
+            tx.send(Msg::Status(level, text)).ok();
         });
     }
 
@@ -1486,7 +1550,7 @@ impl App {
             let min_copies = match repo.min_copies() {
                 Ok(n) => n,
                 Err(e) => {
-                    self.status(format!("Error: {e}"));
+                    self.error(format!("Error: {e}"));
                     return;
                 }
             };
@@ -1503,7 +1567,7 @@ impl App {
             return;
         };
         if jobs.is_empty() {
-            self.status("None of these blobs is present locally; nothing to free");
+            self.warn("None of these blobs is present locally; nothing to free");
             return;
         }
         self.status(format!(
@@ -1525,16 +1589,19 @@ impl App {
                 Ok(())
             });
             let mut text = format!("Freed {} ({dropped} blob(s))", util::format_size(freed));
+            let mut level = Level::Success;
             if dropped < total {
                 text += &format!(
                     "; kept {} that fewer than {min_copies} remote(s) are confirmed to hold",
                     total - dropped
                 );
+                level = Level::Warning;
             }
             if let Err(e) = configured {
                 text += &format!("; error: {e}");
+                level = Level::Error;
             }
-            tx.send(Msg::Status(text)).ok();
+            tx.send(Msg::Status(level, text)).ok();
         });
     }
 
@@ -1544,7 +1611,7 @@ impl App {
             return;
         };
         if hashes.is_empty() {
-            self.status("Nothing stored here to verify");
+            self.warn("Nothing stored here to verify");
             return;
         }
         self.status(format!("Verifying {} local blob(s)…", hashes.len()));
@@ -1558,14 +1625,14 @@ impl App {
                 }
                 tx.send(Msg::VerifiedLocal { hash, result }).ok();
             }
-            tx.send(Msg::Status(if damaged == 0 {
-                format!("Verified {total} blob(s): all intact")
+            tx.send(if damaged == 0 {
+                Msg::Status(Level::Success, format!("Verified {total} blob(s): all intact"))
             } else {
-                format!(
+                Msg::Status(Level::Error, format!(
                     "Verified {total} blob(s): {damaged} DAMAGED, set aside in {} — download them again",
                     repo::CORRUPT_DIR
-                )
-            }))
+                ))
+            })
             .ok();
         });
     }
@@ -1607,13 +1674,19 @@ impl App {
                 Ok(())
             });
             let mut text = format!("'{}': {ok} intact, {missing} missing", remote.name);
+            let mut level = Level::Success;
+            if missing > 0 {
+                level = Level::Warning;
+            }
             if corrupt > 0 {
                 text += &format!(", {corrupt} DAMAGED (deleted there; upload them again)");
+                level = Level::Error;
             }
             if let Some(e) = configured.err().or(failed) {
                 text += &format!("; error: {e}");
+                level = Level::Error;
             }
-            tx.send(Msg::Status(text)).ok();
+            tx.send(Msg::Status(level, text)).ok();
         });
     }
 
@@ -1621,7 +1694,7 @@ impl App {
 
     fn save_state(&self) {
         if let Err(e) = self.state.borrow().save() {
-            self.status(format!("Could not save app state: {e}"));
+            self.error(format!("Could not save app state: {e}"));
         }
     }
 
@@ -1633,18 +1706,18 @@ impl App {
     fn set_password(&self, password: &str, repeat: &str) {
         let Some(root) = self.root() else { return };
         if let Err(e) = metadata::check_new_password(password) {
-            self.status(format!("Error: {e}"));
+            self.error(format!("Error: {e}"));
             return;
         }
         if password != repeat {
-            self.status("Error: the passwords differ");
+            self.error("Error: the passwords differ");
             return;
         }
         {
             let mut repo = self.repo.borrow_mut();
             let Some(repo) = repo.as_mut() else { return };
             if let Err(e) = repo.set_password(password) {
-                self.status(format!("Error: {e}"));
+                self.error(format!("Error: {e}"));
                 return;
             }
         }
@@ -1659,7 +1732,7 @@ impl App {
         *self.password.borrow_mut() = Some(SecretString::from(password.to_owned()));
         self.window.set_pw_new(SharedString::default());
         self.window.set_pw_repeat(SharedString::default());
-        self.status("Master password set and saved on this computer");
+        self.success("Master password set and saved on this computer");
         self.refresh();
     }
 
@@ -1669,12 +1742,12 @@ impl App {
             None => return,
         };
         if let Err(e) = verified {
-            self.status(format!("Error: {e}"));
+            self.error(format!("Error: {e}"));
             return;
         }
         self.window.set_testing_password(false);
         self.window.set_test_password_entry(SharedString::default());
-        self.status("Master password is correct");
+        self.success("Master password is correct");
         self.refresh();
     }
 
@@ -1693,7 +1766,7 @@ impl App {
             None => return,
         };
         if let Err(e) = ready {
-            self.status(format!("Error: {e}"));
+            self.error(format!("Error: {e}"));
             return;
         }
         self.state
@@ -1703,7 +1776,7 @@ impl App {
         self.save_state();
         *self.password.borrow_mut() = Some(SecretString::from(password.to_owned()));
         self.window.set_unlock_entry(SharedString::default());
-        self.status("Master password is correct");
+        self.success("Master password is correct");
         self.refresh();
     }
 
@@ -1735,7 +1808,7 @@ impl App {
                 *self.node.borrow_mut() = Some(node);
                 self.sync_peers();
             }
-            Err(e) => self.status(format!("Cannot sync with the peers: {e}")),
+            Err(e) => self.error(format!("Cannot sync with the peers: {e}")),
         }
     }
 
@@ -1761,7 +1834,7 @@ impl App {
         let id = match peers::check_device_id(id) {
             Ok(id) => id,
             Err(e) => {
-                self.status(format!("Error: {e}"));
+                self.error(format!("Error: {e}"));
                 return;
             }
         };
@@ -1774,7 +1847,7 @@ impl App {
             let repo_state = state.repo_mut(&root);
             if peers::device_id(&peers::node_key(repo_state)) == id {
                 drop(state);
-                self.status("Error: that is this computer's own id");
+                self.error("Error: that is this computer's own id");
                 return;
             }
             repo_state
@@ -1785,7 +1858,7 @@ impl App {
         self.knocking.borrow_mut().remove(&id);
         self.window.set_peer_new_id(SharedString::default());
         self.window.set_peer_new_name(SharedString::default());
-        self.status(format!(
+        self.success(format!(
             "Added {name}: syncing starts once it adds this computer too"
         ));
         let ids: Vec<String> = self
@@ -1826,7 +1899,7 @@ impl App {
             node.set_peers(&ids);
         }
         if let Some(peer) = removed {
-            self.status(format!("No longer syncing with {}", peer.name));
+            self.success(format!("No longer syncing with {}", peer.name));
         }
         self.refresh_peers();
     }
@@ -1842,7 +1915,7 @@ impl App {
                         self.save_state();
                     }
                     *self.password.borrow_mut() = None;
-                    self.status(
+                    self.warn(
                         "This folder joined the peer's; type its master password in Settings",
                     );
                 }
@@ -1946,7 +2019,7 @@ impl App {
     /// chosen remote in the background.
     fn backup_metadata(&self) {
         let Some(password) = self.password.borrow().clone() else {
-            self.status("Set the master password in the Settings tab first");
+            self.warn("Set the master password in the Settings tab first");
             return;
         };
         let (remotes, snapshot, root, scratch) = {
@@ -1961,7 +2034,7 @@ impl App {
                     (remotes, snapshot, repo.root.clone(), repo.scratch_dir())
                 }
                 Err(e) => {
-                    self.status(format!("Error: {e}"));
+                    self.error(format!("Error: {e}"));
                     return;
                 }
             }
@@ -1970,7 +2043,7 @@ impl App {
             return;
         };
         if remotes.is_empty() {
-            self.status("Tick at least one remote to back up to");
+            self.warn("Tick at least one remote to back up to");
             return;
         }
         self.status("Encrypting metadata…");
@@ -1980,8 +2053,11 @@ impl App {
             let (sealed, name) = match sealed {
                 Ok(sealed) => sealed,
                 Err(e) => {
-                    tx.send(Msg::Status(format!("Metadata backup failed: {e}")))
-                        .ok();
+                    tx.send(Msg::Status(
+                        Level::Error,
+                        format!("Metadata backup failed: {e}"),
+                    ))
+                    .ok();
                     return;
                 }
             };
@@ -2005,10 +2081,12 @@ impl App {
                 Ok(())
             });
             let mut text = format!("Metadata backed up to {done} of {total} remote(s)");
+            let mut level = Level::Success;
             if let Err(e) = configured {
                 text += &format!("; error: {e}");
+                level = Level::Error;
             }
-            tx.send(Msg::Status(text)).ok();
+            tx.send(Msg::Status(level, text)).ok();
         });
     }
 
@@ -2071,10 +2149,12 @@ impl App {
                 Ok(())
             });
             let mut text = format!("Uploaded {done} of {total} blob(s) to {}", remote.name);
+            let mut level = Level::Success;
             if let Some(e) = configured.err().or(failed) {
                 text += &format!("; error: {e}");
+                level = Level::Error;
             }
-            tx.send(Msg::Status(text)).ok();
+            tx.send(Msg::Status(level, text)).ok();
         });
     }
 
@@ -2095,7 +2175,7 @@ impl App {
             .filter(|(_, holders)| !holders.is_empty())
             .collect();
         if jobs.is_empty() {
-            self.status("None of these blobs is recorded on any remote; nothing to download");
+            self.warn("None of these blobs is recorded on any remote; nothing to download");
             return;
         }
 
@@ -2119,13 +2199,16 @@ impl App {
                 Ok(())
             });
             let mut text = format!("Downloaded {done} of {total} blob(s)");
+            let mut level = Level::Success;
             if unheld > 0 {
                 text += &format!("; {unheld} not recorded on any remote");
+                level = Level::Warning;
             }
             if let Some(e) = configured.err().or(failed) {
                 text += &format!("; error: {e}");
+                level = Level::Error;
             }
-            tx.send(Msg::Status(text)).ok();
+            tx.send(Msg::Status(level, text)).ok();
         });
     }
 
@@ -2140,7 +2223,7 @@ impl App {
             match repo.blobs_missing_locally(name) {
                 Ok(missing) => missing,
                 Err(e) => {
-                    self.status(format!("Error: {e}"));
+                    self.error(format!("Error: {e}"));
                     return;
                 }
             }
@@ -2168,7 +2251,7 @@ impl App {
             match repo.db.list_remotes() {
                 Ok(remotes) => remotes,
                 Err(e) => {
-                    self.status(format!("Error: {e}"));
+                    self.error(format!("Error: {e}"));
                     return;
                 }
             }
@@ -2181,7 +2264,7 @@ impl App {
             return;
         };
         if remotes.is_empty() {
-            self.status("No remotes to scan");
+            self.warn("No remotes to scan");
             return;
         }
 
@@ -2229,7 +2312,7 @@ impl App {
                         "Removed remote {}; its rclone settings stay: {e}",
                         remote.name
                     );
-                    tx.send(Msg::Status(text)).ok();
+                    tx.send(Msg::Status(Level::Warning, text)).ok();
                 }
             });
         }
@@ -2353,7 +2436,7 @@ impl App {
             .as_ref()
             .is_some_and(|e| e.original != name);
         if renamed && let Err(e) = mbr::remotes::check_name(&name) {
-            self.status(format!("Error: {e}"));
+            self.error(format!("Error: {e}"));
             return;
         }
         let values: Vec<SharedString> = w.get_edit_values().iter().collect();
@@ -2469,18 +2552,18 @@ impl App {
         values: &[SharedString],
     ) -> Option<(&'static Backend, String)> {
         let Some(backend) = backends::offered().find(|b| b.name == backend_name) else {
-            self.status(format!("Unknown backend '{backend_name}'"));
+            self.error(format!("Unknown backend '{backend_name}'"));
             return None;
         };
         for (field, value) in backend.fields.iter().zip(values.iter()) {
             if field.required && value.trim().is_empty() {
-                self.status(format!("Error: '{}' is required", field.label));
+                self.error(format!("Error: '{}' is required", field.label));
                 return None;
             }
         }
         let spec = backends::target_spec(backend, values);
         if let Err(e) = backends::check_target_spec(backend, &spec) {
-            self.status(format!("Error: {e}"));
+            self.error(format!("Error: {e}"));
             return None;
         }
         Some((backend, spec))
@@ -2491,13 +2574,13 @@ impl App {
     /// Always encrypted; unencrypted remotes are CLI-only.
     fn submit_form(&self, name: &str, backend_name: &str, values: &[SharedString]) {
         let Some(password) = self.password.borrow().clone() else {
-            self.status("Set a master password in the Settings tab first");
+            self.warn("Set a master password in the Settings tab first");
             return;
         };
         let layout = match mbr::remotes::Layout::new(name.trim(), true) {
             Ok(layout) => layout,
             Err(e) => {
-                self.status(format!("Error: {e}"));
+                self.error(format!("Error: {e}"));
                 return;
             }
         };
@@ -2518,7 +2601,7 @@ impl App {
         let (folder_id, config_path) = match prepared {
             Ok(prepared) => prepared,
             Err(e) => {
-                self.status(format!("Error: {e}"));
+                self.error(format!("Error: {e}"));
                 return;
             }
         };
@@ -2582,8 +2665,11 @@ impl App {
             }
             match (reached, &pending.purpose) {
                 (Ok(Reached::Backup(sealed)), Purpose::Restore { dir }) => {
-                    tx.send(Msg::Status("Decrypting the backup…".to_owned()))
-                        .ok();
+                    tx.send(Msg::Status(
+                        Level::Info,
+                        "Decrypting the backup…".to_owned(),
+                    ))
+                    .ok();
                     let result = metadata::unseal(&sealed, pending.password.expose_secret());
                     tx.send(Msg::BackupOpened {
                         dir: dir.clone(),
@@ -2697,18 +2783,18 @@ impl App {
                     repo.db.set_blob_on_remote(&hash, &remote)?;
                     Ok(format!("Uploaded {} to {remote}", util::short_hash(&hash)))
                 }),
-                Err(e) => self.status(format!("Upload to {remote} failed: {e}")),
+                Err(e) => self.error(format!("Upload to {remote} failed: {e}")),
             },
             Msg::Fetched { hash, result } => match result {
                 Ok(remote) => {
                     // Here now: its preview can be made.
                     self.no_thumb.borrow_mut().remove(&hash);
-                    self.status(format!(
-                    "Downloaded {} from {remote}",
-                    util::short_hash(&hash)
+                    self.success(format!(
+                        "Downloaded {} from {remote}",
+                        util::short_hash(&hash)
                     ))
                 }
-                Err(e) => self.status(format!("Download failed: {e}")),
+                Err(e) => self.error(format!("Download failed: {e}")),
             },
             Msg::Thumb {
                 root,
@@ -2733,9 +2819,9 @@ impl App {
                         util::short_hash(&hash)
                     ))
                 }),
-                Err(e) => self.status(format!("Check on {remote} failed: {e}")),
+                Err(e) => self.error(format!("Check on {remote} failed: {e}")),
             },
-            Msg::Status(text) => self.status(text),
+            Msg::Status(level, text) => self.notify(level, text),
             Msg::Listed { remote, result } => match result {
                 Ok(found) => self.with_repo("reconcile remote", |repo| {
                     let Some(r) = repo.db.remote(&remote)? else {
@@ -2746,8 +2832,10 @@ impl App {
                         "Remote '{remote}' reachable; {} expected blob(s) present",
                         check.present.len()
                     );
+                    let mut level = Level::Success;
                     if !check.missing.is_empty() {
                         text += &format!(", {} MISSING", check.missing.len());
+                        level = Level::Error;
                     }
                     if !check.discovered.is_empty() {
                         text += &format!(", {} newly recorded", check.discovered.len());
@@ -2759,9 +2847,9 @@ impl App {
                             repo::UNNAMED_DIR
                         );
                     }
-                    Ok(text)
+                    Ok((level, text))
                 }),
-                Err(e) => self.status(format!("Remote '{remote}' scan failed: {e}")),
+                Err(e) => self.error(format!("Remote '{remote}' scan failed: {e}")),
             },
             Msg::RemoteConfig { remote, result } => {
                 let current = self.edit.borrow().as_ref().map(|e| e.original.clone());
@@ -2777,7 +2865,7 @@ impl App {
             }
             Msg::RemoteEdited { old, name, result } => match result {
                 Ok(()) => self.finish_remote_edit(&old, &name),
-                Err(e) => self.status(format!("Saving rclone settings failed: {e}")),
+                Err(e) => self.error(format!("Saving rclone settings failed: {e}")),
             },
             Msg::Setup { pending, result } if pending.cancelled.load(Ordering::Relaxed) => {
                 // The UI was reset when the user cancelled; only clean up.
@@ -2804,7 +2892,7 @@ impl App {
                             .set_setup_help(SharedString::from(format!("Error: {e}")));
                         self.window.set_setup_state(SharedString::default());
                         self.window.set_setup_url(SharedString::default());
-                        self.status(match pending.purpose {
+                        self.error(match pending.purpose {
                             Purpose::Remote { .. } => format!("Remote setup failed: {e}"),
                             Purpose::Restore { .. } => format!("Restore failed: {e}"),
                         });
@@ -2840,7 +2928,7 @@ impl App {
             }
             Msg::Cancelled { result } => {
                 if let Err(e) = result {
-                    self.status(format!("Note: {e}"));
+                    self.warn(format!("Note: {e}"));
                 }
             }
             Msg::MetadataUploaded {
@@ -2862,9 +2950,9 @@ impl App {
                             },
                         );
                     self.save_state();
-                    self.status(format!("Metadata backed up to {remote}"));
+                    self.success(format!("Metadata backed up to {remote}"));
                 }
-                Err(e) => self.status(format!("Metadata backup to {remote} failed: {e}")),
+                Err(e) => self.error(format!("Metadata backup to {remote} failed: {e}")),
             },
             Msg::BackupOpened {
                 dir,
@@ -2876,7 +2964,7 @@ impl App {
                 }
                 match result {
                     Ok(dump) => self.finish_restore(&dir, &dump, password),
-                    Err(e) => self.status(format!("Restore failed: {e}")),
+                    Err(e) => self.error(format!("Restore failed: {e}")),
                 }
             }
             Msg::Dropped { size, result } => match result {
@@ -2890,27 +2978,30 @@ impl App {
                     self.with_repo("record drop", |repo| {
                         repo.record_drop(&outcome)?;
                         Ok(if outcome.dropped {
-                            format!(
-                                "Freed {} ({} is on {})",
-                                util::format_size(size),
-                                util::short_hash(&outcome.hash),
-                                outcome.verified.join(", ")
+                            (
+                                Level::Success,
+                                format!(
+                                    "Freed {} ({} is on {})",
+                                    util::format_size(size),
+                                    util::short_hash(&outcome.hash),
+                                    outcome.verified.join(", ")
+                                ),
                             )
                         } else {
-                            outcome.kept_reason(min_copies)
+                            (Level::Warning, outcome.kept_reason(min_copies))
                         })
                     });
                 }
-                Err(e) => self.status(format!("Could not free space: {e}")),
+                Err(e) => self.error(format!("Could not free space: {e}")),
             },
             Msg::VerifiedLocal { hash, result } => match result {
-                Ok(LocalHealth::Corrupt { moved_to }) => self.status(format!(
+                Ok(LocalHealth::Corrupt { moved_to }) => self.error(format!(
                     "{} is DAMAGED; moved to {}",
                     util::short_hash(&hash),
                     moved_to.display()
                 )),
-                Ok(_) => self.status(format!("{} verified", util::short_hash(&hash))),
-                Err(e) => self.status(format!("Verifying failed: {e}")),
+                Ok(_) => self.success(format!("{} verified", util::short_hash(&hash))),
+                Err(e) => self.error(format!("Verifying failed: {e}")),
             },
             Msg::VerifiedRemote {
                 remote,
@@ -2919,17 +3010,17 @@ impl App {
             } => match result {
                 Ok(health) => self.with_repo("record verification", |repo| {
                     repo.record_remote_health(&remote, &hash, &health)?;
-                    let verdict = match health {
-                        RemoteHealth::Ok => "intact",
-                        RemoteHealth::Missing => "MISSING",
-                        RemoteHealth::Corrupt => "DAMAGED (deleted there)",
+                    let (level, verdict) = match health {
+                        RemoteHealth::Ok => (Level::Success, "intact"),
+                        RemoteHealth::Missing => (Level::Error, "MISSING"),
+                        RemoteHealth::Corrupt => (Level::Error, "DAMAGED (deleted there)"),
                     };
-                    Ok(format!(
-                        "{} is {verdict} on {remote}",
-                        util::short_hash(&hash)
+                    Ok((
+                        level,
+                        format!("{} is {verdict} on {remote}", util::short_hash(&hash)),
                     ))
                 }),
-                Err(e) => self.status(format!("Verifying on {remote} failed: {e}")),
+                Err(e) => self.error(format!("Verifying on {remote} failed: {e}")),
             },
             Msg::Scanned { root, result } => {
                 self.scanning.set(false);
@@ -2956,7 +3047,7 @@ impl App {
                             )
                         })
                     }),
-                    Err(e) => self.status(format!("Scan failed: {e}")),
+                    Err(e) => self.error(format!("Scan failed: {e}")),
                 }
                 if self.sync_pending.get() {
                     self.apply_synced();
@@ -3004,8 +3095,7 @@ impl App {
                 let rows: Vec<FileRow> = statuses
                     .iter()
                     .map(|s| {
-                        let mut row =
-                            file_row(s, selection.paths.contains(&s.path), min_copies);
+                        let mut row = file_row(s, selection.paths.contains(&s.path), min_copies);
                         if let Some(thumb) = thumbs.get(&s.hash) {
                             row.thumb = thumb.clone();
                             row.has_thumb = true;
@@ -3020,7 +3110,7 @@ impl App {
                 self.files.set_vec(rows);
                 *self.statuses.borrow_mut() = statuses;
             }
-            Err(e) => self.status(format!("Error listing files: {e}")),
+            Err(e) => self.error(format!("Error listing files: {e}")),
         }
 
         match repo.db.list_remotes() {
@@ -3050,7 +3140,7 @@ impl App {
                     .set_remote_names(ModelRc::new(VecModel::from(names)));
                 self.window.set_remotes(ModelRc::new(VecModel::from(rows)));
             }
-            Err(e) => self.status(format!("Error listing remotes: {e}")),
+            Err(e) => self.error(format!("Error listing remotes: {e}")),
         }
 
         match repo.unreferenced_blobs() {
@@ -3061,7 +3151,7 @@ impl App {
                     util::format_size(here.iter().map(|u| u.size).sum()).into(),
                 );
             }
-            Err(e) => self.status(format!("Error listing old versions: {e}")),
+            Err(e) => self.error(format!("Error listing old versions: {e}")),
         }
 
         self.refresh_metadata(repo);
@@ -3089,7 +3179,7 @@ impl App {
         }) {
             Ok(found) => found,
             Err(e) => {
-                self.status(format!("Error listing metadata remotes: {e}"));
+                self.error(format!("Error listing metadata remotes: {e}"));
                 return;
             }
         };
