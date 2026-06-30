@@ -45,8 +45,9 @@ target_sdk_version = 34
 [package.metadata.android.application]
 label = "My Beloved Rubble"
 icon = "@mipmap/ic_launcher"
-# java/: the content provider that lends files to other apps, which the
-# android-build recipe in the justfile adds (cargo-apk can't).
+# java/: the content provider that lends files to other apps and the
+# activity that brings files in, which the android-build recipe in the
+# justfile adds (cargo-apk can't).
 has_code = true
 
 [package.metadata.android.application.activity]

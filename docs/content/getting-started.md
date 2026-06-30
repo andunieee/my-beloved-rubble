@@ -22,6 +22,9 @@ Put files into the folder however you like: copy them in, save them from another
 photos. Then click **Rescan**. Every new file is stored in `.mbr/blobs/`, named after its content, and replaced by a
 link to it, so it still opens like a normal file.
 
+**Add files…** (**+** on a phone) picks files to copy into the folder and scans it for you. On Android you can also
+share files with My Beloved Rubble from any other app: they land in the open folder.
+
 From then on the app knows each file's size, when it was added and where copies of it are kept. Renaming, moving and
 deleting files works as usual; the next scan records what changed.
 

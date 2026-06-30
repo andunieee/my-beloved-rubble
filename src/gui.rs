@@ -101,6 +101,13 @@ enum Msg {
         root: PathBuf,
         result: Result<Vec<repo::ScannedEntry>, String>,
     },
+    /// Files picked on the desktop were copied into the folder at `root`:
+    /// their paths there, and what went wrong with the others.
+    Added {
+        root: PathBuf,
+        added: Vec<String>,
+        failed: Vec<String>,
+    },
     /// A background task ended.
     Done,
     /// A remote configuration step returned from librclone.
@@ -325,6 +332,8 @@ struct App {
     /// A folder that isn't an mbr folder yet, while the user chooses to
     /// start anew there or to restore into it.
     pending_folder: RefCell<Option<PathBuf>>,
+    /// Files were added during a scan: scan again once it ends.
+    scan_again: Cell<bool>,
     /// Clears the status bar a while after each message.
     status_timer: slint::Timer,
 }
@@ -719,6 +728,41 @@ mod platform {
         #[cfg(target_os = "android")]
         None
     }
+
+    /// Ask for files to add to the folder.
+    #[cfg(not(target_os = "android"))]
+    pub fn pick_files() -> Vec<PathBuf> {
+        rfd::FileDialog::new().pick_files().unwrap_or_default()
+    }
+
+    /// Ask for files to add to the folder, with the system's picker. The
+    /// app's Inbox activity (android/java) shows it and copies what is
+    /// picked into the inbox ([`AppState::inbox_dir`]).
+    #[cfg(target_os = "android")]
+    pub fn pick_files() -> Result<(), String> {
+        with_activity(|env, activity| {
+            let intent = intent(env, "computer.mybelovedrubble.PICK")?;
+            let package = env.new_string("computer.mybelovedrubble")?;
+            let class = env.new_string("computer.mybelovedrubble.Inbox")?;
+            env.call_method(
+                &intent,
+                "setClassName",
+                "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;",
+                &[JValue::Object(&package), JValue::Object(&class)],
+            )?;
+            // The context isn't always the activity itself, which then
+            // can't start one in its own task: the Inbox joins it anyway,
+            // having its affinity.
+            const FLAG_ACTIVITY_NEW_TASK: i32 = 0x1000_0000;
+            env.call_method(
+                &intent,
+                "addFlags",
+                "(I)Landroid/content/Intent;",
+                &[JValue::Int(FLAG_ACTIVITY_NEW_TASK)],
+            )?;
+            start_activity(env, activity, &intent)
+        })
+    }
 }
 
 /// The names of the folders the app keeps in its own storage (Android),
@@ -776,6 +820,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
         previewed: RefCell::new(None),
         setup: RefCell::new(None),
         pending_folder: RefCell::new(None),
+        scan_again: Cell::new(false),
         status_timer: slint::Timer::default(),
     });
 
@@ -813,6 +858,19 @@ pub fn run() -> Result<(), slint::PlatformError> {
         );
     }
 
+    // ── files shared with the app, or picked to add (Android) ──
+    #[cfg(target_os = "android")]
+    let inbox_timer = slint::Timer::default();
+    #[cfg(target_os = "android")]
+    {
+        let app = app.clone();
+        inbox_timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_secs(1),
+            move || app.take_inbox(),
+        );
+    }
+
     // ── callbacks ──
     let w = &app.window;
     {
@@ -846,6 +904,10 @@ pub fn run() -> Result<(), slint::PlatformError> {
     {
         let app = app.clone();
         w.on_rescan(move || app.rescan());
+    }
+    {
+        let app = app.clone();
+        w.on_add_files(move || app.add_files());
     }
 
     // blob selection
@@ -1489,11 +1551,110 @@ impl App {
             self.warn("A scan is already running");
             return;
         }
+        self.scan_again.set(false);
         self.status("Scanning…");
         self.spawn(move |tx| {
             let result = repo::ingest_tree(&root);
             tx.send(Msg::Scanned { root, result }).ok();
         });
+    }
+
+    /// Ask for files to put in the open folder, and copy them there in the
+    /// background (see [`Msg::Added`]).
+    #[cfg(not(target_os = "android"))]
+    fn add_files(&self) {
+        let Some(root) = self.root() else {
+            self.error("Cannot add files: no folder open");
+            return;
+        };
+        let files = platform::pick_files();
+        if files.is_empty() {
+            return;
+        }
+        self.status(format!("Adding {} file(s)…", files.len()));
+        self.spawn(move |tx| {
+            let (mut added, mut failed) = (Vec::new(), Vec::new());
+            for file in files {
+                let name = file.file_name().unwrap_or_default().to_string_lossy();
+                match repo::add_file(&root, &file, &name, false) {
+                    Ok(path) => added.push(path),
+                    Err(e) => failed.push(e),
+                }
+            }
+            tx.send(Msg::Added {
+                root,
+                added,
+                failed,
+            })
+            .ok();
+        });
+    }
+
+    /// Ask for files to put in the open folder: the picker leaves them in
+    /// the inbox, for [`App::take_inbox`].
+    #[cfg(target_os = "android")]
+    fn add_files(&self) {
+        if self.root().is_none() {
+            self.error("Cannot add files: no folder open");
+        } else if let Err(e) = platform::pick_files() {
+            self.error(format!("Cannot pick files: {e}"));
+        }
+    }
+
+    /// Move the files waiting in the inbox (Android: shared with the app,
+    /// or picked) into the open folder, and scan it.
+    #[cfg(target_os = "android")]
+    fn take_inbox(&self) {
+        let (Some(root), Some(inbox)) = (self.root(), AppState::inbox_dir()) else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(&inbox) else {
+            return;
+        };
+        let (mut added, mut failed) = (0, Vec::new());
+        // Each file waits in a directory of its own; one still being
+        // copied has a dot name.
+        for dir in entries.flatten() {
+            if dir.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            for file in std::fs::read_dir(dir.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let name = file.file_name().to_string_lossy().into_owned();
+                match repo::add_file(&root, &file.path(), &name, true) {
+                    Ok(_) => added += 1,
+                    Err(e) => failed.push(e),
+                }
+            }
+            std::fs::remove_dir(dir.path()).ok();
+        }
+        if added > 0 || !failed.is_empty() {
+            self.scan_added(added, &failed);
+        }
+    }
+
+    /// Scan the folder for the `added` files just put in it, reporting the
+    /// ones that `failed`.
+    fn scan_added(&self, added: usize, failed: &[String]) {
+        if added > 0 {
+            if self.scanning.get() {
+                self.scan_again.set(true);
+            } else {
+                self.rescan();
+            }
+        }
+        if let Some(first) = failed.first() {
+            for e in failed {
+                log::warn!("{e}");
+            }
+            self.error(match failed.len() {
+                1 => format!("Error: {first}"),
+                n => format!("{n} files were not added: {first}…"),
+            });
+        }
     }
 
     // ── blob selection ──
@@ -3416,6 +3577,18 @@ impl App {
                 }
                 // What the scan found goes to the peers.
                 self.sync_peers();
+                if self.scan_again.take() {
+                    self.rescan();
+                }
+            }
+            Msg::Added {
+                root,
+                added,
+                failed,
+            } => {
+                if self.root().as_ref() == Some(&root) {
+                    self.scan_added(added.len(), &failed);
+                }
             }
             Msg::Done => {
                 let left = self.tasks.get().saturating_sub(1);

@@ -82,7 +82,9 @@ android-build action="build":
 
     # cargo-apk can neither ship Java nor declare a content provider: add
     # java/'s provider (which lends files to other apps for "Open with"
-    # and "Share") and its manifest entry, then repackage and re-sign.
+    # and "Share"), its Inbox activity (the target for files shared with
+    # the app, and the file picker) and their manifest entries, then
+    # repackage and re-sign.
     build_tools=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
     jar="$ANDROID_HOME/platforms/android-34/android.jar"
     apk_dir="$(cargo metadata --no-deps --format-version 1 | jq -r .target_directory)/release/apk"
@@ -90,8 +92,13 @@ android-build action="build":
     trap 'rm -r "$classes"' EXIT
     javac -d "$classes" -classpath "$jar" --release 11 java/computer/mybelovedrubble/*.java
     "$build_tools/d8" --release --min-api 26 --lib "$jar" --output "$apk_dir" $(find "$classes" -name '*.class')
-    sed -i 's|</application>|<provider android:name="computer.mybelovedrubble.Files" android:authorities="computer.mybelovedrubble.files" android:exported="false" android:grantUriPermissions="true"/></application>|' \
-        "$apk_dir/AndroidManifest.xml"
+    entries='<provider android:name="computer.mybelovedrubble.Files" android:authorities="computer.mybelovedrubble.files" android:exported="false" android:grantUriPermissions="true"/>'
+    share='<category android:name="android.intent.category.DEFAULT"/><data android:mimeType="*/*"/>'
+    entries+='<activity android:name="computer.mybelovedrubble.Inbox" android:exported="true" android:theme="@android:style/Theme.Translucent.NoTitleBar" android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">'
+    entries+="<intent-filter><action android:name=\"android.intent.action.SEND\"/>$share</intent-filter>"
+    entries+="<intent-filter><action android:name=\"android.intent.action.SEND_MULTIPLE\"/>$share</intent-filter>"
+    entries+='</activity>'
+    sed -i "s#</application>#$entries</application>#" "$apk_dir/AndroidManifest.xml"
     res="$PWD/res"
     (
         cd "$apk_dir"

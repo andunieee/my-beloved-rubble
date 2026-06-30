@@ -136,6 +136,13 @@ impl AppState {
         Some(APP_DIR.get()?.join("folders"))
     }
 
+    /// Where files shared with the app, or picked to add to the open
+    /// folder, wait for it to take them (Android): each in a directory of
+    /// its own, under its name. See android/java.
+    pub fn inbox_dir() -> Option<PathBuf> {
+        Some(APP_DIR.get()?.join("inbox"))
+    }
+
     /// `<config dir>/mbr/state.json` (or in the app's own storage).
     pub fn default_path() -> Option<PathBuf> {
         if let Some(dir) = APP_DIR.get() {

@@ -1118,6 +1118,56 @@ pub fn ingest_tree(root: &Path) -> Result<Vec<ScannedEntry>, String> {
     Ok(scanned)
 }
 
+/// Put the file `src` at the top of the folder at `root`, called `name`
+/// or, if that is taken, `name (2)`, `name (3)`… (before the extension);
+/// the next scan ingests it. It is copied, or moved with `take`. Returns
+/// its path in the folder.
+///
+/// A copy is written under a dot name first, which scans skip, so a scan
+/// never ingests half a file.
+pub fn add_file(root: &Path, src: &Path, name: &str, take: bool) -> Result<String, String> {
+    let name = Path::new(name)
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    let bare = name.trim_start_matches('.');
+    let name = if bare.is_empty() || bare.len() < name.len() {
+        format!("_{bare}")
+    } else {
+        bare.to_owned()
+    };
+    let dest = free_path(root, &name);
+    let fail = |e: std::io::Error| format!("cannot add {}: {e}", src.display());
+    if !(take && std::fs::rename(src, &dest).is_ok()) {
+        let mut partial = OsString::from(".");
+        partial.push(dest.file_name().unwrap());
+        partial.push(".mbr-add");
+        let partial = root.join(partial);
+        let copied = std::fs::copy(src, &partial).and_then(|_| std::fs::rename(&partial, &dest));
+        if let Err(e) = copied {
+            std::fs::remove_file(&partial).ok();
+            return Err(fail(e));
+        }
+        if take {
+            std::fs::remove_file(src).map_err(fail)?;
+        }
+    }
+    Ok(rel_str(dest.strip_prefix(root).unwrap()))
+}
+
+/// `dir/name`, or the first of `dir/name (2)`, `dir/name (3)`… that is free.
+fn free_path(dir: &Path, name: &str) -> PathBuf {
+    let (stem, ext) = match name.rfind('.') {
+        Some(dot) if dot > 0 => name.split_at(dot),
+        _ => (name, ""),
+    };
+    std::iter::once(name.to_owned())
+        .chain((2..).map(|n| format!("{stem} ({n}){ext}")))
+        .map(|name| dir.join(name))
+        .find(|path| std::fs::symlink_metadata(path).is_err())
+        .unwrap()
+}
+
 /// Move a regular file into the blob store and symlink it back. Returns
 /// the content hash.
 ///

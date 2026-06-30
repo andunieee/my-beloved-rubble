@@ -643,6 +643,8 @@ export component AppWindow inherits Window {
     callback choose-folder(name: string);
     callback create-folder(name: string);
     callback rescan();
+    // pick files to put in the open folder
+    callback add-files();
     // blob selection: `toggle` is Ctrl/Cmd, `extend` is Shift
     callback row-pressed(index: int, toggle: bool, extend: bool);
     callback row-dragged(index: int);
@@ -766,6 +768,11 @@ export component AppWindow inherits Window {
                     text: "Folders";
                     icon: root.compact ? "M 3 6 L 3 19 L 21 19 L 21 8 L 11 8 L 9 6 Z" : "";
                     clicked => { root.choosing-folder = true; }
+                }
+                if root.folder != "": Button {
+                    text: "Add files…";
+                    icon: root.compact ? "M 12 5 L 12 19 M 5 12 L 19 12" : "";
+                    clicked => { root.add-files(); }
                 }
                 if root.folder != "": Button {
                     text: "Rescan";

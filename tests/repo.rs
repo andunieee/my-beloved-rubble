@@ -145,3 +145,36 @@ fn ingest_tree_then_apply_scan_matches_scan() {
     assert_eq!(report.added, ["f"]);
     assert!(repo.scan().unwrap().is_empty());
 }
+
+#[test]
+fn added_files_get_a_free_name_and_are_ingested() {
+    let tmp = TempDir::new("add");
+    let root = tmp.0.join("folder");
+    let outside = tmp.0.join("outside");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(root.join("photo.jpg"), "first").unwrap();
+    let mut repo = Repo::init(&root).unwrap();
+    repo.scan().unwrap();
+
+    let src = outside.join("photo.jpg");
+    fs::write(&src, "second").unwrap();
+    let added = mbr::repo::add_file(&root, &src, "photo.jpg", false).unwrap();
+    assert_eq!(added, "photo (2).jpg");
+    assert!(src.exists(), "a copy leaves the original");
+    fs::write(outside.join("taken"), "third").unwrap();
+    let added = mbr::repo::add_file(&root, &outside.join("taken"), "photo.jpg", true).unwrap();
+    assert_eq!(added, "photo (3).jpg");
+    assert!(!outside.join("taken").exists(), "a move takes the original");
+    // Names can't climb out of the folder or hide from the scan.
+    let added = mbr::repo::add_file(&root, &src, "../.secret", false).unwrap();
+    assert_eq!(added, "_secret");
+
+    let mut added = repo.scan().unwrap().added;
+    added.sort();
+    assert_eq!(added, ["_secret", "photo (2).jpg", "photo (3).jpg"]);
+    assert_eq!(
+        fs::read_to_string(root.join("photo (3).jpg")).unwrap(),
+        "third"
+    );
+}
