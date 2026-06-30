@@ -19,7 +19,7 @@ it lives on the [remotes](../remotes/), and each device downloads what it needs 
 Every device has an id for each folder, shown in the **Peers** tab under **This computer** (`mbr peer id`). To sync two
 devices, add each one's id on the other: **Add a peer** (`mbr peer add <id> --name laptop`). Syncing starts once *both*
 have added each other; until then the one that was added says *waiting for them to add this device as a peer*. A device
-that isn't a peer but tries to sync shows up in the list, with **Add it**.
+that isn't a peer but tries to sync shows up under **Add a peer**, in *Wants to sync this folder*, with **Add**.
 
 While the **Peers** tab is open, mbr also looks for other mbr devices on the same local network. They appear under
 **Add a peer** with the name each one announces, and **Add** adds one without typing its id. This is how to bring a

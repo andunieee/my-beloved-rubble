@@ -1143,10 +1143,7 @@ fn unlock(repo: &mut Repo, state: &mut AppState, password: &str) -> Result<(), S
     repo.verify_password(password)?;
     state.repo_mut(&repo.root).keep_password(password);
     state.save()?;
-    if repo.rclone_config_incomplete()? {
-        repo.write_rclone_config(Some(password))?;
-    }
-    Ok(())
+    repo.complete_rclone_config(Some(password))
 }
 
 fn config_password(repo: &mut Repo) -> Result<(), String> {
@@ -1470,8 +1467,12 @@ fn apply_sync(repo: &mut Repo, state: &mut AppState, joined: bool) -> Result<(),
     }
     if applied.remotes_changed {
         let password = state.repo(&repo.root).password;
-        if repo.write_rclone_config(password.as_deref()).is_err() {
-            println!("the remotes synced need the master password here: `mbr config password`");
+        match repo.write_rclone_config(password.as_deref()) {
+            Ok(()) => {}
+            Err(_) if password.is_none() => {
+                println!("the remotes synced need the master password here: `mbr config password`")
+            }
+            Err(e) => eprintln!("warning: cannot write the rclone settings: {e}"),
         }
     }
     Ok(())

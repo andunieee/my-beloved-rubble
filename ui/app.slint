@@ -48,11 +48,10 @@ export struct PeerRow {
     // How the last sync with it went.
     status: string,
     ok: bool,
-    // Not a peer: it tried to sync, and can be added.
-    knocking: bool,
 }
 
-// An mbr device found on the local network, not yet a peer.
+// A device that isn't a peer yet: found on the local network, or one that
+// tried to sync this folder.
 export struct NearbyPeer {
     id: string,
     name: string,
@@ -572,6 +571,8 @@ export component AppWindow inherits Window {
     in-out property <int> peer-count: 0;
     // Devices found on this local network, to suggest adding them.
     in-out property <[NearbyPeer]> nearby-peers: [];
+    // Devices that tried to sync this folder without being peers.
+    in-out property <[NearbyPeer]> knocking-peers: [];
     in-out property <bool> discovering: false;
     in-out property <string> peer-new-id: "";
     in-out property <string> peer-new-name: "";
@@ -1344,6 +1345,14 @@ export component AppWindow inherits Window {
                         Help { page: "peers/"; }
                         Rectangle { horizontal-stretch: 1; }
                     }
+                    if root.folder != "" && root.active-tab == 3 && root.knocking-peers.length > 0: Text {
+                        text: root.knocking-peers.length == 1
+                            ? "Another device wants to sync this folder: add it in “Add a peer”."
+                            : root.knocking-peers.length + " other devices want to sync this folder: add them in “Add a peer”.";
+                        font-size: 12px;
+                        wrap: word-wrap;
+                        color: #e0a94f;
+                    }
                     if root.folder != "" && root.active-tab == 3 && root.peer-rows.length == 0: Rectangle {
                         vertical-stretch: 1;
                         Text {
@@ -1359,7 +1368,7 @@ export component AppWindow inherits Window {
                             padding-bottom: 8px;
                             Rectangle {
                                 border-width: 1px;
-                                border-color: row.knocking ? #e0a94f : Palette.border;
+                                border-color: Palette.border;
                                 border-radius: 6px;
                                 background: Palette.background.darker(0.02);
                                 height: peer-layout.preferred-height;
@@ -1371,7 +1380,7 @@ export component AppWindow inherits Window {
                                         horizontal-stretch: 1;
                                         spacing: 2px;
                                         Text {
-                                            text: row.knocking ? "Another device wants to sync this folder" : row.name;
+                                            text: row.name;
                                             font-size: 13px;
                                             font-weight: 600;
                                             overflow: elide;
@@ -1389,15 +1398,7 @@ export component AppWindow inherits Window {
                                             color: row.ok ? #2fbf71 : #e0a94f;
                                         }
                                     }
-                                    if row.knocking: Button {
-                                        text: "Add it";
-                                        primary: true;
-                                        clicked => {
-                                            root.peer-new-id = row.id;
-                                            root.peer-new-name = "";
-                                        }
-                                    }
-                                    if !row.knocking: Button {
+                                    Button {
                                         text: "Remove";
                                         enabled: !root.busy;
                                         clicked => { root.remove-peer(row.id); }
@@ -1806,6 +1807,49 @@ width: Side.text-width;
                             SectionTitle { text: "ADD A PEER"; help: "peers/#adding-a-device"; }
                             Hint {
                                 text: "Syncing starts once both devices have added each other. A folder with no files yet joins the other's; two folders that both have files never merge. The master password is not sent: type it on each device.";
+                            }
+                            if root.knocking-peers.length > 0: VerticalLayout {
+                                spacing: 6px;
+                                Text {
+                                    text: "WANTS TO SYNC THIS FOLDER";
+                                    font-size: 11px;
+                                    font-weight: 600;
+                                    color: #e0a94f;
+                                }
+                                for peer in root.knocking-peers: Rectangle {
+                                    border-width: 1px;
+                                    border-color: #e0a94f;
+                                    border-radius: 6px;
+                                    background: Palette.background.darker(0.02);
+                                    height: knocking-row.preferred-height;
+
+                                    knocking-row := HorizontalLayout {
+                                        padding: 8px;
+                                        spacing: 8px;
+                                        VerticalLayout {
+                                            horizontal-stretch: 1;
+                                            spacing: 1px;
+                                            Text {
+                                                text: peer.name != "" ? peer.name : "Another device";
+                                                font-size: 12px;
+                                                font-weight: 600;
+                                                overflow: elide;
+                                            }
+                                            Text {
+                                                text: peer.id;
+                                                font-size: 11px;
+                                                overflow: elide;
+                                                color: Palette.foreground.transparentize(35%);
+                                            }
+                                        }
+                                        Button {
+                                            text: "Add";
+                                            primary: true;
+                                            enabled: !root.busy;
+                                            clicked => { root.add-peer(peer.id, peer.name); }
+                                        }
+                                    }
+                                }
                             }
                             if root.nearby-peers.length > 0: VerticalLayout {
                                 spacing: 6px;

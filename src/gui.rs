@@ -1046,8 +1046,28 @@ impl App {
         }
     }
 
+    /// The open folder's rclone config, for a job about to use it. The
+    /// sections of remotes synced from another device are written first if
+    /// they are missing, so the job never meets a remote rclone doesn't know.
     fn config_path(&self) -> Option<PathBuf> {
-        self.repo.borrow().as_ref().map(Repo::rclone_config_path)
+        let password = self.password.borrow().clone();
+        let completed = {
+            let mut repo = self.repo.borrow_mut();
+            let repo = repo.as_mut()?;
+            repo.complete_rclone_config(password.as_ref().map(|p| p.expose_secret()))
+                .map(|()| repo.rclone_config_path())
+        };
+        match completed {
+            Ok(path) => Some(path),
+            Err(_) if password.is_none() => {
+                self.error("Type the master password in Settings to use the synced remotes");
+                None
+            }
+            Err(e) => {
+                self.error(format!("Cannot write the rclone settings: {e}"));
+                None
+            }
+        }
     }
 
     /// Open the mbr folder `dir`; for a folder that isn't one yet, offer to
@@ -1079,13 +1099,7 @@ impl App {
         self.state.borrow_mut().last_folder = Some(repo.root.clone());
         self.save_state();
         let saved = self.state.borrow().repo(&repo.root).password;
-        let rewritten = repo.rclone_config_incomplete().and_then(|incomplete| {
-            if incomplete {
-                repo.write_rclone_config(saved.as_deref())?;
-            }
-            Ok(())
-        });
-        if let Err(e) = rewritten {
+        if let Err(e) = repo.complete_rclone_config(saved.as_deref()) {
             self.error(format!("Cannot write the rclone settings: {e}"));
         }
         *self.password.borrow_mut() = saved.map(SecretString::from);
@@ -1849,12 +1863,9 @@ impl App {
     fn unlock(&self, password: &str) {
         let Some(root) = self.root() else { return };
         let ready = match self.repo.borrow_mut().as_mut() {
-            Some(repo) => repo.verify_password(password).and_then(|()| {
-                if repo.rclone_config_incomplete()? {
-                    repo.write_rclone_config(Some(password))?;
-                }
-                Ok(())
-            }),
+            Some(repo) => repo
+                .verify_password(password)
+                .and_then(|()| repo.complete_rclone_config(Some(password))),
             None => return,
         };
         if let Err(e) = ready {
@@ -2091,9 +2102,12 @@ impl App {
                 text += &format!("; {} skipped", applied.skipped.len());
             }
             if applied.remotes_changed {
-                let password = password.as_ref().map(|p| p.expose_secret());
-                if repo.write_rclone_config(password).is_err() {
-                    text += "; type the master password in Settings to use the synced remotes";
+                match repo.write_rclone_config(password.as_ref().map(|p| p.expose_secret())) {
+                    Ok(()) => {}
+                    Err(_) if password.is_none() => {
+                        text += "; type the master password in Settings to use the synced remotes";
+                    }
+                    Err(e) => text += &format!("; cannot write the rclone settings: {e}"),
                 }
             }
             Ok(text)
@@ -2107,6 +2121,7 @@ impl App {
             w.set_device_id(SharedString::default());
             w.set_peer_rows(ModelRc::default());
             w.set_nearby_peers(ModelRc::default());
+            w.set_knocking_peers(ModelRc::default());
             w.set_discovering(false);
             w.set_peer_count(0);
             return;
@@ -2118,40 +2133,38 @@ impl App {
         };
         w.set_device_id(peers::device_id(&key).into());
         let status = self.peer_status.borrow();
-        let mut rows: Vec<PeerRow> = self
-            .knocking
-            .borrow()
+        let rows: Vec<PeerRow> = known
             .iter()
-            .filter(|id| !known.contains_key(*id))
-            .map(|id| PeerRow {
-                id: id.as_str().into(),
-                name: SharedString::default(),
-                status: SharedString::default(),
-                ok: false,
-                knocking: true,
+            .map(|(id, peer)| {
+                let (text, ok) = status
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| ("not synced yet".to_owned(), true));
+                PeerRow {
+                    id: id.as_str().into(),
+                    name: peer.name.as_str().into(),
+                    status: text.into(),
+                    ok,
+                }
             })
             .collect();
-        rows.extend(known.iter().map(|(id, peer)| {
-            let (text, ok) = status
-                .get(id)
-                .cloned()
-                .unwrap_or_else(|| ("not synced yet".to_owned(), true));
-            PeerRow {
-                id: id.as_str().into(),
-                name: peer.name.as_str().into(),
-                status: text.into(),
-                ok,
-                knocking: false,
-            }
-        }));
         w.set_peer_count(known.len() as i32);
         w.set_peer_rows(ModelRc::new(VecModel::from(rows)));
 
         let self_id = peers::device_id(&key);
         let knocking = self.knocking.borrow();
-        let nearby: Vec<NearbyPeer> = self
-            .nearby
-            .borrow()
+        let nearby_map = self.nearby.borrow();
+        // A knocking device found on the network too gets its name from there.
+        let knocking_peers: Vec<NearbyPeer> = knocking
+            .iter()
+            .filter(|id| !known.contains_key(*id))
+            .map(|id| NearbyPeer {
+                id: id.as_str().into(),
+                name: nearby_map.get(id).map(String::as_str).unwrap_or("").into(),
+            })
+            .collect();
+        w.set_knocking_peers(ModelRc::new(VecModel::from(knocking_peers)));
+        let nearby: Vec<NearbyPeer> = nearby_map
             .iter()
             .filter(|(id, _)| {
                 **id != self_id && !known.contains_key(*id) && !knocking.contains(*id)

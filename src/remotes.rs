@@ -518,6 +518,15 @@ impl Repo {
         }))
     }
 
+    /// Write rclone.conf again if it lacks a section of some remote (see
+    /// [`Repo::write_rclone_config`] for `password`).
+    pub fn complete_rclone_config(&mut self, password: Option<&str>) -> Result<(), String> {
+        if self.rclone_config_incomplete()? {
+            self.write_rclone_config(password)?;
+        }
+        Ok(())
+    }
+
     /// Rename remote `old` to `name`: its records follow it, and its rclone
     /// sections are written again under the new name (see
     /// [`Repo::write_rclone_config`] for `password`).
