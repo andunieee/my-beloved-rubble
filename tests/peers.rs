@@ -90,8 +90,8 @@ fn folders_sync_once_both_sides_agree() {
     a.repo.scan().unwrap();
     a.repo.set_password("correct horse battery").unwrap();
     let record = RemoteRecord {
-        backend: "local".into(),
-        spec: "/mnt/disk".into(),
+        backend: "s3".into(),
+        spec: "bucket".into(),
         encrypt: true,
         ..RemoteRecord::default()
     };
@@ -99,6 +99,19 @@ fn folders_sync_once_both_sides_agree() {
     a.repo
         .db
         .set_blob_on_remote(&link_hash(&a_root.join("one.txt")).unwrap(), "disk")
+        .unwrap();
+    // A local disk belongs to the machine it was set up on: a sync leaves
+    // it, and where its blobs are, behind.
+    let local = RemoteRecord {
+        backend: "local".into(),
+        spec: "/mnt/usb".into(),
+        encrypt: true,
+        ..RemoteRecord::default()
+    };
+    a.repo.db.add_remote("usb", &local).unwrap();
+    a.repo
+        .db
+        .set_blob_on_remote(&link_hash(&a_root.join("one.txt")).unwrap(), "usb")
         .unwrap();
 
     // Only A has added B: B refuses, and says who knocked.
@@ -123,6 +136,16 @@ fn folders_sync_once_both_sides_agree() {
     assert!(fs::metadata(b_root.join("one.txt")).is_err(), "dangling");
     assert_eq!(b.repo.db.remote_record("disk").unwrap(), Some(record));
     assert_eq!(b.repo.db.blobs_on_remote("disk").unwrap().len(), 1);
+    assert!(
+        b.repo.db.remote_record("usb").unwrap().is_none(),
+        "a local disk is not synced"
+    );
+    assert!(b.repo.db.blobs_on_remote("usb").unwrap().is_empty());
+    assert_eq!(
+        a.repo.db.remote_record("usb").unwrap(),
+        Some(local),
+        "it stays on the device that set it up"
+    );
     assert_eq!(b.repo.folder_id().unwrap(), a.repo.folder_id().unwrap());
     // The password is typed on B, and checked against A's.
     assert!(b.repo.verify_password("wrong password").is_err());
@@ -179,6 +202,41 @@ fn folders_sync_once_both_sides_agree() {
     let applied = b.repo.apply_synced().unwrap();
     assert!(applied.remotes_changed);
     assert!(b.repo.db.remote_record("disk").unwrap().is_none());
+
+    // Removing the local disk changes nothing on B, which never had it.
+    a.repo.db.remove_remote("usb").unwrap();
+    a.node.sync_now(&b.node.id()).unwrap();
+    let applied = b.repo.apply_synced().unwrap();
+    assert!(!applied.remotes_changed);
+    assert!(a.repo.db.remote_record("usb").unwrap().is_none());
+}
+
+#[test]
+fn a_folder_with_only_a_local_disk_can_join_and_keeps_it() {
+    let (ta, tb) = (TempDir::new("peers-local-a"), TempDir::new("peers-local-b"));
+    fs::write(ta.0.join("a.txt"), "a").unwrap();
+    let mut a = Device::new(&ta.0);
+    let mut b = Device::new(&tb.0);
+    a.repo.scan().unwrap();
+
+    // B has only a local disk, which is this machine's and not a file.
+    let local = RemoteRecord {
+        backend: "local".into(),
+        spec: "/mnt/usb".into(),
+        encrypt: true,
+        ..RemoteRecord::default()
+    };
+    b.repo.db.add_remote("usb", &local).unwrap();
+
+    a.trust(&b);
+    b.trust(&a);
+    let report = a.node.sync_now(&b.node.id()).unwrap();
+    assert!(!report.joined, "A keeps its folder");
+    let applied = b.repo.apply_synced().unwrap();
+    assert_eq!(applied.updated, ["a.txt"]);
+    // Joining A's folder didn't lose B's own disk.
+    assert_eq!(b.repo.db.remote_record("usb").unwrap(), Some(local));
+    assert_eq!(active_paths(&mut b.repo), ["a.txt"]);
 }
 
 #[test]

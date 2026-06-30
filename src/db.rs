@@ -17,10 +17,17 @@
 //! ```text
 //! setting/<key>                 → value
 //! remote/<name>                 → JSON (RemoteRecord)
+//! local/<author>/remote/<name>  → JSON (RemoteRecord)  this device's only
+//! local/<author>/on/<remote>/<sha256> → "1"            the same for locations
 //! blob/<sha256>/<size>          → "1"
 //! on/<remote>/<sha256>          → "1"   the blob is stored on the remote
 //! path/<path>/<µs>/<sha256|->   → "1"   from then on, the path names the blob ("-": nothing)
 //! ```
+//!
+//! Remotes of the `local` backend (a disk or directory) are particular to
+//! the machine that set them up, so they and their locations live under
+//! `local/<author>/…`: other devices ignore those entries and don't
+//! exchange their values.
 //!
 //! Everything but settings and remotes is carried by the key itself, with
 //! the same one-byte value, so loading never reads more than a handful of
@@ -157,6 +164,8 @@ pub struct Dump {
 pub struct Shared {
     docs: Arc<tokio::sync::Mutex<Docs>>,
     blobs: FsStore,
+    /// This device's author: its local-only entries are keyed by it.
+    author: Author,
 }
 
 struct Docs {
@@ -197,6 +206,19 @@ fn segments(key: &[u8]) -> Option<Vec<&str>> {
     body.split(|&b| b == 0)
         .map(|s| std::str::from_utf8(s).ok())
         .collect()
+}
+
+/// Whether a remote is local to the machine that set it up: a disk or
+/// directory, whose path and contents aren't shared with other devices.
+fn is_local_record(record: &RemoteRecord) -> bool {
+    record.backend == "local"
+}
+
+/// The key of a local-only entry of `author`: `local/<author>/<rest>`.
+fn local_key(author: &str, rest: &[&str]) -> Vec<u8> {
+    let mut segments = vec!["local", author];
+    segments.extend_from_slice(rest);
+    key(&segments)
 }
 
 /// A segment may not hold the separator.
@@ -286,6 +308,7 @@ impl Db {
                     namespace,
                 })),
                 blobs,
+                author: author.clone(),
             },
             author,
             marker,
@@ -306,10 +329,26 @@ impl Db {
         self.shared.docs.blocking_lock()
     }
 
+    /// The value of the entry with `hash`, if this device has it yet.
+    fn value_bytes(&self, hash: iroh_blobs::Hash, what: &str) -> Option<Vec<u8>> {
+        match self.rt.block_on(self.shared.blobs.get_bytes(hash)) {
+            Ok(bytes) => Some(bytes.to_vec()),
+            Err(e) => {
+                log::debug!("value of {what:?} not available yet: {e}");
+                None
+            }
+        }
+    }
+
     /// Read the whole store into memory again.
     pub fn reload(&mut self) -> Result<(), String> {
+        let me = self.author.id().to_string();
         let mut cache = Cache::default();
-        let mut values: Vec<(String, iroh_blobs::Hash)> = Vec::new();
+        let mut settings: Vec<(String, iroh_blobs::Hash)> = Vec::new();
+        let mut remotes: Vec<(String, iroh_blobs::Hash, AuthorId)> = Vec::new();
+        let mut local_remotes: Vec<(String, iroh_blobs::Hash)> = Vec::new();
+        let mut locations: Vec<(String, String, AuthorId)> = Vec::new();
+        let mut local_locations: Vec<(String, String)> = Vec::new();
         // The newest entry of every key, whoever wrote it.
         let entries: Vec<_> = {
             let mut docs = self.docs();
@@ -325,17 +364,25 @@ impl Db {
                 continue;
             };
             match parts[..] {
-                ["setting", name] => {
-                    values.push((format!("setting\0{name}"), entry.content_hash()))
+                ["setting", name] => settings.push((name.to_owned(), entry.content_hash())),
+                ["remote", name] => {
+                    remotes.push((name.to_owned(), entry.content_hash(), entry.author()))
                 }
-                ["remote", name] => values.push((format!("remote\0{name}"), entry.content_hash())),
+                // Local remotes and where their blobs are stay on the device
+                // that made them: other devices ignore these entries.
+                ["local", author, "remote", name] if author == me.as_str() => {
+                    local_remotes.push((name.to_owned(), entry.content_hash()));
+                }
+                ["local", author, "on", remote, hash] if author == me.as_str() => {
+                    local_locations.push((remote.to_owned(), hash.to_owned()));
+                }
                 ["blob", hash, size] => {
                     if let Ok(size) = size.parse() {
                         cache.blobs.entry(hash.to_owned()).or_default().insert(size);
                     }
                 }
                 ["on", remote, hash] => {
-                    cache.locations.insert((hash.to_owned(), remote.to_owned()));
+                    locations.push((remote.to_owned(), hash.to_owned(), entry.author()))
                 }
                 ["path", path, at, hash] => {
                     let Ok(at) = at.parse() else { continue };
@@ -351,30 +398,92 @@ impl Db {
             }
         }
 
-        for (what, hash) in values {
-            // A value whose entry a sync just brought in may not have
-            // arrived yet: it shows once it has.
-            let bytes = match self.rt.block_on(self.shared.blobs.get_bytes(hash)) {
-                Ok(bytes) => bytes,
+        for (name, hash) in settings {
+            let Some(bytes) = self.value_bytes(hash, &name) else {
+                continue;
+            };
+            cache
+                .settings
+                .insert(name, String::from_utf8_lossy(&bytes).into_owned());
+        }
+
+        // Remotes kept in the shared metadata. A local one written by an
+        // earlier version (under a plain `remote/` key) is moved to this
+        // device's own key; one from another device is ignored.
+        let mut migrate_remotes = Vec::new();
+        for (name, hash, author) in remotes {
+            let Some(bytes) = self.value_bytes(hash, &name) else {
+                continue;
+            };
+            let record: RemoteRecord = match serde_json::from_slice(&bytes) {
+                Ok(record) => record,
                 Err(e) => {
-                    log::debug!("value of {what:?} not available yet: {e}");
+                    log::warn!("ignoring unreadable remote '{name}': {e}");
                     continue;
                 }
             };
-            let text = String::from_utf8_lossy(&bytes).into_owned();
-            match what.split_once('\0') {
-                Some(("setting", name)) => {
-                    cache.settings.insert(name.to_owned(), text);
+            if is_local_record(&record) {
+                if author.to_string() == me {
+                    cache.remotes.insert(name.clone(), record);
+                    migrate_remotes.push(name);
                 }
-                Some(("remote", name)) => match serde_json::from_str(&text) {
-                    Ok(record) => {
-                        cache.remotes.insert(name.to_owned(), record);
-                    }
-                    Err(e) => log::warn!("ignoring unreadable remote '{name}': {e}"),
-                },
-                _ => {}
+            } else {
+                cache.remotes.insert(name, record);
             }
         }
+        for (name, hash) in local_remotes {
+            let Some(bytes) = self.value_bytes(hash, &name) else {
+                continue;
+            };
+            match serde_json::from_slice(&bytes) {
+                Ok(record) => {
+                    cache.remotes.insert(name, record);
+                }
+                Err(e) => log::warn!("ignoring unreadable local remote '{name}': {e}"),
+            }
+        }
+
+        // Blob locations, only for remotes this device knows. A local
+        // remote's locations count only when this device wrote them.
+        let mut migrate_locations = Vec::new();
+        for (remote, hash, author) in locations {
+            let Some(record) = cache.remotes.get(&remote) else {
+                continue;
+            };
+            if is_local_record(record) {
+                if author.to_string() == me {
+                    cache.locations.insert((hash.clone(), remote.clone()));
+                    migrate_locations.push((remote, hash));
+                }
+            } else {
+                cache.locations.insert((hash, remote));
+            }
+        }
+        for (remote, hash) in local_locations {
+            if cache.remotes.get(&remote).is_some_and(is_local_record) {
+                cache.locations.insert((hash, remote));
+            }
+        }
+
+        if !migrate_remotes.is_empty() || !migrate_locations.is_empty() {
+            self.batch(|db| {
+                for name in &migrate_remotes {
+                    let record = cache
+                        .remotes
+                        .get(name)
+                        .ok_or_else(|| format!("remote '{name}' vanished"))?;
+                    let json = serde_json::to_vec(record).map_err(err)?;
+                    db.put(&local_key(&me, &["remote", name]), &json)?;
+                    db.delete(&key(&["remote", name]))?;
+                }
+                for (remote, hash) in &migrate_locations {
+                    db.put(&local_key(&me, &["on", remote, hash]), MARKER)?;
+                    db.delete(&key(&["on", remote, hash]))?;
+                }
+                Ok(())
+            })?;
+        }
+
         for events in cache.paths.values_mut() {
             events.sort();
         }
@@ -577,14 +686,58 @@ impl Db {
         self.set_remote_record(name, record)
     }
 
+    /// The key of a local-only entry of this device.
+    fn local_key(&self, rest: &[&str]) -> Vec<u8> {
+        local_key(&self.author.id().to_string(), rest)
+    }
+
+    /// Move where `name`'s blobs are recorded, when it becomes local or
+    /// stops being so.
+    fn move_locations(&mut self, name: &str, to_local: bool) -> Result<(), String> {
+        let hashes: Vec<String> = self
+            .cache
+            .locations
+            .iter()
+            .filter(|(_, remote)| remote == name)
+            .map(|(hash, _)| hash.clone())
+            .collect();
+        for hash in hashes {
+            if to_local {
+                self.put(&self.local_key(&["on", name, &hash]), MARKER)?;
+                self.delete(&key(&["on", name, &hash]))?;
+            } else {
+                self.put(&key(&["on", name, &hash]), MARKER)?;
+                self.delete(&self.local_key(&["on", name, &hash]))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Replace everything recorded about remote `name`.
     pub fn set_remote_record(&mut self, name: &str, record: &RemoteRecord) -> Result<(), String> {
         check_segment(name)?;
         if self.cache.remotes.get(name) == Some(record) {
             return Ok(());
         }
+        let was_local = self.cache.remotes.get(name).is_some_and(is_local_record);
+        let now_local = is_local_record(record);
+        if was_local != now_local {
+            self.move_locations(name, now_local)?;
+        }
         let json = serde_json::to_vec(record).map_err(err)?;
-        self.put(&key(&["remote", name]), &json)?;
+        if now_local {
+            // A local remote's path and contents are this machine's: keep
+            // it out of the shared metadata, under this device's own key.
+            if !was_local {
+                self.delete(&key(&["remote", name]))?;
+            }
+            self.put(&self.local_key(&["remote", name]), &json)?;
+        } else {
+            if was_local {
+                self.delete(&self.local_key(&["remote", name]))?;
+            }
+            self.put(&key(&["remote", name]), &json)?;
+        }
         self.cache.remotes.insert(name.to_owned(), record.clone());
         Ok(())
     }
@@ -594,11 +747,18 @@ impl Db {
         if !self.cache.remotes.contains_key(name) {
             return Err(format!("no remote named '{name}'"));
         }
+        let local = self.cache.remotes.get(name).is_some_and(is_local_record);
         self.batch(|db| {
             for hash in db.blobs_on_remote(name)? {
                 db.unset_blob_on_remote(&hash, name)?;
             }
+            // Delete both keys, in case a local remote still has the old
+            // shared key from before it was kept apart.
             db.delete(&key(&["remote", name]))?;
+            db.delete(&db.local_key(&["remote", name]))?;
+            if local {
+                db.delete(&db.local_key(&["on", name]))?;
+            }
             db.cache.remotes.remove(name);
             Ok(())
         })
@@ -662,7 +822,11 @@ impl Db {
         if self.cache.locations.contains(&pair) {
             return Ok(());
         }
-        self.put(&key(&["on", remote, hash]), MARKER)?;
+        if self.cache.remotes.get(remote).is_some_and(is_local_record) {
+            self.put(&self.local_key(&["on", remote, hash]), MARKER)?;
+        } else {
+            self.put(&key(&["on", remote, hash]), MARKER)?;
+        }
         self.cache.locations.insert(pair);
         Ok(())
     }
@@ -672,7 +836,11 @@ impl Db {
         if !self.cache.locations.contains(&pair) {
             return Ok(());
         }
-        self.delete(&key(&["on", remote, hash]))?;
+        if self.cache.remotes.get(remote).is_some_and(is_local_record) {
+            self.delete(&self.local_key(&["on", remote, hash]))?;
+        } else {
+            self.delete(&key(&["on", remote, hash]))?;
+        }
         self.cache.locations.remove(&pair);
         Ok(())
     }
@@ -838,7 +1006,8 @@ impl Shared {
             .get_many(namespace, Query::single_latest_per_key().build())
             .map_err(err)?;
         for entry in entries {
-            if !entry.map_err(err)?.key().starts_with(b"setting\0") {
+            let key = entry.map_err(err)?.key().to_vec();
+            if !key.starts_with(b"setting\0") && !key.starts_with(b"local\0") {
                 return Ok(true);
             }
         }
@@ -860,8 +1029,22 @@ impl Shared {
             .store
             .get_many(old, Query::single_latest_per_key().build())
             .map_err(err)?;
+        // Local-only entries belong to this machine, not to the folder:
+        // they don't stop it joining another, and this device's own come
+        // along. Other devices' stay with them.
+        let mine = local_key(&self.author.id().to_string(), &[]);
+        let mut local = Vec::new();
         for entry in entries {
-            if !entry.map_err(err)?.key().starts_with(b"setting\0") {
+            let entry = entry.map_err(err)?;
+            if entry.key().starts_with(b"local\0") {
+                if entry.key().starts_with(&mine) {
+                    local.push((
+                        entry.key().to_vec(),
+                        entry.content_hash(),
+                        entry.content_len(),
+                    ));
+                }
+            } else if !entry.key().starts_with(b"setting\0") {
                 return Err("this folder has files now: it can't join another".to_owned());
             }
         }
@@ -869,6 +1052,15 @@ impl Shared {
         docs.store
             .import_namespace(Capability::Write(secret))
             .map_err(err)?;
+        {
+            let mut replica = docs.store.open_replica(&id).map_err(err)?;
+            for (key, hash, len) in local {
+                replica
+                    .insert(&key, &self.author, hash, len)
+                    .await
+                    .map_err(err)?;
+            }
+        }
         docs.store.close_replica(old);
         docs.store.remove_replica(&old).map_err(err)?;
         docs.namespace = id;
@@ -921,11 +1113,26 @@ impl Shared {
             .map_err(err)?;
         for entry in entries {
             let entry = entry.map_err(err)?;
-            if value_tagged(entry.key()) {
+            if value_tagged(entry.key()) && self.owns(entry.key()) {
                 values.push((entry.key().to_vec(), entry.content_hash()));
             }
         }
         Ok(values)
+    }
+
+    /// Whether the value of `key` belongs to this device: local-only
+    /// entries of other devices are not exchanged.
+    fn owns(&self, key: &[u8]) -> bool {
+        if !key.starts_with(b"local\0") {
+            return true;
+        }
+        segments(key)
+            .and_then(|parts| {
+                parts
+                    .get(1)
+                    .map(|author| author.to_string() == self.author.id().to_string())
+            })
+            .unwrap_or(false)
     }
 
     /// The values entries name that are missing here: `(key, hash)`.
@@ -963,7 +1170,7 @@ impl Shared {
         hash: iroh_blobs::Hash,
         value: Vec<u8>,
     ) -> Result<(), String> {
-        if iroh_blobs::Hash::new(&value) != hash || !value_tagged(key) {
+        if iroh_blobs::Hash::new(&value) != hash || !value_tagged(key) || !self.owns(key) {
             return Err("received a value that doesn't match its entry".to_owned());
         }
         self.blobs
@@ -984,7 +1191,9 @@ impl Shared {
 /// Whether the value of `key` is kept under a tag of its own (see
 /// [`Db::put`]).
 fn value_tagged(key: &[u8]) -> bool {
-    key.starts_with(b"setting\0") || key.starts_with(b"remote\0")
+    key.starts_with(b"setting\0")
+        || key.starts_with(b"remote\0")
+        || matches!(segments(key).as_deref(), Some(["local", _, "remote", _]))
 }
 
 /// The names `path` held, from its history: each event closes the one

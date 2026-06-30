@@ -24,7 +24,8 @@ that directory.
 
 Pick the kind of storage, give the remote a name, and fill in the form. Fields marked **required** must be filled;
 the others can usually be left alone. The **?** next to each field opens rclone's documentation for it. Storage that
-holds buckets or shares asks which one to use; a local disk asks for the folder.
+holds buckets or shares asks which one to use; a local disk asks for the folder. A **Local disk or directory** remote
+belongs to the computer it was set up on: it is not [synced](../peers/) to other devices.
 
 Remotes set up in the app are always encrypted. An unencrypted remote, storing files as they are and readable by
 anyone with access to it, can only be made from the [command line](../cli/) with `mbr remote setup --unencrypted`.

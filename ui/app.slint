@@ -1732,7 +1732,7 @@ width: Side.text-width;
                             spacing: 6px;
                             SectionTitle { text: "MASTER PASSWORD"; help: "settings/#the-master-password"; }
                             Hint { text: "Saved on this computer."; }
-                            HorizontalLayout {
+                            if !root.testing-password: HorizontalLayout {
                                 alignment: start;
                                 Button {
                                     text: "Test";
