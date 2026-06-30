@@ -24,7 +24,7 @@ use mbr::metadata;
 use mbr::peers::{self, Node};
 use mbr::rclone::RemoteBlob;
 use mbr::repo::{self, DropOutcome, LocalHealth, RemoteHealth, Repo};
-use mbr::state::{AppState, BackupRecord, Peer, RepoState};
+use mbr::state::{AppState, BackupRecord, DEFAULT_FOLDER, Peer, RepoState};
 use mbr::thumbs;
 use mbr::util;
 use slint::{Model, ModelRc, SharedString, VecModel};
@@ -548,6 +548,24 @@ mod platform {
     }
 }
 
+/// The names of the folders the app keeps in its own storage (Android),
+/// sorted; none on the desktop.
+fn app_folders() -> Vec<String> {
+    let Some(dir) = AppState::folders_dir() else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| !name.starts_with('.'))
+        .collect();
+    names.sort();
+    names
+}
+
 /// Run the app: on the desktop from `main`, on Android once the activity
 /// is set up (see `android/`).
 pub fn run() -> Result<(), slint::PlatformError> {
@@ -634,6 +652,14 @@ pub fn run() -> Result<(), slint::PlatformError> {
                 app.attach(dir);
             }
         });
+    }
+    {
+        let app = app.clone();
+        w.on_choose_folder(move |name| app.choose_folder(&name));
+    }
+    {
+        let app = app.clone();
+        w.on_create_folder(move |name| app.create_folder(&name));
     }
     {
         let app = app.clone();
@@ -926,11 +952,17 @@ pub fn run() -> Result<(), slint::PlatformError> {
     let last = app.state.borrow().last_folder.clone();
     if let Some(dir) = last.filter(|dir| Repo::is_initialized(dir)) {
         app.attach(dir);
-    } else if let Some(dir) = AppState::folder_dir() {
-        // Android: the app keeps its folder in its own storage.
+    } else if let Some(dir) = AppState::folders_dir() {
+        // Android: the app keeps its folders in its own storage.
+        let name = app_folders()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| DEFAULT_FOLDER.to_owned());
+        let dir = dir.join(name);
         std::fs::create_dir_all(&dir).ok();
         app.attach(dir);
     }
+    app.show_app_folders();
 
     app.window.run()
 }
@@ -1009,6 +1041,8 @@ impl App {
     /// start anew there or to restore a lost folder into it.
     fn attach(&self, dir: PathBuf) {
         self.cancel_restore();
+        let name = dir.file_name().unwrap_or_default().to_string_lossy();
+        self.window.set_app_folder(name.as_ref().into());
         if Repo::is_initialized(&dir) {
             match Repo::init(&dir) {
                 Ok(repo) => self.open_repo(repo),
@@ -1064,6 +1098,47 @@ impl App {
         self.close_editor();
         self.reset_setup_ui();
         self.refresh();
+    }
+
+    // ── the folders in the app's own storage (Android) ──
+
+    fn show_app_folders(&self) {
+        let names: Vec<SharedString> = app_folders().into_iter().map(Into::into).collect();
+        self.window
+            .set_app_folders(ModelRc::new(VecModel::from(names)));
+    }
+
+    /// Open the app's folder called `name`.
+    fn choose_folder(&self, name: &str) {
+        let Some(dir) = AppState::folders_dir() else {
+            return;
+        };
+        self.window.set_choosing_folder(false);
+        self.attach(dir.join(name));
+    }
+
+    /// Make a new folder called `name` in the app's storage, and open it.
+    fn create_folder(&self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() || name.starts_with('.') || name.contains(['/', '\\']) {
+            self.warn("A folder's name can't be empty, start with a dot or have a slash");
+            return;
+        }
+        let Some(dir) = AppState::folders_dir() else {
+            return;
+        };
+        let dir = dir.join(name);
+        if dir.exists() {
+            self.warn(format!("There already is a folder named {name}"));
+            return;
+        }
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.error(format!("Cannot create {name}: {e}"));
+            return;
+        }
+        self.window.set_new_folder_name(SharedString::default());
+        self.show_app_folders();
+        self.choose_folder(name);
     }
 
     // ── a folder that isn't an mbr folder yet ──

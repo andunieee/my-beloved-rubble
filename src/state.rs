@@ -116,16 +116,24 @@ impl RepoState {
 /// (Android): see [`AppState::use_app_dir`].
 static APP_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
+/// The name of the folder made on the app's first start, in its own
+/// storage (see [`AppState::folders_dir`]).
+pub const DEFAULT_FOLDER: &str = "Main";
+
 impl AppState {
-    /// Keep the app state, and the app's folder, in `dir`: the app's own
-    /// storage on Android, which has no config directory.
+    /// Keep the app state, and the app's folders, in `dir`: the app's own
+    /// storage on Android, which has no config directory. The one folder
+    /// earlier versions kept in `dir/folder` moves among the others, as
+    /// [`DEFAULT_FOLDER`] (nothing in a folder records where it is).
     pub fn use_app_dir(dir: PathBuf) {
+        move_old_folder(&dir);
         APP_DIR.set(dir).ok();
     }
 
-    /// The folder the app keeps in its own storage (Android), if any.
-    pub fn folder_dir() -> Option<PathBuf> {
-        Some(APP_DIR.get()?.join("folder"))
+    /// Where the app keeps its folders, one per subdirectory, in its own
+    /// storage (Android), if it does.
+    pub fn folders_dir() -> Option<PathBuf> {
+        Some(APP_DIR.get()?.join("folders"))
     }
 
     /// `<config dir>/mbr/state.json` (or in the app's own storage).
@@ -188,6 +196,20 @@ impl AppState {
         self.local
             .entry(key(root))
             .or_insert_with(|| read_local(root))
+    }
+}
+
+/// Move the folder earlier versions kept in `dir/folder` to where
+/// [`AppState::folders_dir`] keeps them, once.
+fn move_old_folder(dir: &Path) {
+    let old = dir.join("folder");
+    let folders = dir.join("folders");
+    if old.is_dir() && !folders.exists() {
+        let moved = std::fs::create_dir_all(&folders)
+            .and_then(|()| std::fs::rename(&old, folders.join(DEFAULT_FOLDER)));
+        if let Err(e) = moved {
+            log::warn!("cannot move {} into {}: {e}", old.display(), folders.display());
+        }
     }
 }
 
@@ -295,6 +317,23 @@ mod tests {
         let text = std::fs::read_to_string(folder.join(LOCAL_STATE_FILE)).unwrap();
         assert!(!text.contains("old one"), "{text}");
         assert_eq!(read_local(&folder).password.as_deref(), Some("old one"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn the_old_app_folder_moves_among_the_others_once() {
+        let dir = std::env::temp_dir().join(format!("mbr-app-dir-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("folder/.mbr")).unwrap();
+        move_old_folder(&dir);
+        let moved = dir.join("folders").join(DEFAULT_FOLDER);
+        assert!(moved.join(".mbr").is_dir());
+        assert!(!dir.join("folder").exists());
+
+        // A later `folder` is left alone: the folders were already moved.
+        std::fs::create_dir_all(dir.join("folder")).unwrap();
+        move_old_folder(&dir);
+        assert!(dir.join("folder").is_dir());
+        assert!(moved.join(".mbr").is_dir());
         std::fs::remove_dir_all(dir).ok();
     }
 }

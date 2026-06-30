@@ -1,6 +1,6 @@
 //! The Android app: the same GUI as the desktop (`src/gui.rs`), started
-//! by the native activity. The app keeps its state and its folder in its
-//! own storage, which (unlike shared storage) can hold the folder's links.
+//! by the native activity. The app keeps its state and its folders in its
+//! own storage, which (unlike shared storage) can hold the folders' links.
 
 #[allow(dead_code)]
 #[path = "../src/gui.rs"]

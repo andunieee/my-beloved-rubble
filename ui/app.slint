@@ -496,6 +496,12 @@ export component AppWindow inherits Window {
     // Running on a desktop (false on Android): folders and files can be
     // picked, and the window is usually wide.
     in property <bool> desktop: true;
+    // Android: the folders the app keeps in its own storage, the one
+    // attached, and the screen for switching between them.
+    in property <[string]> app-folders: [];
+    in property <string> app-folder: "";
+    in-out property <bool> choosing-folder: false;
+    in-out property <string> new-folder-name: "";
     // A phone-sized window: the main area and the side panel take turns
     // filling it, `show-panel` saying which.
     out property <bool> compact: root.width < 720px;
@@ -612,6 +618,8 @@ export component AppWindow inherits Window {
 
     // ── Callbacks ──
     callback open-folder();
+    callback choose-folder(name: string);
+    callback create-folder(name: string);
     callback rescan();
     // blob selection: `toggle` is Ctrl/Cmd, `extend` is Shift
     callback row-pressed(index: int, toggle: bool, extend: bool);
@@ -714,7 +722,7 @@ export component AppWindow inherits Window {
                     }
                 }
                 Text {
-                    text: root.compact ? "" : root.folder;
+                    text: root.compact ? "" : root.desktop ? root.folder : root.app-folder;
                     font-size: 12px;
                     color: Palette.foreground.transparentize(40%);
                     vertical-alignment: center;
@@ -725,6 +733,11 @@ export component AppWindow inherits Window {
                 if root.desktop: Button {
                     text: root.compact ? "Open…" : "Open Folder…";
                     clicked => { root.open-folder(); }
+                }
+                if !root.desktop: Button {
+                    text: "Folders";
+                    icon: root.compact ? "M 3 6 L 3 19 L 21 19 L 21 8 L 11 8 L 9 6 Z" : "";
+                    clicked => { root.choosing-folder = true; }
                 }
                 if root.folder != "": Button {
                     text: "Rescan";
@@ -822,7 +835,7 @@ export component AppWindow inherits Window {
                                 spacing: 12px;
 
                                 Text {
-                                    text: root.pending-folder;
+                                    text: root.desktop ? root.pending-folder : root.app-folder;
                                     font-size: 16px;
                                     font-weight: 700;
                                     wrap: word-wrap;
@@ -1980,6 +1993,89 @@ width: Side.text-width;
                     overflow: elide;
                     horizontal-stretch: 1;
                     color: root.status-level == 3 ? status-bar.level-color : Palette.foreground;
+                }
+            }
+        }
+    }
+
+    // ══ Android: switching between the app's folders ══
+    if root.choosing-folder: Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: Palette.background;
+        // Keep taps from reaching what is underneath.
+        TouchArea { }
+
+        VerticalLayout {
+            padding-top: root.safe-area-insets.top + 12px;
+            padding-bottom: root.safe-area-insets.bottom + 12px;
+            padding-left: root.safe-area-insets.left + 16px;
+            padding-right: root.safe-area-insets.right + 16px;
+            spacing: 10px;
+
+            HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    text: "Folders";
+                    font-size: 16px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                Button {
+                    text: "Close";
+                    icon: "M 6 6 L 18 18 M 18 6 L 6 18";
+                    clicked => { root.choosing-folder = false; }
+                }
+            }
+            Text {
+                text: "Each folder has its own files, remotes and peers. They are kept in the app's own storage.";
+                font-size: 11px;
+                wrap: word-wrap;
+                color: Palette.foreground.transparentize(40%);
+            }
+
+            ListView {
+                vertical-stretch: 1;
+                for name in root.app-folders: VerticalLayout {
+                    padding-bottom: 6px;
+                    Rectangle {
+                        height: 44px;
+                        border-width: 1px;
+                        border-radius: 6px;
+                        border-color: name == root.app-folder ? Palette.accent-background : Palette.border;
+                        background: folder-touch.pressed ? Palette.background.darker(0.08) : Palette.background.darker(0.02);
+                        Text {
+                            x: 12px;
+                            width: parent.width - 24px;
+                            text: name;
+                            font-size: 14px;
+                            font-weight: name == root.app-folder ? 700 : 400;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        folder-touch := TouchArea {
+                            clicked => { root.choose-folder(name); }
+                        }
+                    }
+                }
+            }
+
+            SectionTitle { text: "NEW FOLDER"; }
+            HorizontalLayout {
+                spacing: 6px;
+                LineEdit {
+                    placeholder-text: "its name (e.g. Photos)";
+                    text <=> root.new-folder-name;
+                    accepted => { root.create-folder(root.new-folder-name); }
+                }
+                Button {
+                    text: "Create";
+                    primary: true;
+                    enabled: root.new-folder-name != "";
+                    clicked => { root.create-folder(root.new-folder-name); }
                 }
             }
         }
