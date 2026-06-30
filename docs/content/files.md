@@ -44,3 +44,15 @@ folder:
 - **Clean up old versions** frees the space taken by previous versions of files and by deleted files, under the same
   rule as **Free up space**: only what enough remotes hold is removed from here. To delete old versions everywhere,
   remotes included, use [`mbr gc --purge`](../cli/).
+
+## Activity
+
+Uploads, downloads, scans of remotes, checks, verifications, freeing space and metadata backups don't have to wait
+for each other: start as many as you like. They queue up in the **Activity** tab and run one at a time, in the order
+they were started. The tab shows the one running, how far it got, and the ones waiting their turn.
+
+**Cancel** takes a waiting action off the queue, or stops the running one after the file it is on. Closing or
+switching folders cancels the folder's actions.
+
+Below the queue are the last 100 finished actions, from every folder, and how each went. They are kept on this device
+only, and **Clear the list** forgets them.

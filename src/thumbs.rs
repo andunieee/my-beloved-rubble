@@ -63,7 +63,10 @@ pub fn thumbnail(root: &Path, hash: &str) -> Outcome {
         // Written aside and moved in place, so a half-written one is
         // never read back.
         let tmp = cached.with_extension("png.tmp");
-        if thumb.save_with_format(&tmp, image::ImageFormat::Png).is_ok() {
+        if thumb
+            .save_with_format(&tmp, image::ImageFormat::Png)
+            .is_ok()
+        {
             std::fs::rename(&tmp, &cached).ok();
         }
     }
@@ -110,10 +113,8 @@ fn check(path: &Path) -> Result<(), Outcome> {
 /// character cut at the end of what was read aside), with no NUL bytes.
 fn text(path: &Path) -> Outcome {
     let mut head = Vec::with_capacity(TEXT_PREVIEW_BYTES);
-    let read = std::fs::File::open(path).and_then(|f| {
-        f.take(TEXT_PREVIEW_BYTES as u64 + 1)
-            .read_to_end(&mut head)
-    });
+    let read = std::fs::File::open(path)
+        .and_then(|f| f.take(TEXT_PREVIEW_BYTES as u64 + 1).read_to_end(&mut head));
     if read.is_err() {
         return Outcome::Missing;
     }
@@ -188,7 +189,10 @@ mod tests {
         std::fs::remove_file(&blob).unwrap();
         assert!(matches!(thumbnail(&root, &hash), Outcome::Ready(_)));
         assert!(matches!(preview(&root, &hash, 100), Outcome::Missing));
-        assert!(matches!(thumbnail(&root, &"cd".repeat(32)), Outcome::Missing));
+        assert!(matches!(
+            thumbnail(&root, &"cd".repeat(32)),
+            Outcome::Missing
+        ));
 
         // Not an image, whatever its name.
         let other = "ef".repeat(32);

@@ -44,6 +44,21 @@ export struct MetadataRow {
     up-to-date: bool,
 }
 
+// An upload, download, scan or check in the Activity tab.
+export struct ActionRow {
+    id: int,
+    title: string,
+    // What it is doing, or how it went.
+    detail: string,
+    // When it was queued, started or finished.
+    when: string,
+    // 0 running, 1 queued, 2 done, 3 done with warnings, 4 failed,
+    // 5 cancelled.
+    state: int,
+    // Running: the share done, 0 to 1; -1 when not known.
+    progress: float,
+}
+
 // A device the folder syncs with, or one that asked to.
 export struct PeerRow {
     id: string,
@@ -273,22 +288,116 @@ component Button {
     }
 }
 
+// An action in the Activity tab, with a Cancel button while it is
+// running or queued.
+component ActionCard inherits Rectangle {
+    in property <ActionRow> action;
+    callback cancel();
+    border-width: 1px;
+    border-color: root.action.state == 0 ? Palette.accent-background : Palette.border;
+    border-radius: 6px;
+    background: Palette.background.darker(0.02);
+    height: card.preferred-height;
+
+    card := HorizontalLayout {
+        padding: 10px;
+        spacing: 10px;
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: 3px;
+            HorizontalLayout {
+                spacing: 6px;
+                Text {
+                    text: root.action.title;
+                    font-size: 13px;
+                    font-weight: 600;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+                Text {
+                    text: root.action.state == 0 ? "running"
+                        : root.action.state == 1 ? "queued"
+                        : root.action.state == 2 ? "done"
+                        : root.action.state == 3 ? "done, with warnings"
+                        : root.action.state == 4 ? "failed"
+                        : "cancelled";
+                    font-size: 11px;
+                    vertical-alignment: center;
+                    color: root.action.state == 2 ? #2fbf71
+                        : root.action.state == 3 ? #e0a94f
+                        : root.action.state == 4 ? #e05f5f
+                        : Palette.foreground.transparentize(40%);
+                }
+            }
+            if root.action.state == 0: Rectangle {
+                height: 4px;
+                border-radius: 2px;
+                background: Palette.border;
+                Rectangle {
+                    x: 0;
+                    width: parent.width * max(0, root.action.progress);
+                    border-radius: 2px;
+                    background: Palette.accent-background;
+                }
+            }
+            Text {
+                text: root.action.detail;
+                font-size: 12px;
+                wrap: word-wrap;
+                color: Palette.foreground.transparentize(20%);
+            }
+            Text {
+                text: root.action.when;
+                font-size: 11px;
+                overflow: elide;
+                color: Palette.foreground.transparentize(40%);
+            }
+        }
+        if root.action.state <= 1: VerticalLayout {
+            alignment: center;
+            Button {
+                text: "Cancel";
+                clicked => { root.cancel(); }
+            }
+        }
+    }
+}
+
 component TabButton inherits Rectangle {
     in property <string> text;
+    // SVG path commands on a 24×24 grid, drawn before the text (see Button).
+    in property <string> icon;
     in property <bool> active;
     callback clicked();
-    min-width: label.preferred-width + 24px;
+    min-width: tab-layout.preferred-width;
+    horizontal-stretch: 0;
     border-radius: 6px;
     background: root.active ? Palette.accent-background
         : touch.has-hover ? Palette.background.darker(0.08) : transparent;
 
-    label := Text {
-        text: root.text;
-        font-size: 13px;
-        font-weight: root.active ? 700 : 500;
-        color: root.active ? Palette.accent-foreground : Palette.foreground;
-        vertical-alignment: center;
-        horizontal-alignment: center;
+    tab-layout := HorizontalLayout {
+        padding-left: root.text == "" ? 10px : 12px;
+        padding-right: root.text == "" ? 10px : 12px;
+        spacing: 4px;
+        alignment: center;
+        if root.icon != "": Path {
+            width: 16px;
+            height: 16px;
+            y: (parent.height - self.height) / 2;
+            viewbox-width: 24;
+            viewbox-height: 24;
+            commands: root.icon;
+            stroke: root.active ? Palette.accent-foreground : Palette.foreground;
+            stroke-width: 2px;
+        }
+        if root.text != "": Text {
+            text: root.text;
+            font-size: 13px;
+            font-weight: root.active ? 700 : 500;
+            color: root.active ? Palette.accent-foreground : Palette.foreground;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
     }
     touch := TouchArea {
         mouse-cursor: pointer;
@@ -570,8 +679,14 @@ export component AppWindow inherits Window {
     // 0 = info, 1 = success, 2 = warning, 3 = error.
     in-out property <int> status-level: 0;
     in-out property <bool> busy: false;
-    // 0 = Blobs, 1 = Remotes, 2 = Settings, 3 = Peers.
+    // 0 = Blobs, 1 = Remotes, 2 = Settings, 3 = Peers, 4 = Activity.
     in-out property <int> active-tab: 0;
+    // ── activity: the running action first, then the queued ones ──
+    in-out property <[ActionRow]> action-queue: [];
+    // Finished actions, newest first.
+    in-out property <[ActionRow]> action-history: [];
+    // Actions running or queued.
+    in-out property <int> actions-pending: 0;
     // Copies of every file to keep (local + remotes).
     in-out property <int> min-copies: 2;
     // Files with fewer copies than that.
@@ -717,6 +832,10 @@ export component AppWindow inherits Window {
     callback sync-peers();
     // The Peers tab (and so the add-peer screen) was opened or closed.
     callback peers-visible(visible: bool);
+    // the Activity tab
+    callback cancel-action(id: int);
+    callback cancel-all-actions();
+    callback clear-action-history();
     // a folder that isn't an mbr folder yet
     callback start-new();
     // the encrypted backup to restore from
@@ -787,6 +906,12 @@ export component AppWindow inherits Window {
                         active: root.active-tab == 3;
                         clicked => { root.active-tab = 3; }
                     }
+                    // On a phone, on the row below (no room here).
+                    if !root.compact: TabButton {
+                        text: root.actions-pending > 0 ? "Activity (" + root.actions-pending + ")" : "Activity";
+                        active: root.active-tab == 4;
+                        clicked => { root.active-tab = 4; }
+                    }
                 }
                 Text {
                     text: root.compact ? "" : root.desktop ? root.folder : root.app-folder;
@@ -831,7 +956,8 @@ export component AppWindow inherits Window {
                 text: root.active-tab == 0 ? "Files (" + root.files.length + ")"
                     : root.active-tab == 1 ? "Remotes (" + root.remotes.length + ")"
                     : root.active-tab == 2 ? "Backups"
-                    : "Peers (" + root.peer-count + ")";
+                    : root.active-tab == 3 ? "Peers (" + root.peer-count + ")"
+                    : "Activity";
                 active: !root.show-panel;
                 clicked => { root.show-panel = false; }
             }
@@ -842,11 +968,19 @@ export component AppWindow inherits Window {
                             : "Selected (" + root.selected-count + ")")
                     : root.active-tab == 1 ? (root.editing ? "Edit remote" : "Add a remote")
                     : root.active-tab == 2 ? "Password"
-                    : "Add a peer";
+                    : root.active-tab == 3 ? "Add a peer"
+                    : "Options";
                 active: root.show-panel;
                 clicked => { root.show-panel = true; }
             }
             Rectangle { horizontal-stretch: 1; }
+            // The Activity tab, with how many actions are pending.
+            TabButton {
+                icon: "M 7 4 L 7 20 M 3 8 L 7 4 L 11 8 M 17 20 L 17 4 M 13 16 L 17 20 L 21 16";
+                text: root.actions-pending > 0 ? root.actions-pending : "";
+                active: root.active-tab == 4;
+                clicked => { root.active-tab = 4; }
+            }
         }
         if root.compact && root.folder != "": Rectangle { height: 1px; background: Palette.border; }
 
@@ -1221,7 +1355,7 @@ export component AppWindow inherits Window {
                         Help { page: "remotes/#scanning"; }
                         Button {
                             text: "Scan all";
-                            enabled: !root.busy && root.remotes.length > 0;
+                            enabled: root.remotes.length > 0;
                             clicked => { root.scan-all-remotes(); }
                         }
                     }
@@ -1275,17 +1409,15 @@ export component AppWindow inherits Window {
                                         alignment: start;
                                         Button {
                                             text: "Scan";
-                                            enabled: !root.busy;
                                             clicked => { root.scan-remote(remote.name); }
                                         }
                                         Button {
                                             text: "Download all";
-                                            enabled: !root.busy && remote.missing-locally > 0;
+                                            enabled: remote.missing-locally > 0;
                                             clicked => { root.download-all(remote.name); }
                                         }
                                         Button {
                                             text: "Upload all";
-                                            enabled: !root.busy;
                                             clicked => { root.push-all(remote.name); }
                                         }
                                         if !root.compact: Button {
@@ -1379,6 +1511,54 @@ export component AppWindow inherits Window {
                                         color: row.up-to-date ? #2fbf71 : #e0a94f;
                                     }
                                 }
+                            }
+                        }
+                    }
+
+                    // ── Activity tab: the running, queued and recent actions ──
+                    if root.folder != "" && root.active-tab == 4: HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: root.actions-pending == 0 ? "Nothing running."
+                                : root.actions-pending == 1 ? "One action running."
+                                : "One action running, " + (root.actions-pending - 1) + " queued.";
+                            font-size: 14px;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        Help { page: "files/#activity"; }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                    if root.folder != "" && root.active-tab == 4
+                        && root.action-queue.length == 0 && root.action-history.length == 0: Rectangle {
+                        vertical-stretch: 1;
+                        Text {
+                            text: "Uploads, downloads, scans and checks show up here.";
+                            font-size: 14px;
+                            horizontal-alignment: center;
+                            color: Palette.foreground.transparentize(40%);
+                        }
+                    }
+                    if root.folder != "" && root.active-tab == 4
+                        && (root.action-queue.length > 0 || root.action-history.length > 0): activity-scroll := ScrollView {
+                        vertical-stretch: 1;
+                        mouse-drag-pan-enabled: true;
+                        // Wrapped text must measure itself against the real
+                        // width, not the unwrapped one.
+                        viewport-width: self.visible-width;
+                        VerticalLayout {
+                            width: activity-scroll.visible-width;
+                            spacing: 8px;
+                            alignment: start;
+                            if root.action-queue.length > 0: SectionTitle { text: "NOW AND NEXT"; }
+                            for action in root.action-queue: ActionCard {
+                                action: action;
+                                cancel => { root.cancel-action(action.id); }
+                            }
+                            if root.action-history.length > 0: SectionTitle { text: "RECENT"; }
+                            for action in root.action-history: ActionCard {
+                                action: action;
                             }
                         }
                     }
@@ -1537,13 +1717,13 @@ export component AppWindow inherits Window {
                                 alignment: start;
                                 Button {
                                     text: "Verify all local copies";
-                                    enabled: !root.busy && root.files.length > 0;
+                                    enabled: root.files.length > 0;
                                     clicked => { root.verify-all-local(); }
                                 }
                                 Button {
                                     text: root.old-local-count > 0
                                         ? "Clean up old versions (" + root.old-local-size + ")" : "Clean up old versions";
-                                    enabled: !root.busy && root.old-local-count > 0;
+                                    enabled: root.old-local-count > 0;
                                     clicked => { root.clean-up-old(); }
                                 }
                             }
@@ -1698,20 +1878,18 @@ width: Side.text-width;
                                 spacing: 6px;
                                 Button {
                                     text: "Upload";
-                                    enabled: !root.busy
-                                        && root.remote-names.length > 0
-                                        && root.selection-local > 0;
+                                    enabled: root.remote-names.length > 0 && root.selection-local > 0;
                                     clicked => { root.upload-selected(root.action-remote); }
                                 }
                                 Button {
                                     text: "Check remote";
-                                    enabled: !root.busy && root.remote-names.length > 0;
+                                    enabled: root.remote-names.length > 0;
                                     clicked => { root.check-selected(root.action-remote); }
                                 }
                                 Button {
                                     text: root.selection-missing > 0
                                         ? "Download (" + root.selection-missing + ")" : "Download";
-                                    enabled: !root.busy && root.selection-missing > 0;
+                                    enabled: root.selection-missing > 0;
                                     clicked => {
                                         root.download-selected(
                                             root.action-remote);
@@ -1722,17 +1900,17 @@ width: Side.text-width;
                                 spacing: 6px;
                                 Button {
                                     text: "Free up space";
-                                    enabled: !root.busy && root.selection-local > 0;
+                                    enabled: root.selection-local > 0;
                                     clicked => { root.drop-selected(); }
                                 }
                                 Button {
                                     text: "Verify";
-                                    enabled: !root.busy && root.selection-local > 0;
+                                    enabled: root.selection-local > 0;
                                     clicked => { root.verify-selected(); }
                                 }
                                 Button {
                                     text: "Verify on remote";
-                                    enabled: !root.busy && root.remote-names.length > 0;
+                                    enabled: root.remote-names.length > 0;
                                     clicked => { root.verify-selected-on(root.action-remote); }
                                 }
                             }
@@ -1849,10 +2027,34 @@ width: Side.text-width;
                                 Button {
                                     text: "Back up now";
                                     primary: true;
-                                    enabled: !root.busy && root.metadata-chosen > 0;
+                                    enabled: root.metadata-chosen > 0;
                                     clicked => { root.backup-metadata(); }
                                 }
                             }
+                        }
+
+                        // ════ Activity tab ════
+                        if root.active-tab == 4 && root.folder != "": VerticalLayout {
+                            spacing: 8px;
+                            SectionTitle { text: "ACTIVITY"; help: "files/#activity"; }
+                            Hint {
+                                text: "Uploads, downloads, scans and checks wait their turn and run one at a time, in the order they were started. Cancelling the running one stops it after the file it is on.";
+                            }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                alignment: start;
+                                Button {
+                                    text: "Cancel all";
+                                    enabled: root.actions-pending > 0;
+                                    clicked => { root.cancel-all-actions(); }
+                                }
+                                Button {
+                                    text: "Clear the list";
+                                    enabled: root.action-history.length > 0;
+                                    clicked => { root.clear-action-history(); }
+                                }
+                            }
+                            Hint { text: "The last 100 finished actions are kept, on this device only."; }
                         }
 
                         // ════ Peers tab ════

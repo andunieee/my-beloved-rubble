@@ -2,12 +2,13 @@
 
 //! `my-beloved-rubble` — the Slint GUI.
 //!
-//! Four tabs: **Blobs** (the annotated file listing, with multi-selection
+//! Five tabs: **Blobs** (the annotated file listing, with multi-selection
 //! and a sidebar acting on the selected blobs), **Remotes** (listing,
 //! scanning, downloading from, setting up and editing remotes),
 //! **Settings** (the master password, and which remotes receive the
-//! encrypted metadata backups) and **Peers** (the other devices the
-//! folder's metadata syncs with, over iroh). A folder that isn't an mbr
+//! encrypted metadata backups), **Peers** (the other devices the
+//! folder's metadata syncs with, over iroh) and **Activity** (the queue of
+//! transfers and checks, see [`actions`]). A folder that isn't an mbr
 //! folder yet first asks whether to start anew there or restore a lost
 //! folder into it.
 //!
@@ -15,7 +16,9 @@
 //! the filesystem half of a scan (hashing, moving files into the store) —
 //! runs on background threads and reports back through an mpsc channel
 //! drained by a UI timer, so the window stays responsive; database writes
-//! always happen on the UI thread.
+//! always happen on the UI thread. Transfers and checks queue up as
+//! [`actions`] and run one at a time; the rest runs as soon as it starts,
+//! the window marked busy meanwhile.
 
 use age::secrecy::{ExposeSecret, SecretString};
 use mbr::backends::{self, Backend, Field, Kind};
@@ -37,16 +40,21 @@ use std::sync::{Arc, mpsc};
 
 slint::include_modules!();
 
+mod actions;
+
 /// Screenshots for the README and the user guide, rendered offscreen over
 /// made-up data: `cargo run --features screenshots --bin screenshots`.
 #[cfg(feature = "screenshots")]
 pub mod screenshots;
 
+/// How often the action history is written to disk, when it changed.
+const SAVE_ACTIONS_SECONDS: u64 = 30;
+
 /// How long a status bar message stays up.
 const STATUS_SECONDS: u64 = 10;
 
 /// What a status bar message is about, for its color.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Level {
     Info = 0,
     Success = 1,
@@ -110,6 +118,16 @@ enum Msg {
     },
     /// A background task ended.
     Done,
+    /// The running action got further: `done` of `total` items, `doing`
+    /// the next one.
+    Progress {
+        id: u64,
+        done: usize,
+        total: usize,
+        doing: String,
+    },
+    /// The running action returned its summary.
+    ActionDone { id: u64, level: Level, text: String },
     /// A remote configuration step returned from librclone.
     Setup {
         pending: PendingSetup,
@@ -186,7 +204,24 @@ impl Msg {
             self,
             Msg::Thumb { .. }
                 | Msg::Preview { .. }
+                | Msg::Progress { .. }
                 | Msg::Peer(peers::Event::Discovered { .. } | peers::Event::Gone { .. })
+        )
+    }
+
+    /// Whether it reports on one item of the running action, about that
+    /// action's folder.
+    fn reports_on_an_action(&self) -> bool {
+        matches!(
+            self,
+            Msg::Pushed { .. }
+                | Msg::Fetched { .. }
+                | Msg::Listed { .. }
+                | Msg::Checked { .. }
+                | Msg::Dropped { .. }
+                | Msg::VerifiedLocal { .. }
+                | Msg::VerifiedRemote { .. }
+                | Msg::MetadataUploaded { .. }
         )
     }
 }
@@ -296,6 +331,8 @@ struct App {
     repo: Rc<RefCell<Option<Repo>>>,
     tx: mpsc::Sender<Msg>,
     tasks: Rc<Cell<u32>>,
+    /// Transfers and checks, queued, running and done.
+    actions: RefCell<actions::Actions>,
     /// A scan is running in the background.
     scanning: Cell<bool>,
     /// The listing shown in the Blobs tab, row for row.
@@ -813,6 +850,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
         repo: Rc::new(RefCell::new(None)),
         tx,
         tasks: Rc::new(Cell::new(0)),
+        actions: RefCell::new(actions::Actions::load()),
         scanning: Cell::new(false),
         statuses: RefCell::new(Vec::new()),
         files,
@@ -855,6 +893,17 @@ pub fn run() -> Result<(), slint::PlatformError> {
                     app.refresh();
                 }
             },
+        );
+    }
+
+    // ── writing the action history, every now and then ──
+    let actions_timer = slint::Timer::default();
+    {
+        let app = app.clone();
+        actions_timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_secs(SAVE_ACTIONS_SECONDS),
+            move || app.actions.borrow_mut().save(),
         );
     }
 
@@ -968,6 +1017,31 @@ pub fn run() -> Result<(), slint::PlatformError> {
     {
         let app = app.clone();
         w.on_download_selected(move |remote| app.download_selected(&remote));
+    }
+
+    // the Activity tab
+    {
+        let app = app.clone();
+        w.on_cancel_action(move |id| {
+            app.actions.borrow_mut().cancel(id as u64);
+            app.show_actions();
+        });
+    }
+    {
+        let app = app.clone();
+        w.on_cancel_all_actions(move || {
+            app.actions
+                .borrow_mut()
+                .cancel_all("Cancelled before it started");
+            app.show_actions();
+        });
+    }
+    {
+        let app = app.clone();
+        w.on_clear_action_history(move || {
+            app.actions.borrow_mut().clear_history();
+            app.show_actions();
+        });
     }
 
     // remote management
@@ -1222,8 +1296,11 @@ pub fn run() -> Result<(), slint::PlatformError> {
         app.attach(dir);
     }
     app.show_app_folders();
+    app.show_actions();
 
-    app.window.run()
+    let ran = app.window.run();
+    app.actions.borrow_mut().save();
+    ran
 }
 
 impl App {
@@ -1364,6 +1441,10 @@ impl App {
     }
 
     fn close_repo(&self) {
+        self.actions
+            .borrow_mut()
+            .cancel_all("Cancelled: its folder was closed");
+        self.show_actions();
         // The node shares the database: it stops first.
         *self.node.borrow_mut() = None;
         *self.repo.borrow_mut() = None;
@@ -1950,40 +2031,40 @@ impl App {
         else {
             return;
         };
-        self.status(format!(
-            "Checking {} blob(s) on '{remote_name}'…",
-            hashes.len()
-        ));
-        self.spawn(move |tx| {
+        let title = format!("Check {} blob(s) on '{remote_name}'", hashes.len());
+        self.enqueue(title, move |ctx| {
+            let total = hashes.len();
             let mut stored = 0;
             let mut absent = 0;
             let mut failed = None;
-            let configured = mbr::rclone::with_config(&config_path, || {
-                for hash in hashes {
-                    let result = mbr::rclone::stat_blob(&remote.target, &hash);
-                    match &result {
-                        Ok(Some(_)) => stored += 1,
-                        Ok(None) => absent += 1,
-                        Err(e) => {
-                            failed.get_or_insert_with(|| e.clone());
-                        }
-                    }
-                    tx.send(Msg::Checked {
-                        remote: remote.name.clone(),
-                        hash,
-                        result,
-                    })
-                    .ok();
+            for (i, hash) in hashes.into_iter().enumerate() {
+                if ctx.cancelled() {
+                    break;
                 }
-                Ok(())
-            });
+                ctx.progress(i, total, util::short_hash(&hash));
+                let result = mbr::rclone::with_config(&config_path, || {
+                    mbr::rclone::stat_blob(&remote.target, &hash)
+                });
+                match &result {
+                    Ok(Some(_)) => stored += 1,
+                    Ok(None) => absent += 1,
+                    Err(e) => {
+                        failed.get_or_insert_with(|| e.clone());
+                    }
+                }
+                ctx.send(Msg::Checked {
+                    remote: remote.name.clone(),
+                    hash,
+                    result,
+                });
+            }
             let mut text = format!("'{}': {stored} stored, {absent} not stored", remote.name);
             let mut level = Level::Success;
-            if let Some(e) = configured.err().or(failed) {
+            if let Some(e) = failed {
                 text += &format!("; error: {e}");
                 level = Level::Error;
             }
-            tx.send(Msg::Status(level, text)).ok();
+            (level, text)
         });
     }
 
@@ -2014,7 +2095,7 @@ impl App {
             self.status("Every selected blob is already present locally");
             return;
         }
-        self.fetch_blobs(jobs);
+        self.fetch_blobs(jobs, None);
     }
 
     // ── keeping copies safe ──
@@ -2047,24 +2128,31 @@ impl App {
             self.warn("None of these blobs is present locally; nothing to free");
             return;
         }
-        self.status(format!(
-            "Checking the remotes of {} blob(s) before freeing space…",
-            jobs.len()
-        ));
-        self.spawn(move |tx| {
+        let title = format!("Free up space: {} blob(s)", jobs.len());
+        self.enqueue(title, move |ctx| {
             let total = jobs.len();
             let (mut dropped, mut freed) = (0, 0);
-            let configured = mbr::rclone::with_config(&config_path, || {
-                for (hash, holders, size) in jobs {
-                    let result = repo::drop_local_blob(&root, &hash, &holders, min_copies);
-                    if result.as_ref().is_ok_and(|o| o.dropped) {
+            let mut failed = None;
+            for (i, (hash, holders, size)) in jobs.into_iter().enumerate() {
+                if ctx.cancelled() {
+                    break;
+                }
+                ctx.progress(i, total, util::short_hash(&hash));
+                let result = mbr::rclone::with_config(&config_path, || {
+                    repo::drop_local_blob(&root, &hash, &holders, min_copies)
+                });
+                match &result {
+                    Ok(o) if o.dropped => {
                         dropped += 1;
                         freed += size;
                     }
-                    tx.send(Msg::Dropped { size, result }).ok();
+                    Ok(_) => {}
+                    Err(e) => {
+                        failed.get_or_insert_with(|| e.clone());
+                    }
                 }
-                Ok(())
-            });
+                ctx.send(Msg::Dropped { size, result });
+            }
             let mut text = format!("Freed {} ({dropped} blob(s))", util::format_size(freed));
             let mut level = Level::Success;
             if dropped < total {
@@ -2074,11 +2162,11 @@ impl App {
                 );
                 level = Level::Warning;
             }
-            if let Err(e) = configured {
+            if let Some(e) = failed {
                 text += &format!("; error: {e}");
                 level = Level::Error;
             }
-            tx.send(Msg::Status(level, text)).ok();
+            (level, text)
         });
     }
 
@@ -2091,26 +2179,30 @@ impl App {
             self.warn("Nothing stored here to verify");
             return;
         }
-        self.status(format!("Verifying {} local blob(s)…", hashes.len()));
-        self.spawn(move |tx| {
+        let title = format!("Verify {} local blob(s)", hashes.len());
+        self.enqueue(title, move |ctx| {
             let total = hashes.len();
-            let mut damaged = 0;
-            for hash in hashes {
+            let (mut verified, mut damaged) = (0, 0);
+            for (i, hash) in hashes.into_iter().enumerate() {
+                if ctx.cancelled() {
+                    break;
+                }
+                ctx.progress(i, total, util::short_hash(&hash));
                 let result = repo::verify_local_blob(&root, &hash);
+                verified += 1;
                 if matches!(result, Ok(LocalHealth::Corrupt { .. })) {
                     damaged += 1;
                 }
-                tx.send(Msg::VerifiedLocal { hash, result }).ok();
+                ctx.send(Msg::VerifiedLocal { hash, result });
             }
-            tx.send(if damaged == 0 {
-                Msg::Status(Level::Success, format!("Verified {total} blob(s): all intact"))
+            if damaged == 0 {
+                (Level::Success, format!("Verified {verified} blob(s): all intact"))
             } else {
-                Msg::Status(Level::Error, format!(
-                    "Verified {total} blob(s): {damaged} DAMAGED, set aside in {} — download them again",
+                (Level::Error, format!(
+                    "Verified {verified} blob(s): {damaged} DAMAGED, set aside in {} — download them again",
                     repo::CORRUPT_DIR
                 ))
-            })
-            .ok();
+            }
         });
     }
 
@@ -2123,33 +2215,33 @@ impl App {
         let Some(root) = self.repo.borrow().as_ref().map(|r| r.root.clone()) else {
             return;
         };
-        self.status(format!(
-            "Downloading {} blob(s) from '{remote_name}' to verify them…",
-            hashes.len()
-        ));
-        self.spawn(move |tx| {
+        let title = format!("Verify {} blob(s) on '{remote_name}'", hashes.len());
+        self.enqueue(title, move |ctx| {
+            let total = hashes.len();
             let (mut ok, mut missing, mut corrupt) = (0, 0, 0);
             let mut failed = None;
-            let configured = mbr::rclone::with_config(&config_path, || {
-                for hash in hashes {
-                    let result = repo::verify_remote_blob(&root, &remote.target, &hash);
-                    match &result {
-                        Ok(RemoteHealth::Ok) => ok += 1,
-                        Ok(RemoteHealth::Missing) => missing += 1,
-                        Ok(RemoteHealth::Corrupt) => corrupt += 1,
-                        Err(e) => {
-                            failed.get_or_insert_with(|| e.clone());
-                        }
-                    }
-                    tx.send(Msg::VerifiedRemote {
-                        remote: remote.name.clone(),
-                        hash,
-                        result,
-                    })
-                    .ok();
+            for (i, hash) in hashes.into_iter().enumerate() {
+                if ctx.cancelled() {
+                    break;
                 }
-                Ok(())
-            });
+                ctx.progress(i, total, util::short_hash(&hash));
+                let result = mbr::rclone::with_config(&config_path, || {
+                    repo::verify_remote_blob(&root, &remote.target, &hash)
+                });
+                match &result {
+                    Ok(RemoteHealth::Ok) => ok += 1,
+                    Ok(RemoteHealth::Missing) => missing += 1,
+                    Ok(RemoteHealth::Corrupt) => corrupt += 1,
+                    Err(e) => {
+                        failed.get_or_insert_with(|| e.clone());
+                    }
+                }
+                ctx.send(Msg::VerifiedRemote {
+                    remote: remote.name.clone(),
+                    hash,
+                    result,
+                });
+            }
             let mut text = format!("'{}': {ok} intact, {missing} missing", remote.name);
             let mut level = Level::Success;
             if missing > 0 {
@@ -2159,11 +2251,11 @@ impl App {
                 text += &format!(", {corrupt} DAMAGED (deleted there; upload them again)");
                 level = Level::Error;
             }
-            if let Some(e) = configured.err().or(failed) {
+            if let Some(e) = failed {
                 text += &format!("; error: {e}");
                 level = Level::Error;
             }
-            tx.send(Msg::Status(level, text)).ok();
+            (level, text)
         });
     }
 
@@ -2580,47 +2672,45 @@ impl App {
             self.warn("Tick at least one remote to back up to");
             return;
         }
-        self.status("Encrypting metadata…");
-        self.spawn(move |tx| {
+        let title = format!("Back up the metadata to {} remote(s)", remotes.len());
+        self.enqueue(title, move |ctx| {
+            let total = remotes.len();
+            ctx.progress(0, total, "encrypting");
             let sealed = metadata::seal(&snapshot, password.expose_secret())
                 .and_then(|sealed| Ok((sealed, metadata::backup_name(password.expose_secret())?)));
             let (sealed, name) = match sealed {
                 Ok(sealed) => sealed,
-                Err(e) => {
-                    tx.send(Msg::Status(
-                        Level::Error,
-                        format!("Metadata backup failed: {e}"),
-                    ))
-                    .ok();
-                    return;
-                }
+                Err(e) => return (Level::Error, format!("Metadata backup failed: {e}")),
             };
-            let total = remotes.len();
             let mut done = 0;
-            let configured = mbr::rclone::with_config(&config_path, || {
-                for remote in remotes {
-                    let result = mbr::remotes::backup_location(&remote.target)
-                        .and_then(|location| metadata::upload(&location, &name, &sealed, &scratch));
-                    if result.is_ok() {
-                        done += 1;
-                    }
-                    tx.send(Msg::MetadataUploaded {
-                        root: root.clone(),
-                        remote: remote.name,
-                        db_hash: snapshot.db_hash.clone(),
-                        result,
-                    })
-                    .ok();
+            for (i, remote) in remotes.into_iter().enumerate() {
+                if ctx.cancelled() {
+                    break;
                 }
-                Ok(())
-            });
-            let mut text = format!("Metadata backed up to {done} of {total} remote(s)");
-            let mut level = Level::Success;
-            if let Err(e) = configured {
-                text += &format!("; error: {e}");
-                level = Level::Error;
+                ctx.progress(i, total, remote.name.as_str());
+                let result = mbr::rclone::with_config(&config_path, || {
+                    mbr::remotes::backup_location(&remote.target)
+                        .and_then(|location| metadata::upload(&location, &name, &sealed, &scratch))
+                });
+                if result.is_ok() {
+                    done += 1;
+                }
+                ctx.send(Msg::MetadataUploaded {
+                    root: root.clone(),
+                    remote: remote.name,
+                    db_hash: snapshot.db_hash.clone(),
+                    result,
+                });
             }
-            tx.send(Msg::Status(level, text)).ok();
+            let level = if done == total {
+                Level::Success
+            } else {
+                Level::Error
+            };
+            (
+                level,
+                format!("Metadata backed up to {done} of {total} remote(s)"),
+            )
         });
     }
 
@@ -2642,6 +2732,43 @@ impl App {
         });
     }
 
+    /// Queue `work` on the open folder as an action titled `title`; it runs
+    /// once those queued before it are done.
+    fn enqueue(
+        &self,
+        title: String,
+        work: impl FnOnce(&actions::Ctx) -> (Level, String) + Send + 'static,
+    ) {
+        let Some(root) = self.root() else { return };
+        let ahead = self
+            .actions
+            .borrow_mut()
+            .push(title.clone(), root, Box::new(work));
+        if ahead > 0 {
+            self.status(format!("Queued: {title} ({ahead} ahead, see Activity)"));
+        }
+        self.start_next_action();
+    }
+
+    /// Start the next queued action, if none is running.
+    fn start_next_action(&self) {
+        let started = self.actions.borrow_mut().start_next(&self.tx);
+        if let Some(title) = started {
+            self.status(format!("{title}…"));
+        }
+        self.show_actions();
+    }
+
+    /// Show the running, queued and finished actions in the Activity tab.
+    fn show_actions(&self) {
+        let actions = self.actions.borrow();
+        self.window
+            .set_action_queue(ModelRc::new(VecModel::from(actions.queue_rows())));
+        self.window
+            .set_action_history(ModelRc::new(VecModel::from(actions.history_rows())));
+        self.window.set_actions_pending(actions.pending() as i32);
+    }
+
     fn push_blobs(&self, remote_name: &str, hashes: Vec<String>) {
         let (Some(remote), Some(config_path)) = (self.remote(remote_name), self.config_path())
         else {
@@ -2656,44 +2783,44 @@ impl App {
                 .collect()
         };
 
-        self.status(format!(
-            "Uploading {} blob(s) to {remote_name}…",
-            blobs.len()
-        ));
-        self.spawn(move |tx| {
+        let title = format!("Upload {} blob(s) to '{remote_name}'", blobs.len());
+        self.enqueue(title, move |ctx| {
             let total = blobs.len();
             let mut done = 0;
             let mut failed = None;
-            let configured = mbr::rclone::with_config(&config_path, || {
-                for (hash, blob) in blobs {
-                    let result = mbr::rclone::push_blob(&remote.target, &blob, &hash);
-                    match &result {
-                        Ok(()) => done += 1,
-                        Err(e) => {
-                            failed.get_or_insert_with(|| e.clone());
-                        }
-                    }
-                    tx.send(Msg::Pushed {
-                        remote: remote.name.clone(),
-                        hash,
-                        result,
-                    })
-                    .ok();
+            for (i, (hash, blob)) in blobs.into_iter().enumerate() {
+                if ctx.cancelled() {
+                    break;
                 }
-                Ok(())
-            });
+                ctx.progress(i, total, util::short_hash(&hash));
+                let result = mbr::rclone::with_config(&config_path, || {
+                    mbr::rclone::push_blob(&remote.target, &blob, &hash)
+                });
+                match &result {
+                    Ok(()) => done += 1,
+                    Err(e) => {
+                        failed.get_or_insert_with(|| e.clone());
+                    }
+                }
+                ctx.send(Msg::Pushed {
+                    remote: remote.name.clone(),
+                    hash,
+                    result,
+                });
+            }
             let mut text = format!("Uploaded {done} of {total} blob(s) to {}", remote.name);
             let mut level = Level::Success;
-            if let Some(e) = configured.err().or(failed) {
+            if let Some(e) = failed {
                 text += &format!("; error: {e}");
                 level = Level::Error;
             }
-            tx.send(Msg::Status(level, text)).ok();
+            (level, text)
         });
     }
 
-    /// Download each `(hash, holders)` job, trying its holders in order.
-    fn fetch_blobs(&self, jobs: Vec<(String, Vec<Remote>)>) {
+    /// Download each `(hash, holders)` job, trying its holders in order;
+    /// all `from` one remote, if named.
+    fn fetch_blobs(&self, jobs: Vec<(String, Vec<Remote>)>, from: Option<&str>) {
         let (Some(config_path), Some(root)) = (
             self.config_path(),
             self.repo.borrow().as_ref().map(|r| r.root.clone()),
@@ -2713,36 +2840,47 @@ impl App {
             return;
         }
 
-        self.status(format!("Downloading {} blob(s)…", jobs.len()));
-        self.spawn(move |tx| {
+        let title = match from {
+            Some(remote) => format!("Download {} blob(s) from '{remote}'", jobs.len()),
+            None => format!("Download {} blob(s)", jobs.len()),
+        };
+        self.enqueue(title, move |ctx| {
             let total = jobs.len();
             let mut done = 0;
             let mut failed = None;
-            let configured = mbr::rclone::with_config(&config_path, || {
-                for (hash, holders) in jobs {
-                    let blob = repo::blob_path_in(&root, &hash);
-                    let result = repo::download_blob(&holders, &hash, &blob);
-                    match &result {
-                        Ok(_) => done += 1,
-                        Err(e) => {
-                            failed.get_or_insert_with(|| e.clone());
-                        }
-                    }
-                    tx.send(Msg::Fetched { hash, result }).ok();
+            for (i, (hash, holders)) in jobs.into_iter().enumerate() {
+                if ctx.cancelled() {
+                    break;
                 }
-                Ok(())
-            });
+                let blob = repo::blob_path_in(&root, &hash);
+                // An action queued earlier may have brought it already.
+                if blob.exists() {
+                    done += 1;
+                    continue;
+                }
+                ctx.progress(i, total, util::short_hash(&hash));
+                let result = mbr::rclone::with_config(&config_path, || {
+                    repo::download_blob(&holders, &hash, &blob)
+                });
+                match &result {
+                    Ok(_) => done += 1,
+                    Err(e) => {
+                        failed.get_or_insert_with(|| e.clone());
+                    }
+                }
+                ctx.send(Msg::Fetched { hash, result });
+            }
             let mut text = format!("Downloaded {done} of {total} blob(s)");
             let mut level = Level::Success;
             if unheld > 0 {
                 text += &format!("; {unheld} not recorded on any remote");
                 level = Level::Warning;
             }
-            if let Some(e) = configured.err().or(failed) {
+            if let Some(e) = failed {
                 text += &format!("; error: {e}");
                 level = Level::Error;
             }
-            tx.send(Msg::Status(level, text)).ok();
+            (level, text)
         });
     }
 
@@ -2773,6 +2911,7 @@ impl App {
                 .into_iter()
                 .map(|h| (h, vec![remote.clone()]))
                 .collect(),
+            Some(name),
         );
     }
 
@@ -2802,20 +2941,33 @@ impl App {
             return;
         }
 
-        self.status(match only {
-            Some(name) => format!("Scanning remote '{name}'…"),
-            None => format!("Scanning {} remote(s)…", remotes.len()),
-        });
-        self.spawn(move |tx| {
-            for remote in remotes {
+        let title = match only {
+            Some(name) => format!("Scan remote '{name}'"),
+            None => format!("Scan {} remote(s)", remotes.len()),
+        };
+        self.enqueue(title, move |ctx| {
+            let total = remotes.len();
+            let mut failed = 0;
+            for (i, remote) in remotes.into_iter().enumerate() {
+                if ctx.cancelled() {
+                    break;
+                }
+                ctx.progress(i, total, remote.name.as_str());
                 let result = mbr::rclone::with_config(&config_path, || {
                     mbr::rclone::list_blobs(&remote.target)
                 });
-                tx.send(Msg::Listed {
+                failed += usize::from(result.is_err());
+                ctx.send(Msg::Listed {
                     remote: remote.name,
                     result,
-                })
-                .ok();
+                });
+            }
+            match failed {
+                0 => (Level::Success, format!("Scanned {total} remote(s)")),
+                _ => (
+                    Level::Error,
+                    format!("{failed} of {total} remote(s) could not be scanned"),
+                ),
             }
         });
     }
@@ -3307,6 +3459,11 @@ impl App {
 
     /// Apply a completion message from a background task (UI thread).
     fn handle(&self, msg: Msg) {
+        if msg.reports_on_an_action()
+            && self.actions.borrow().running_root() != self.root().as_deref()
+        {
+            return; // its folder was closed meanwhile
+        }
         match msg {
             Msg::Pushed {
                 remote,
@@ -3356,35 +3513,16 @@ impl App {
                 Err(e) => self.error(format!("Check on {remote} failed: {e}")),
             },
             Msg::Status(level, text) => self.notify(level, text),
-            Msg::Listed { remote, result } => match result {
-                Ok(found) => self.with_repo("reconcile remote", |repo| {
-                    let Some(r) = repo.db.remote(&remote)? else {
-                        return Err(format!("remote '{remote}' vanished"));
+            Msg::Listed { remote, result } => {
+                let (level, text) =
+                    match result.and_then(|found| self.apply_listing(&remote, found)) {
+                        Ok(note) => note,
+                        Err(e) => (Level::Error, format!("Remote '{remote}' scan failed: {e}")),
                     };
-                    let check = repo.apply_remote_listing(&r, found)?;
-                    let mut text = format!(
-                        "Remote '{remote}' reachable; {} expected blob(s) present",
-                        check.present.len()
-                    );
-                    let mut level = Level::Success;
-                    if !check.missing.is_empty() {
-                        text += &format!(", {} MISSING", check.missing.len());
-                        level = Level::Error;
-                    }
-                    if !check.discovered.is_empty() {
-                        text += &format!(", {} newly recorded", check.discovered.len());
-                    }
-                    if !check.adopted.is_empty() {
-                        text += &format!(
-                            ", {} unknown blob(s) added under {}/",
-                            check.adopted.len(),
-                            repo::UNNAMED_DIR
-                        );
-                    }
-                    Ok((level, text))
-                }),
-                Err(e) => self.error(format!("Remote '{remote}' scan failed: {e}")),
-            },
+                self.notify(level, text.clone());
+                // The scan's summary, in the Activity tab.
+                self.actions.borrow_mut().note(level, text);
+            }
             Msg::RemoteConfig { remote, result } => {
                 let current = self.edit.borrow().as_ref().map(|e| e.original.clone());
                 if current.as_deref() != Some(remote.as_str()) {
@@ -3606,8 +3744,60 @@ impl App {
                 self.tasks.set(left);
                 self.window.set_busy(left > 0);
             }
+            Msg::Progress {
+                id,
+                done,
+                total,
+                doing,
+            } => {
+                self.actions.borrow_mut().progress(id, done, total, doing);
+                self.show_actions();
+            }
+            Msg::ActionDone { id, level, text } => {
+                let (outcome, level, text) = self.actions.borrow_mut().finish(id, level, text);
+                if outcome == actions::Outcome::Cancelled {
+                    self.warn(format!("Cancelled: {text}"));
+                } else {
+                    self.notify(level, text);
+                }
+                self.start_next_action();
+            }
             Msg::Peer(event) => self.peer_event(event),
         }
+    }
+
+    /// Reconcile the database with what remote `remote` holds: how it went.
+    fn apply_listing(
+        &self,
+        remote: &str,
+        found: Vec<RemoteBlob>,
+    ) -> Result<(Level, String), String> {
+        let mut repo = self.repo.borrow_mut();
+        let repo = repo.as_mut().ok_or("no folder open")?;
+        let Some(r) = repo.db.remote(remote)? else {
+            return Err(format!("remote '{remote}' vanished"));
+        };
+        let check = repo.apply_remote_listing(&r, found)?;
+        let mut text = format!(
+            "Remote '{remote}' reachable; {} expected blob(s) present",
+            check.present.len()
+        );
+        let mut level = Level::Success;
+        if !check.missing.is_empty() {
+            text += &format!(", {} MISSING", check.missing.len());
+            level = Level::Error;
+        }
+        if !check.discovered.is_empty() {
+            text += &format!(", {} newly recorded", check.discovered.len());
+        }
+        if !check.adopted.is_empty() {
+            text += &format!(
+                ", {} unknown blob(s) added under {}/",
+                check.adopted.len(),
+                repo::UNNAMED_DIR
+            );
+        }
+        Ok((level, text))
     }
 
     // ── view refresh ──

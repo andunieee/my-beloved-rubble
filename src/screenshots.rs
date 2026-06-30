@@ -233,6 +233,12 @@ pub fn run(out: &Path) -> Result<(), slint::PlatformError> {
         .set_status_text("Synced: 3 file(s) updated".into());
     s.shoot("peers");
 
+    show_activity(&app);
+    app.window.set_active_tab(4);
+    app.window
+        .set_status_text("Queued: Upload 12 blob(s) to 'backblaze' (1 ahead, see Activity)".into());
+    s.shoot("activity");
+
     // ── on a phone ──
     s.resize(PHONE);
     app.window.set_desktop(false);
@@ -256,6 +262,9 @@ pub fn run(out: &Path) -> Result<(), slint::PlatformError> {
     app.window.set_active_tab(3);
     app.window.set_show_panel(true);
     s.shoot("phone-add-peer");
+    app.window.set_active_tab(4);
+    app.window.set_show_panel(false);
+    s.shoot("phone-activity");
     app.window.set_active_tab(0);
     app.window.set_desktop(true);
 
@@ -288,6 +297,7 @@ fn new_app() -> App {
         repo: Rc::new(RefCell::new(None)),
         tx,
         tasks: Rc::new(Cell::new(0)),
+        actions: RefCell::new(actions::Actions::default()),
         scanning: Cell::new(false),
         statuses: RefCell::new(Vec::new()),
         files,
@@ -306,6 +316,7 @@ fn new_app() -> App {
         previewed: RefCell::new(None),
         setup: RefCell::new(None),
         pending_folder: RefCell::new(None),
+        scan_again: Cell::new(false),
         status_timer: slint::Timer::default(),
     };
 
@@ -318,6 +329,42 @@ fn new_app() -> App {
         app.select_backend(first.title);
     }
     app
+}
+
+/// A download running, an upload queued and a few finished actions.
+fn show_activity(app: &App) {
+    let row = |title: &str, detail: &str, when: &str, state, progress| ActionRow {
+        id: 0,
+        title: title.into(),
+        detail: detail.into(),
+        when: when.into(),
+        state,
+        progress,
+    };
+    app.window
+        .set_action_queue(ModelRc::new(VecModel::from(vec![
+            row(
+                "Download 48 blob(s) from 'gdrive'",
+                "17 of 48 · 3f9a1c0e",
+                "started 2026-11-05 14:02",
+                0,
+                17.0 / 48.0,
+            ),
+            row(
+                "Upload 12 blob(s) to 'backblaze'",
+                "Waiting for the actions above",
+                "queued 2026-11-05 14:03",
+                1,
+                -1.0,
+            ),
+        ])));
+    app.window.set_action_history(ModelRc::new(VecModel::from(vec![
+        row("Scan 3 remote(s)", "Remote 'gdrive' reachable; 212 expected blob(s) present; Remote 'backblaze' reachable; 198 expected blob(s) present, 2 MISSING; Remote 'usb-disk' reachable; 240 expected blob(s) present", "family-archive · 2026-11-05 13:58 · took 41s", 4, -1.0),
+        row("Verify 240 local blob(s)", "Verified 240 blob(s): all intact", "family-archive · 2026-11-05 13:40 · took 3m 12s", 2, -1.0),
+        row("Free up space: 30 blob(s)", "Freed 1.2 GiB (28 blob(s)); kept 2 that fewer than 2 remote(s) are confirmed to hold", "family-archive · 2026-11-05 12:15 · took 52s", 3, -1.0),
+        row("Upload 5 blob(s) to 'usb-disk'", "Cancelled before it started", "family-archive · 2026-11-05 12:10 · took 0s", 5, -1.0),
+    ])));
+    app.window.set_actions_pending(2);
 }
 
 fn select(app: &App, paths: &[&str]) {

@@ -143,6 +143,15 @@ impl AppState {
         Some(APP_DIR.get()?.join("inbox"))
     }
 
+    /// `<cache dir>/mbr` (or `cache` in the app's own storage): for what
+    /// can be lost, like the GUI's list of recent actions.
+    pub fn cache_dir() -> Option<PathBuf> {
+        if let Some(dir) = APP_DIR.get() {
+            return Some(dir.join("cache"));
+        }
+        Some(dirs::cache_dir()?.join("mbr"))
+    }
+
     /// `<config dir>/mbr/state.json` (or in the app's own storage).
     pub fn default_path() -> Option<PathBuf> {
         if let Some(dir) = APP_DIR.get() {
@@ -215,7 +224,11 @@ fn move_old_folder(dir: &Path) {
         let moved = std::fs::create_dir_all(&folders)
             .and_then(|()| std::fs::rename(&old, folders.join(DEFAULT_FOLDER)));
         if let Err(e) = moved {
-            log::warn!("cannot move {} into {}: {e}", old.display(), folders.display());
+            log::warn!(
+                "cannot move {} into {}: {e}",
+                old.display(),
+                folders.display()
+            );
         }
     }
 }
