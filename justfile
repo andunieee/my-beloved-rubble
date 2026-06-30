@@ -78,7 +78,36 @@ android-build action="build":
         fi
     fi
 
-    cargo apk {{action}} --release --lib
+    cargo apk build --release --lib
+
+    # cargo-apk can neither ship Java nor declare a content provider: add
+    # java/'s provider (which lends files to other apps for "Open with"
+    # and "Share") and its manifest entry, then repackage and re-sign.
+    build_tools=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+    jar="$ANDROID_HOME/platforms/android-34/android.jar"
+    apk_dir="$(cargo metadata --no-deps --format-version 1 | jq -r .target_directory)/release/apk"
+    classes=$(mktemp -d)
+    trap 'rm -r "$classes"' EXIT
+    javac -d "$classes" -classpath "$jar" --release 11 java/computer/mybelovedrubble/*.java
+    "$build_tools/d8" --release --min-api 26 --lib "$jar" --output "$apk_dir" $(find "$classes" -name '*.class')
+    sed -i 's|</application>|<provider android:name="computer.mybelovedrubble.Files" android:authorities="computer.mybelovedrubble.files" android:exported="false" android:grantUriPermissions="true"/></application>|' \
+        "$apk_dir/AndroidManifest.xml"
+    res="$PWD/res"
+    (
+        cd "$apk_dir"
+        libs=$("$build_tools/aapt" list my-beloved-rubble-unaligned.apk | grep '^lib/')
+        "$build_tools/aapt" package -f -F my-beloved-rubble-unaligned.apk -M AndroidManifest.xml -I "$jar" -S "$res"
+        "$build_tools/aapt" add my-beloved-rubble-unaligned.apk classes.dex $libs
+        "$build_tools/zipalign" -f 4 my-beloved-rubble-unaligned.apk my-beloved-rubble.apk
+        "$build_tools/apksigner" sign --ks "$CARGO_APK_RELEASE_KEYSTORE" \
+            --ks-pass "pass:$CARGO_APK_RELEASE_KEYSTORE_PASSWORD" my-beloved-rubble.apk
+    )
+
+    if [ "{{action}}" = run ]; then
+        adb install -r "$apk_dir/my-beloved-rubble.apk"
+        adb shell am start -n computer.mybelovedrubble/android.app.NativeActivity
+        adb logcat -s mbr
+    fi
 
 # build the arm64 apk and install it on every android device connected through adb
 android-install: android-build

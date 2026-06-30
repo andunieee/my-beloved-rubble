@@ -646,8 +646,12 @@ export component AppWindow inherits Window {
     // blob selection: `toggle` is Ctrl/Cmd, `extend` is Shift
     callback row-pressed(index: int, toggle: bool, extend: bool);
     callback row-dragged(index: int);
-    // open a listed file (if it is here) with the system's app for it
+    // open a listed file (if it is here) with the system's app for it;
+    // on Android, images in the app's own viewer
     callback open-file(index: int);
+    // Android: open a listed file with another app, or share it
+    callback open-with(index: int);
+    callback share-file(index: int);
     callback select-all();
     callback clear-selection();
     // actions on the selected blobs
@@ -1548,10 +1552,20 @@ export component AppWindow inherits Window {
                             }
                             if root.files[root.detail-index].present: HorizontalLayout {
                                 alignment: start;
-                                Button {
+                                spacing: 6px;
+                                if root.desktop: Button {
                                     text: "Open";
                                     primary: true;
                                     clicked => { root.open-file(root.detail-index); }
+                                }
+                                if !root.desktop: Button {
+                                    text: "Open with";
+                                    primary: true;
+                                    clicked => { root.open-with(root.detail-index); }
+                                }
+                                if !root.desktop: Button {
+                                    text: "Share";
+                                    clicked => { root.share-file(root.detail-index); }
                                 }
                             }
                             DetailLine { label: "hash"; value: root.files[root.detail-index].hash; }

@@ -505,38 +505,203 @@ mod platform {
     /// Open `url` in the browser, through an Android intent.
     #[cfg(target_os = "android")]
     pub fn open_url(url: &str) -> Result<(), String> {
-        use jni::objects::{JObject, JValue};
+        with_activity(|env, activity| {
+            let url = env.new_string(url)?;
+            let uri = env
+                .call_static_method(
+                    "android/net/Uri",
+                    "parse",
+                    "(Ljava/lang/String;)Landroid/net/Uri;",
+                    &[JValue::Object(&url)],
+                )?
+                .l()?;
+            let intent = intent(env, "android.intent.action.VIEW")?;
+            env.call_method(
+                &intent,
+                "setData",
+                "(Landroid/net/Uri;)Landroid/content/Intent;",
+                &[JValue::Object(&uri)],
+            )?;
+            start_activity(env, activity, &intent)
+        })
+    }
+
+    /// Open `path`, in the app's own storage, with the app Android has
+    /// for its type (asking which, if there is no default).
+    #[cfg(target_os = "android")]
+    pub fn open_with(path: &std::path::Path) -> Result<(), String> {
+        with_activity(|env, activity| {
+            let (uri, mime) = content_uri(env, activity, path)?;
+            let intent = intent(env, "android.intent.action.VIEW")?;
+            env.call_method(
+                &intent,
+                "setDataAndType",
+                "(Landroid/net/Uri;Ljava/lang/String;)Landroid/content/Intent;",
+                &[JValue::Object(&uri), JValue::Object(&mime)],
+            )?;
+            grant_read(env, &intent)?;
+            start_activity(env, activity, &intent)
+        })
+    }
+
+    /// Hand `path`, in the app's own storage, to the share sheet.
+    #[cfg(target_os = "android")]
+    pub fn share(path: &std::path::Path) -> Result<(), String> {
+        with_activity(|env, activity| {
+            let (uri, mime) = content_uri(env, activity, path)?;
+            let intent = intent(env, "android.intent.action.SEND")?;
+            env.call_method(
+                &intent,
+                "setType",
+                "(Ljava/lang/String;)Landroid/content/Intent;",
+                &[JValue::Object(&mime)],
+            )?;
+            let stream = env.new_string("android.intent.extra.STREAM")?;
+            env.call_method(
+                &intent,
+                "putExtra",
+                "(Ljava/lang/String;Landroid/os/Parcelable;)Landroid/content/Intent;",
+                &[JValue::Object(&stream), JValue::Object(&uri)],
+            )?;
+            grant_read(env, &intent)?;
+            let chooser = env
+                .call_static_method(
+                    "android/content/Intent",
+                    "createChooser",
+                    "(Landroid/content/Intent;Ljava/lang/CharSequence;)Landroid/content/Intent;",
+                    &[JValue::Object(&intent), JValue::Object(&JObject::null())],
+                )?
+                .l()?;
+            start_activity(env, activity, &chooser)
+        })
+    }
+
+    #[cfg(target_os = "android")]
+    use jni::{
+        JNIEnv,
+        objects::{JObject, JValue},
+    };
+
+    /// Run `f` with the JNI environment and the activity, turning a Java
+    /// exception into an error (cleared, so later calls into Java work).
+    #[cfg(target_os = "android")]
+    fn with_activity(
+        f: impl for<'a> FnOnce(&mut JNIEnv<'a>, &JObject<'a>) -> jni::errors::Result<()>,
+    ) -> Result<(), String> {
         let fail = |e: jni::errors::Error| e.to_string();
         let ctx = ndk_context::android_context();
         let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.map_err(fail)?;
         let mut env = vm.attach_current_thread().map_err(fail)?;
         let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
-        let url = env.new_string(url).map_err(fail)?;
-        let uri = env
-            .call_static_method(
-                "android/net/Uri",
-                "parse",
-                "(Ljava/lang/String;)Landroid/net/Uri;",
-                &[JValue::Object(&url)],
-            )
-            .and_then(|v| v.l())
-            .map_err(fail)?;
-        let action = env.new_string("android.intent.action.VIEW").map_err(fail)?;
-        let intent = env
-            .new_object(
-                "android/content/Intent",
-                "(Ljava/lang/String;Landroid/net/Uri;)V",
-                &[JValue::Object(&action), JValue::Object(&uri)],
-            )
-            .map_err(fail)?;
+        let result = f(&mut env, &activity);
+        if let Ok(thrown) = env.exception_occurred()
+            && !thrown.is_null()
+        {
+            env.exception_clear().map_err(fail)?;
+            if env
+                .is_instance_of(&thrown, "android/content/ActivityNotFoundException")
+                .unwrap_or(false)
+            {
+                return Err("no app on this device can open it".into());
+            }
+            let text = env
+                .call_method(&thrown, "toString", "()Ljava/lang/String;", &[])
+                .and_then(|v| v.l())
+                .and_then(|s| env.get_string(&s.into()).map(String::from));
+            env.exception_clear().ok();
+            return Err(text.unwrap_or_else(|_| "a Java exception".into()));
+        }
+        result.map_err(fail)
+    }
+
+    #[cfg(target_os = "android")]
+    fn intent<'a>(env: &mut JNIEnv<'a>, action: &str) -> jni::errors::Result<JObject<'a>> {
+        let action = env.new_string(action)?;
+        env.new_object(
+            "android/content/Intent",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(&action)],
+        )
+    }
+
+    /// Let the app the intent reaches read its uri.
+    #[cfg(target_os = "android")]
+    fn grant_read(env: &mut JNIEnv, intent: &JObject) -> jni::errors::Result<()> {
+        const FLAG_GRANT_READ_URI_PERMISSION: i32 = 1;
         env.call_method(
-            &activity,
+            intent,
+            "addFlags",
+            "(I)Landroid/content/Intent;",
+            &[JValue::Int(FLAG_GRANT_READ_URI_PERMISSION)],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "android")]
+    fn start_activity(
+        env: &mut JNIEnv,
+        activity: &JObject,
+        intent: &JObject,
+    ) -> jni::errors::Result<()> {
+        env.call_method(
+            activity,
             "startActivity",
             "(Landroid/content/Intent;)V",
-            &[JValue::Object(&intent)],
-        )
-        .map_err(fail)?;
+            &[JValue::Object(intent)],
+        )?;
         Ok(())
+    }
+
+    /// `path`, in the app's files dir, as a uri of the app's provider
+    /// (android/java), with its MIME type.
+    #[cfg(target_os = "android")]
+    fn content_uri<'a>(
+        env: &mut JNIEnv<'a>,
+        activity: &JObject<'a>,
+        path: &std::path::Path,
+    ) -> jni::errors::Result<(JObject<'a>, JObject<'a>)> {
+        let files_dir = env
+            .call_method(activity, "getFilesDir", "()Ljava/io/File;", &[])?
+            .l()?;
+        let files_dir = env
+            .call_method(&files_dir, "getPath", "()Ljava/lang/String;", &[])?
+            .l()?;
+        let files_dir = PathBuf::from(String::from(env.get_string(&files_dir.into())?));
+        let relative = path.strip_prefix(&files_dir).unwrap_or(path);
+        let builder = env.new_object("android/net/Uri$Builder", "()V", &[])?;
+        for (method, value) in [
+            ("scheme", "content".to_owned()),
+            ("authority", "computer.mybelovedrubble.files".to_owned()),
+            ("path", format!("/{}", relative.to_string_lossy())),
+        ] {
+            let value = env.new_string(value)?;
+            env.call_method(
+                &builder,
+                method,
+                "(Ljava/lang/String;)Landroid/net/Uri$Builder;",
+                &[JValue::Object(&value)],
+            )?;
+        }
+        let uri = env
+            .call_method(&builder, "build", "()Landroid/net/Uri;", &[])?
+            .l()?;
+        let resolver = env
+            .call_method(
+                activity,
+                "getContentResolver",
+                "()Landroid/content/ContentResolver;",
+                &[],
+            )?
+            .l()?;
+        let mime = env
+            .call_method(
+                &resolver,
+                "getType",
+                "(Landroid/net/Uri;)Ljava/lang/String;",
+                &[JValue::Object(&uri)],
+            )?
+            .l()?;
+        Ok((uri, mime))
     }
 
     /// Ask for a folder (none on Android: the app has its own).
@@ -653,6 +818,14 @@ pub fn run() -> Result<(), slint::PlatformError> {
     {
         let app = app.clone();
         w.on_open_file(move |index| app.open_file(index as usize));
+    }
+    {
+        let app = app.clone();
+        w.on_open_with(move |index| app.open_with(index as usize));
+    }
+    {
+        let app = app.clone();
+        w.on_share_file(move |index| app.share_file(index as usize));
     }
     {
         let app = app.clone();
@@ -1525,31 +1698,57 @@ impl App {
         }
     }
 
-    /// Open the file listed at `index`: with the app the system chooses
-    /// on the desktop; images in the app's own viewer on Android, where
-    /// other apps can't read the folder.
-    fn open_file(&self, index: usize) {
-        let Some(status) = self.statuses.borrow().get(index).cloned() else {
-            return;
-        };
+    /// The path of the file listed at `index`, if it is on this device
+    /// (warning if it isn't).
+    fn local_file(&self, index: usize) -> Option<(String, PathBuf)> {
+        let status = self.statuses.borrow().get(index).cloned()?;
         if !status.present_locally {
             self.warn(format!(
                 "{} isn't on this device: download it first",
                 status.path
             ));
-            return;
+            return None;
         }
+        let path = self.root()?.join(&status.path);
+        Some((status.path, path))
+    }
+
+    /// Open the file listed at `index`: with the app the system chooses
+    /// on the desktop; on Android, images in the app's own viewer and
+    /// anything else with another app.
+    fn open_file(&self, index: usize) {
         #[cfg(target_os = "android")]
         if self.window.get_detail_index() == index as i32 && self.window.get_has_detail_preview() {
-            self.window.set_viewer_open(true);
-        } else {
-            self.warn("Only images can be opened on Android for now");
+            if self.local_file(index).is_some() {
+                self.window.set_viewer_open(true);
+            }
+            return;
         }
+        self.open_with(index);
+    }
+
+    /// Open the file listed at `index` with the system's app for it.
+    fn open_with(&self, index: usize) {
+        let Some((name, path)) = self.local_file(index) else {
+            return;
+        };
+        #[cfg(target_os = "android")]
+        let opened = platform::open_with(&path);
         #[cfg(not(target_os = "android"))]
-        if let Some(root) = self.root()
-            && let Err(e) = open::that_detached(root.join(&status.path))
+        let opened = open::that_detached(path).map_err(|e| e.to_string());
+        if let Err(e) = opened {
+            self.error(format!("Cannot open {name}: {e}"));
+        }
+    }
+
+    /// Hand the file listed at `index` to another app (Android).
+    #[cfg_attr(not(target_os = "android"), allow(unused_variables))]
+    fn share_file(&self, index: usize) {
+        #[cfg(target_os = "android")]
+        if let Some((name, path)) = self.local_file(index)
+            && let Err(e) = platform::share(&path)
         {
-            self.error(format!("Cannot open {}: {e}", status.path));
+            self.error(format!("Cannot share {name}: {e}"));
         }
     }
 

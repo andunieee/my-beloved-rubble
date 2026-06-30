@@ -291,6 +291,7 @@ jobs:
         run: |
           apk="android/target/release/apk/my-beloved-rubble.apk"
           unzip -l "$apk" | grep -q 'lib/arm64-v8a/librclonego.so'
+          unzip -l "$apk" | grep -q 'classes.dex'
           build_tools="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
           "$build_tools/apksigner" verify --print-certs "$apk"
           mkdir -p dist
