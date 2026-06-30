@@ -82,6 +82,31 @@ global Side {
     out property <length> text-width: self.width - 28px;
 }
 
+// Where the focused text input ends, so that the window can be bumped up
+// just enough to keep it above the on-screen keyboard.
+global Keyboard {
+    // The bottom of the focused input in the unbumped layout.
+    in-out property <length> input-bottom;
+    // How much the layout is currently bumped up.
+    in-out property <length> bump;
+}
+
+component InputLine inherits LineEdit {
+    changed has-focus => {
+        if self.has-focus {
+            Keyboard.input-bottom = self.absolute-position.y + self.height + Keyboard.bump;
+        }
+    }
+}
+
+component InputSpin inherits SpinBox {
+    changed has-focus => {
+        if self.has-focus {
+            Keyboard.input-bottom = self.absolute-position.y + self.height + Keyboard.bump;
+        }
+    }
+}
+
 component Hint inherits Text {
     font-size: 11px;
     wrap: word-wrap;
@@ -305,7 +330,7 @@ component BackendForm inherits VerticalLayout {
             enabled: root.enabled;
             selected => { root.values[i] = field.examples[self.current-index]; }
         }
-        if field.kind != 2: LineEdit {
+        if field.kind != 2: InputLine {
             text: root.values[i];
             enabled: root.enabled;
             placeholder-text: field.default;
@@ -353,7 +378,7 @@ component SetupForm inherits VerticalLayout {
         enabled: !root.busy && root.state == "";
         selected(title) => { root.select-backend(title); }
     }
-    if root.ask-name: LineEdit {
+    if root.ask-name: InputLine {
         placeholder-text: "my-cloud-drive";
         text <=> root.name;
         enabled: !root.busy && root.state == "";
@@ -392,7 +417,7 @@ component SetupForm inherits VerticalLayout {
                 checked: root.answer == "true";
                 toggled => { root.answer = self.checked ? "true" : "false"; }
             }
-            if !root.boolean: LineEdit {
+            if !root.boolean: InputLine {
                 text <=> root.answer;
             }
             HorizontalLayout {
@@ -700,7 +725,19 @@ export component AppWindow inherits Window {
     callback restore-from-remote(backend: string, values: [string], password: string);
     callback cancel-restore();
 
+    // Slint doesn't resize the window for the on-screen keyboard, so the
+    // layout is bumped up by just what it takes for the focused input to end
+    // above the keyboard: nothing if it already does, and never more than
+    // the keyboard's height.
+    property <length> keyboard-height: self.virtual-keyboard-size.height;
+    property <length> bump: root.keyboard-height <= 0 ? 0px : Math.min(root.keyboard-height,
+        Math.max(0px, Keyboard.input-bottom + 8px - (root.height - root.keyboard-height)));
+    changed bump => {
+        Keyboard.bump = root.bump;
+    }
+
     VerticalLayout {
+        y: -root.bump;
         // Keep the UI out from under the status bar, navigation bar, notches
         // and rounded corners. These are 0 on desktop.
         padding-top: root.safe-area-insets.top;
@@ -934,7 +971,7 @@ export component AppWindow inherits Window {
                                         text-width: root.column-width;
                                         pick => { root.pick-restore-file(); }
                                     }
-                                    LineEdit {
+                                    InputLine {
                                         input-type: InputType.password;
                                         font-family: "Password Dots";
                                         placeholder-text: "master password";
@@ -964,7 +1001,7 @@ export component AppWindow inherits Window {
                                         text: "The backup is found with the master password and the remote's settings: fill them in as when the remote was set up.";
                                         width: root.column-width;
                                     }
-                                    LineEdit {
+                                    InputLine {
                                         input-type: InputType.password;
                                         font-family: "Password Dots";
                                         placeholder-text: "master password";
@@ -1153,7 +1190,7 @@ export component AppWindow inherits Window {
                             font-size: 12px;
                             vertical-alignment: center;
                         }
-                        SpinBox {
+                        InputSpin {
                             max-height: self.min-height;
                             width: 96px;
                             minimum: 1;
@@ -1708,13 +1745,13 @@ width: Side.text-width;
                             Hint {
                                 text: "Remotes and metadata backups are encrypted with it. Write it down: it can't be recovered.";
                             }
-                            LineEdit {
+                            InputLine {
                                 input-type: InputType.password;
                                 font-family: "Password Dots";
                                 placeholder-text: "master password";
                                 text <=> root.pw-new;
                             }
-                            LineEdit {
+                            InputLine {
                                 input-type: InputType.password;
                                 font-family: "Password Dots";
                                 placeholder-text: "repeat it";
@@ -1739,7 +1776,7 @@ width: Side.text-width;
                             Hint {
                                 text: "It was set on another device. Type it once to use the remotes and back up metadata here; it is then saved on this computer.";
                             }
-                            LineEdit {
+                            InputLine {
                                 input-type: InputType.password;
                                 font-family: "Password Dots";
                                 placeholder-text: "master password";
@@ -1773,7 +1810,7 @@ width: Side.text-width;
                             }
                             if root.testing-password: VerticalLayout {
                                 spacing: 6px;
-                                LineEdit {
+                                InputLine {
                                     input-type: InputType.password;
                                     font-family: "Password Dots";
                                     placeholder-text: "enter master password to test";
@@ -1927,11 +1964,11 @@ width: Side.text-width;
                             if root.nearby-peers.length == 0 && root.discovering: Hint {
                                 text: "Looking for mbr devices on this local network…";
                             }
-                            LineEdit {
+                            InputLine {
                                 placeholder-text: "its id";
                                 text <=> root.peer-new-id;
                             }
-                            LineEdit {
+                            InputLine {
                                 placeholder-text: "a name for it (e.g. laptop)";
                                 text <=> root.peer-new-name;
                                 accepted => { root.add-peer(root.peer-new-id, root.peer-new-name); }
@@ -1959,7 +1996,7 @@ width: Side.text-width;
                             SectionTitle { text: "EDIT REMOTE “" + root.edit-original + "”"; help: "remotes/#editing-a-remote"; }
 
                             Text { text: "Name"; font-size: 12px; font-weight: 600; }
-                            LineEdit {
+                            InputLine {
                                 text <=> root.edit-name;
                                 enabled: !root.busy;
                             }
@@ -2142,7 +2179,7 @@ width: Side.text-width;
     // ══ Android: switching between the app's folders ══
     if root.choosing-folder: Rectangle {
         x: 0;
-        y: 0;
+        y: -root.bump;
         width: root.width;
         height: root.height;
         background: Palette.background;
@@ -2207,7 +2244,7 @@ width: Side.text-width;
             SectionTitle { text: "NEW FOLDER"; }
             HorizontalLayout {
                 spacing: 6px;
-                LineEdit {
+                InputLine {
                     placeholder-text: "its name (e.g. Photos)";
                     text <=> root.new-folder-name;
                     accepted => { root.create-folder(root.new-folder-name); }
