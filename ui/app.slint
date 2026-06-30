@@ -689,7 +689,7 @@ export component AppWindow inherits Window {
                     font-size: 16px;
                     vertical-alignment: center;
                 }
-                HorizontalLayout {
+                if root.folder != "": HorizontalLayout {
                     spacing: root.compact ? 2px : 4px;
                     padding-left: root.compact ? 0px : 8px;
                     TabButton {
@@ -726,10 +726,10 @@ export component AppWindow inherits Window {
                     text: root.compact ? "Open…" : "Open Folder…";
                     clicked => { root.open-folder(); }
                 }
-                Button {
+                if root.folder != "": Button {
                     text: "Rescan";
                     icon: root.compact ? "M 21 12 A 9 9 0 1 1 12 3 C 14.52 3 16.93 4 18.74 5.74 L 21 8 M 21 3 L 21 8 L 16 8" : "";
-                    enabled: root.folder != "" && !root.busy;
+                    enabled: !root.busy;
                     clicked => { root.rescan(); }
                 }
             }
