@@ -1,4 +1,7 @@
 import { CheckBox, LineEdit, ListView, Palette, ComboBox, ScrollView, SpinBox } from "std-widgets.slint";
+// Password fields draw their text as "●", which Android's fonts lack, so
+// it comes from this tiny bundled font (other glyphs fall back as usual).
+import "password-dots.ttf";
 
 export struct FileRow {
     path: string,
@@ -922,6 +925,7 @@ export component AppWindow inherits Window {
                                     }
                                     LineEdit {
                                         input-type: InputType.password;
+                                        font-family: "Password Dots";
                                         placeholder-text: "master password";
                                         text <=> root.pw-restore;
                                     }
@@ -951,6 +955,7 @@ export component AppWindow inherits Window {
                                     }
                                     LineEdit {
                                         input-type: InputType.password;
+                                        font-family: "Password Dots";
                                         placeholder-text: "master password";
                                         text <=> root.pw-restore;
                                         enabled: root.setup-state == "";
@@ -1684,11 +1689,13 @@ width: Side.text-width;
                             }
                             LineEdit {
                                 input-type: InputType.password;
+                                font-family: "Password Dots";
                                 placeholder-text: "master password";
                                 text <=> root.pw-new;
                             }
                             LineEdit {
                                 input-type: InputType.password;
+                                font-family: "Password Dots";
                                 placeholder-text: "repeat it";
                                 text <=> root.pw-repeat;
                                 accepted => { root.set-password(root.pw-new, root.pw-repeat); }
@@ -1713,6 +1720,7 @@ width: Side.text-width;
                             }
                             LineEdit {
                                 input-type: InputType.password;
+                                font-family: "Password Dots";
                                 placeholder-text: "master password";
                                 text <=> root.unlock-entry;
                                 accepted => { root.unlock(root.unlock-entry); }
@@ -1746,6 +1754,7 @@ width: Side.text-width;
                                 spacing: 6px;
                                 LineEdit {
                                     input-type: InputType.password;
+                                    font-family: "Password Dots";
                                     placeholder-text: "enter master password to test";
                                     text <=> root.test-password-entry;
                                     accepted => { root.test-password(root.test-password-entry); }
