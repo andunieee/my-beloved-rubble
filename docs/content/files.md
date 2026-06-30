@@ -48,8 +48,9 @@ folder:
 ## Activity
 
 Uploads, downloads, scans of remotes, checks, verifications, freeing space and metadata backups don't have to wait
-for each other: start as many as you like. They queue up in the **Activity** tab and run one at a time, in the order
-they were started. The tab shows the one running, how far it got, and the ones waiting their turn.
+for each other: start as many as you like. They queue up and run one at a time, in the order they were started. The
+activity icon (two arrows) at the top shows how many are running or waiting, and opens the list of them: the one
+running, how far it got, and the ones waiting their turn.
 
 **Cancel** takes a waiting action off the queue, or stops the running one after the file it is on. Closing or
 switching folders cancels the folder's actions.

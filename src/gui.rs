@@ -2,13 +2,14 @@
 
 //! `my-beloved-rubble` — the Slint GUI.
 //!
-//! Five tabs: **Blobs** (the annotated file listing, with multi-selection
+//! Three tabs: **Blobs** (the annotated file listing, with multi-selection
 //! and a sidebar acting on the selected blobs), **Remotes** (listing,
-//! scanning, downloading from, setting up and editing remotes),
-//! **Settings** (the master password, and which remotes receive the
-//! encrypted metadata backups), **Peers** (the other devices the
-//! folder's metadata syncs with, over iroh) and **Activity** (the queue of
-//! transfers and checks, see [`actions`]). A folder that isn't an mbr
+//! scanning, downloading from, setting up and editing remotes) and
+//! **Settings**, in two parts: **Metadata** (the master password, and which
+//! remotes receive the encrypted metadata backups) and **Peers** (the other
+//! devices the folder's metadata syncs with, over iroh). An icon opens
+//! **Activity**, the queue of transfers and checks (see [`actions`]). A
+//! folder that isn't an mbr
 //! folder yet first asks whether to start anew there or restore a lost
 //! folder into it.
 //!
@@ -2745,7 +2746,7 @@ impl App {
             .borrow_mut()
             .push(title.clone(), root, Box::new(work));
         if ahead > 0 {
-            self.status(format!("Queued: {title} ({ahead} ahead, see Activity)"));
+            self.status(format!("Queued: {title} ({ahead} ahead)"));
         }
         self.start_next_action();
     }

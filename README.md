@@ -188,7 +188,7 @@ The backup's database and rclone config become the folder's, so its remotes, fol
 
 ## Syncing between devices
 
-A folder can live on several devices that sync its metadata over [iroh](https://iroh.computer) (the Peers tab, or `mbr peer` and `mbr sync`). Each device has an id per folder (an iroh endpoint key kept in `local.json`); two devices sync once each has added the other's id. While the Peers tab is open, mbr also discovers other mbr devices on the local network and offers to add them. A new device starts an empty folder, which *joins* the other's: it is handed the iroh-docs namespace secret and adopts it. Two folders that both hold files never merge.
+A folder can live on several devices that sync its metadata over [iroh](https://iroh.computer) (Settings → Peers, or `mbr peer` and `mbr sync`). Each device has an id per folder (an iroh endpoint key kept in `local.json`); two devices sync once each has added the other's id. While Settings → Peers is open, mbr also discovers other mbr devices on the local network and offers to add them. A new device starts an empty folder, which *joins* the other's: it is handed the iroh-docs namespace secret and adopts it. Two folders that both hold files never merge.
 
 A sync is iroh-docs set reconciliation of the entries, then an exchange of the few values entries point at (settings, remotes); the newest entry of each key wins, whichever device wrote it. Synced changes become links in the folder (dangling until downloaded from a remote), except for files changed locally since the last scan, which the next scan records as the newest change. Blob content never travels between devices, and neither does the master password: each device types it, checked against the check in the metadata.
 

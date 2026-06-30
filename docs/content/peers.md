@@ -11,17 +11,17 @@ directly when they are on the same network, through a relay otherwise. The files
 it lives on the [remotes](../remotes/), and each device downloads what it needs from them.
 
 <p align="center">
-  <img src="../screenshots/peers.png" alt="The Peers tab: two peers, a device asking to sync, and one found on the local network">
+  <img src="../screenshots/peers.png" alt="Settings → Peers: two peers, a device asking to sync, and one found on the local network">
 </p>
 
 ## Adding a device
 
-Every device has an id for each folder, shown in the **Peers** tab under **This computer** (`mbr peer id`). To sync two
+Every device has an id for each folder, shown in **Settings → Peers** under **This computer** (`mbr peer id`). To sync two
 devices, add each one's id on the other: **Add a peer** (`mbr peer add <id> --name laptop`). Syncing starts once *both*
 have added each other; until then the one that was added says *waiting for them to add this device as a peer*. A device
 that isn't a peer but tries to sync shows up under **Add a peer**, in *Wants to sync this folder*, with **Add**.
 
-While the **Peers** tab is open, mbr also looks for other mbr devices on the same local network. They appear under
+While **Settings → Peers** is open, mbr also looks for other mbr devices on the same local network. They appear under
 **Add a peer** with the name each one announces, and **Add** adds one without typing its id. This is how to bring a
 folder to a new device without copying long ids around.
 
@@ -41,7 +41,7 @@ are the exception: their path belongs to the machine that set them up, so they s
 
 The app syncs with every peer when the folder is opened, after every scan, every minute, and on **Sync now**. From the
 command line, `mbr sync` scans and syncs once; `mbr sync --watch` keeps running, accepting the peers' syncs and syncing
-every minute. A folder with no peers makes no network connections unless the **Peers** tab is open, where it listens for
+every minute. A folder with no peers makes no network connections unless **Settings → Peers** is open, where it listens for
 devices on the local network.
 
 Changes from a peer show up in the folder: new files appear as links, removed ones go, replaced ones point at their new

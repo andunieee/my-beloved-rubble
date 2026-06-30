@@ -5,11 +5,11 @@ weight = 4
 nav = "settings"
 +++
 
-The **Settings** tab chooses which remotes receive [metadata backups](../metadata/) and shows their backup status.
+The **Metadata** part of the **Settings** tab chooses which remotes receive [metadata backups](../metadata/) and shows their backup status.
 
 ## The master password
 
-Choose a master password before adding any remote, in the **Settings** tab. A restored folder gets the password from
+Choose a master password before adding any remote, in **Settings → Metadata**. A restored folder gets the password from
 its backup automatically. Everything sent to a remote is encrypted with it: your files, their names, and the
 metadata backups. Whoever runs a remote sees only scrambled names and content.
 

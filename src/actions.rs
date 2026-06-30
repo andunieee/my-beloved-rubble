@@ -1,4 +1,4 @@
-//! The Activity tab's actions: uploads, downloads, scans of remotes,
+//! The actions in the Activity view: uploads, downloads, scans of remotes,
 //! checks and verifications. They queue up and run one at a time on a
 //! background thread, in the order they were started, so starting one
 //! while another runs is always fine. The most recent finished ones are

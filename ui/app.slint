@@ -679,8 +679,11 @@ export component AppWindow inherits Window {
     // 0 = info, 1 = success, 2 = warning, 3 = error.
     in-out property <int> status-level: 0;
     in-out property <bool> busy: false;
-    // 0 = Blobs, 1 = Remotes, 2 = Settings, 3 = Peers, 4 = Activity.
+    // 0 = Blobs, 1 = Remotes, 2 = Settings → Metadata, 3 = Settings →
+    // Peers, 4 = Activity.
     in-out property <int> active-tab: 0;
+    // The part of Settings shown last: 2 or 3.
+    in-out property <int> settings-tab: 2;
     // ── activity: the running action first, then the queued ones ──
     in-out property <[ActionRow]> action-queue: [];
     // Finished actions, newest first.
@@ -898,19 +901,8 @@ export component AppWindow inherits Window {
                     }
                     TabButton {
                         text: "Settings";
-                        active: root.active-tab == 2;
-                        clicked => { root.active-tab = 2; }
-                    }
-                    TabButton {
-                        text: root.compact ? "Peers" : "Peers (" + root.peer-count + ")";
-                        active: root.active-tab == 3;
-                        clicked => { root.active-tab = 3; }
-                    }
-                    // On a phone, on the row below (no room here).
-                    if !root.compact: TabButton {
-                        text: root.actions-pending > 0 ? "Activity (" + root.actions-pending + ")" : "Activity";
-                        active: root.active-tab == 4;
-                        clicked => { root.active-tab = 4; }
+                        active: root.active-tab == 2 || root.active-tab == 3;
+                        clicked => { root.active-tab = root.settings-tab; }
                     }
                 }
                 Text {
@@ -921,6 +913,14 @@ export component AppWindow inherits Window {
                     horizontal-alignment: right;
                     overflow: elide;
                     horizontal-stretch: 1;
+                }
+                // The Activity tab: an icon, with how many actions are
+                // running or queued.
+                if root.folder != "": TabButton {
+                    icon: "M 7 4 L 7 20 M 3 8 L 7 4 L 11 8 M 17 20 L 17 4 M 13 16 L 17 20 L 21 16";
+                    text: root.actions-pending > 0 ? root.actions-pending : "";
+                    active: root.active-tab == 4;
+                    clicked => { root.active-tab = 4; }
                 }
                 if root.desktop: Button {
                     text: root.compact ? "Open…" : "Open Folder…";
@@ -936,7 +936,8 @@ export component AppWindow inherits Window {
                     icon: root.compact ? "M 12 5 L 12 19 M 5 12 L 19 12" : "";
                     clicked => { root.add-files(); }
                 }
-                if root.folder != "": Button {
+                // Android scans by itself: on opening, and when files come in.
+                if root.folder != "" && root.desktop: Button {
                     text: "Rescan";
                     icon: root.compact ? "M 21 12 A 9 9 0 1 1 12 3 C 14.52 3 16.93 4 18.74 5.74 L 21 8 M 21 3 L 21 8 L 16 8" : "";
                     enabled: !root.busy;
@@ -952,14 +953,31 @@ export component AppWindow inherits Window {
             height: 44px;
             padding: 6px;
             spacing: 4px;
-            TabButton {
+            if root.active-tab != 2 && root.active-tab != 3: TabButton {
                 text: root.active-tab == 0 ? "Files (" + root.files.length + ")"
                     : root.active-tab == 1 ? "Remotes (" + root.remotes.length + ")"
-                    : root.active-tab == 2 ? "Backups"
-                    : root.active-tab == 3 ? "Peers (" + root.peer-count + ")"
                     : "Activity";
                 active: !root.show-panel;
                 clicked => { root.show-panel = false; }
+            }
+            // Settings: its two parts, then the panel of the one shown.
+            if root.active-tab == 2 || root.active-tab == 3: TabButton {
+                text: "Metadata";
+                active: root.active-tab == 2 && !root.show-panel;
+                clicked => {
+                    root.settings-tab = 2;
+                    root.active-tab = 2;
+                    root.show-panel = false;
+                }
+            }
+            if root.active-tab == 2 || root.active-tab == 3: TabButton {
+                text: "Peers (" + root.peer-count + ")";
+                active: root.active-tab == 3 && !root.show-panel;
+                clicked => {
+                    root.settings-tab = 3;
+                    root.active-tab = 3;
+                    root.show-panel = false;
+                }
             }
             TabButton {
                 text: root.active-tab == 0
@@ -974,13 +992,6 @@ export component AppWindow inherits Window {
                 clicked => { root.show-panel = true; }
             }
             Rectangle { horizontal-stretch: 1; }
-            // The Activity tab, with how many actions are pending.
-            TabButton {
-                icon: "M 7 4 L 7 20 M 3 8 L 7 4 L 11 8 M 17 20 L 17 4 M 13 16 L 17 20 L 21 16";
-                text: root.actions-pending > 0 ? root.actions-pending : "";
-                active: root.active-tab == 4;
-                clicked => { root.active-tab = 4; }
-            }
         }
         if root.compact && root.folder != "": Rectangle { height: 1px; background: Palette.border; }
 
@@ -1454,7 +1465,30 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    // ── Settings tab: where metadata backups go ──
+                    // ── Settings tab: Metadata and Peers ──
+                    // On a phone, in the row under the toolbar.
+                    if root.folder != "" && !root.compact && (root.active-tab == 2 || root.active-tab == 3): HorizontalLayout {
+                        spacing: 4px;
+                        TabButton {
+                            text: "Metadata";
+                            active: root.active-tab == 2;
+                            clicked => {
+                                root.settings-tab = 2;
+                                root.active-tab = 2;
+                            }
+                        }
+                        TabButton {
+                            text: "Peers (" + root.peer-count + ")";
+                            active: root.active-tab == 3;
+                            clicked => {
+                                root.settings-tab = 3;
+                                root.active-tab = 3;
+                            }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+
+                    // ── Settings → Metadata: where metadata backups go ──
                     if root.folder != "" && root.active-tab == 2: HorizontalLayout {
                         spacing: 8px;
                         Text {
@@ -1563,7 +1597,7 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    // ── Peers tab: the devices syncing this folder ──
+                    // ── Settings → Peers: the devices syncing this folder ──
                     if root.folder != "" && root.active-tab == 3: HorizontalLayout {
                         spacing: 8px;
                         Text {
@@ -1916,7 +1950,7 @@ width: Side.text-width;
                             }
                         }
 
-                        // ════ Settings tab ════
+                        // ════ Settings → Metadata ════
                         if root.active-tab == 2 && root.folder != "" && !root.password-set: VerticalLayout {
                             spacing: 6px;
                             SectionTitle { text: "CHOOSE A MASTER PASSWORD"; help: "settings/#the-master-password"; }
@@ -2057,7 +2091,7 @@ width: Side.text-width;
                             Hint { text: "The last 100 finished actions are kept, on this device only."; }
                         }
 
-                        // ════ Peers tab ════
+                        // ════ Settings → Peers ════
                         if root.active-tab == 3 && root.folder != "": VerticalLayout {
                             spacing: 6px;
                             SectionTitle { text: "THIS COMPUTER"; help: "peers/"; }
@@ -2247,7 +2281,10 @@ width: Side.text-width;
                                     alignment: start;
                                     Button {
                                         text: "Go to Settings";
-                                        clicked => { root.active-tab = 2; }
+                                        clicked => {
+                                            root.settings-tab = 2;
+                                            root.active-tab = 2;
+                                        }
                                     }
                                 }
                             }

@@ -236,7 +236,7 @@ pub fn run(out: &Path) -> Result<(), slint::PlatformError> {
     show_activity(&app);
     app.window.set_active_tab(4);
     app.window
-        .set_status_text("Queued: Upload 12 blob(s) to 'backblaze' (1 ahead, see Activity)".into());
+        .set_status_text("Queued: Upload 12 blob(s) to 'backblaze' (1 ahead)".into());
     s.shoot("activity");
 
     // ── on a phone ──

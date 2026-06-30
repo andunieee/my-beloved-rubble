@@ -8,7 +8,7 @@ nav = "metadata backup"
 Remotes store your files by their content only. The names, folders and history of your files live in the folder's
 database, `.mbr/db`. If the folder is lost along with the computer, its remotes would come back as a heap of
 nameless files. So the database is backed up separately, encrypted with the [master password](../settings/), to the
-remotes you choose in the **Settings** tab.
+remotes you choose in **Settings → Metadata**.
 
 Each remote shows when it was last backed up, and whether that backup is out of date because files changed since.
 
