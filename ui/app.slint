@@ -1,0 +1,452 @@
+import { Button, LineEdit, ListView, Palette, ComboBox, ScrollView } from "std-widgets.slint";
+
+export struct FileRow {
+    path: string,
+    hash: string,
+    short-hash: string,
+    size: string,
+    added: string,
+    present: bool,
+    remotes: string,
+    other-names: string,
+    past-names: string,
+    versions: string,
+}
+
+export struct RemoteRow {
+    name: string,
+    target: string,
+    blobs: string,
+}
+
+component SectionTitle inherits Text {
+    font-size: 11px;
+    font-weight: 700;
+    color: Palette.foreground.transparentize(35%);
+}
+
+component DetailLine inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> value;
+    spacing: 6px;
+    Text {
+        text: root.label;
+        font-size: 12px;
+        color: Palette.foreground.transparentize(40%);
+        width: 60px;
+    }
+    Text {
+        text: root.value;
+        font-size: 12px;
+        wrap: word-wrap;
+        horizontal-stretch: 1;
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "My Beloved Rubble";
+    preferred-width: 1100px;
+    preferred-height: 720px;
+    min-width: 800px;
+    min-height: 480px;
+
+    // ── State ──
+    in-out property <string> folder: "";
+    in-out property <[FileRow]> files: [];
+    in-out property <[RemoteRow]> remotes: [];
+    in-out property <[string]> remote-names: [];
+    in-out property <int> selected-index: -1;
+    in-out property <string> status-text: "Open a folder to get started";
+    in-out property <bool> busy: false;
+
+    in-out property <string> new-remote-name: "";
+    in-out property <string> new-remote-target: "";
+
+    property <bool> has-selection: root.selected-index >= 0 && root.selected-index < root.files.length;
+
+    // ── Callbacks ──
+    callback open-folder();
+    callback rescan();
+    callback add-remote(name: string, target: string);
+    callback remove-remote(name: string);
+    callback check-remote(name: string);
+    callback push-all(remote: string);
+    callback push-file(hash: string, remote: string);
+    callback fetch-file(hash: string);
+
+    VerticalLayout {
+        padding: 0px;
+        spacing: 0px;
+
+        // ══ Toolbar ══
+        Rectangle {
+            height: 52px;
+            background: Palette.background.darker(0.06);
+
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                padding-top: 10px;
+                padding-bottom: 10px;
+                spacing: 10px;
+
+                Text {
+                    text: "My Beloved Rubble";
+                    font-weight: 700;
+                    font-size: 16px;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: root.folder;
+                    font-size: 12px;
+                    color: Palette.foreground.transparentize(40%);
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+                Button {
+                    text: "Open Folder…";
+                    clicked => { root.open-folder(); }
+                }
+                Button {
+                    text: "Rescan";
+                    enabled: root.folder != "" && !root.busy;
+                    clicked => { root.rescan(); }
+                }
+            }
+        }
+
+        Rectangle { height: 1px; background: Palette.border; }
+
+        // ══ Content ══
+        HorizontalLayout {
+            vertical-stretch: 1;
+            padding: 0px;
+            spacing: 0px;
+
+            // ── File list ──
+            Rectangle {
+                horizontal-stretch: 1;
+                background: Palette.background;
+
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 6px;
+
+                    if root.folder == "": Rectangle {
+                        vertical-stretch: 1;
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 12px;
+                            Text {
+                                text: "No folder attached";
+                                font-size: 18px;
+                                horizontal-alignment: center;
+                                color: Palette.foreground.transparentize(40%);
+                            }
+                            Text {
+                                text: "Open a folder to attach mbr to it.\nFiles you drop there are content-addressed into .blobs/ and symlinked back.";
+                                font-size: 12px;
+                                horizontal-alignment: center;
+                                color: Palette.foreground.transparentize(50%);
+                            }
+                            HorizontalLayout {
+                                alignment: center;
+                                Button {
+                                    text: "Open Folder…";
+                                    primary: true;
+                                    clicked => { root.open-folder(); }
+                                }
+                            }
+                        }
+                    }
+
+                    if root.folder != "" && root.files.length == 0: Rectangle {
+                        vertical-stretch: 1;
+                        Text {
+                            text: "No tracked files yet.\nDrop files into the folder and hit Rescan.";
+                            font-size: 14px;
+                            horizontal-alignment: center;
+                            color: Palette.foreground.transparentize(40%);
+                        }
+                    }
+
+                    if root.folder != "" && root.files.length > 0: ListView {
+                        vertical-stretch: 1;
+                        for file[idx] in root.files: Rectangle {
+                            height: 40px;
+                            background: idx == root.selected-index
+                                ? Palette.accent-background
+                                : row-touch.has-hover ? Palette.background.darker(0.04) : transparent;
+                            border-radius: 6px;
+
+                            row-touch := TouchArea {
+                                clicked => { root.selected-index = idx; }
+                            }
+
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 10px;
+                                spacing: 10px;
+
+                                // local presence dot
+                                Text {
+                                    text: file.present ? "●" : "○";
+                                    color: file.present
+                                        ? #2fbf71
+                                        : #e05f5f;
+                                    font-size: 13px;
+                                    vertical-alignment: center;
+                                    width: 14px;
+                                }
+                                Text {
+                                    text: file.path;
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                    color: idx == root.selected-index
+                                        ? Palette.accent-foreground : Palette.foreground;
+                                }
+                                Text {
+                                    text: file.size;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    color: idx == root.selected-index
+                                        ? Palette.accent-foreground.transparentize(20%)
+                                        : Palette.foreground.transparentize(35%);
+                                }
+                                Text {
+                                    text: file.remotes == "" ? "no remote" : file.remotes;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    width: 140px;
+                                    overflow: elide;
+                                    color: file.remotes == ""
+                                        ? #e0a94f
+                                        : idx == root.selected-index
+                                            ? Palette.accent-foreground.transparentize(20%)
+                                            : Palette.foreground.transparentize(35%);
+                                }
+                                Text {
+                                    text: file.short-hash;
+                                    font-size: 11px;
+                                    vertical-alignment: center;
+                                    color: idx == root.selected-index
+                                        ? Palette.accent-foreground.transparentize(30%)
+                                        : Palette.foreground.transparentize(50%);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Rectangle { width: 1px; background: Palette.border; }
+
+            // ── Side panel ──
+            Rectangle {
+                width: 360px;
+                background: Palette.background.darker(0.03);
+
+                ScrollView {
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 14px;
+                        alignment: start;
+
+                        // ── Selected file details ──
+                        if root.has-selection: VerticalLayout {
+                            spacing: 6px;
+
+                            Text {
+                                text: root.files[root.selected-index].path;
+                                font-size: 15px;
+                                font-weight: 700;
+                                wrap: word-wrap;
+                            }
+                            DetailLine { label: "hash"; value: root.files[root.selected-index].hash; }
+                            DetailLine { label: "size"; value: root.files[root.selected-index].size; }
+                            DetailLine { label: "added"; value: root.files[root.selected-index].added; }
+                            DetailLine {
+                                label: "local";
+                                value: root.files[root.selected-index].present ? "present" : "missing (fetch to restore)";
+                            }
+                            DetailLine {
+                                label: "remotes";
+                                value: root.files[root.selected-index].remotes == ""
+                                    ? "not stored on any remote" : root.files[root.selected-index].remotes;
+                            }
+                            if root.files[root.selected-index].other-names != "": DetailLine {
+                                label: "also as";
+                                value: root.files[root.selected-index].other-names;
+                            }
+                            if root.files[root.selected-index].past-names != "": DetailLine {
+                                label: "was";
+                                value: root.files[root.selected-index].past-names;
+                            }
+                            if root.files[root.selected-index].versions != "": VerticalLayout {
+                                spacing: 4px;
+                                SectionTitle { text: "PREVIOUS VERSIONS"; }
+                                Text {
+                                    text: root.files[root.selected-index].versions;
+                                    font-size: 11px;
+                                    wrap: word-wrap;
+                                    color: Palette.foreground.transparentize(25%);
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 6px;
+                                padding-top: 4px;
+
+                                push-target := ComboBox {
+                                    model: root.remote-names;
+                                    current-index: 0;
+                                    horizontal-stretch: 1;
+                                    enabled: root.remote-names.length > 0;
+                                }
+                                Button {
+                                    text: "Push";
+                                    enabled: !root.busy
+                                        && root.remote-names.length > 0
+                                        && root.files[root.selected-index].present;
+                                    clicked => {
+                                        root.push-file(root.files[root.selected-index].hash, push-target.current-value);
+                                    }
+                                }
+                                Button {
+                                    text: "Fetch";
+                                    enabled: !root.busy && !root.files[root.selected-index].present;
+                                    clicked => { root.fetch-file(root.files[root.selected-index].hash); }
+                                }
+                            }
+                        }
+
+                        if root.has-selection: Rectangle { height: 1px; background: Palette.border; }
+
+                        // ── Remotes ──
+                        VerticalLayout {
+                            spacing: 8px;
+
+                            SectionTitle { text: "RCLONE REMOTES"; }
+
+                            if root.remotes.length == 0: Text {
+                                text: "No remotes configured.";
+                                font-size: 12px;
+                                color: Palette.foreground.transparentize(45%);
+                            }
+
+                            for remote in root.remotes: Rectangle {
+                                border-width: 1px;
+                                border-color: Palette.border;
+                                border-radius: 6px;
+                                background: Palette.background;
+                                height: remote-layout.preferred-height + 20px;
+
+                                remote-layout := VerticalLayout {
+                                    padding: 10px;
+                                    spacing: 6px;
+
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        Text {
+                                            text: remote.name;
+                                            font-weight: 700;
+                                            font-size: 13px;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                        }
+                                        Text {
+                                            text: remote.blobs;
+                                            font-size: 11px;
+                                            vertical-alignment: center;
+                                            color: Palette.foreground.transparentize(40%);
+                                        }
+                                    }
+                                    Text {
+                                        text: remote.target;
+                                        font-size: 11px;
+                                        color: Palette.foreground.transparentize(35%);
+                                        overflow: elide;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        Button {
+                                            text: "Check";
+                                            enabled: !root.busy;
+                                            clicked => { root.check-remote(remote.name); }
+                                        }
+                                        Button {
+                                            text: "Push all";
+                                            enabled: !root.busy;
+                                            clicked => { root.push-all(remote.name); }
+                                        }
+                                        Button {
+                                            text: "Remove";
+                                            enabled: !root.busy;
+                                            clicked => { root.remove-remote(remote.name); }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // add remote form
+                            VerticalLayout {
+                                spacing: 4px;
+                                LineEdit {
+                                    placeholder-text: "name (e.g. backup)";
+                                    text: root.new-remote-name;
+                                    edited(t) => { root.new-remote-name = t; }
+                                }
+                                LineEdit {
+                                    placeholder-text: "rclone target (e.g. s3:bucket/mbr)";
+                                    text: root.new-remote-target;
+                                    edited(t) => { root.new-remote-target = t; }
+                                }
+                                Button {
+                                    text: "Add Remote";
+                                    enabled: root.folder != ""
+                                        && root.new-remote-name != ""
+                                        && root.new-remote-target != "";
+                                    clicked => {
+                                        root.add-remote(root.new-remote-name, root.new-remote-target);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle { height: 1px; background: Palette.border; }
+
+        // ══ Status bar ══
+        Rectangle {
+            height: 30px;
+            background: Palette.background.darker(0.06);
+
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                spacing: 8px;
+
+                if root.busy: Text {
+                    text: "⧗ working…";
+                    font-size: 12px;
+                    vertical-alignment: center;
+                    color: #e0a94f;
+                }
+                Text {
+                    text: root.status-text;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+            }
+        }
+    }
+}

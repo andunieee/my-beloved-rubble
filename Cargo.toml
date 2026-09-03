@@ -1,0 +1,28 @@
+[package]
+name = "mybelovedrubble"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "mbr"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mbr"
+path = "src/cli.rs"
+
+[[bin]]
+name = "my-beloved-rubble"
+path = "src/gui.rs"
+
+[build-dependencies]
+slint-build = "1.11"
+
+[dependencies]
+slint = "1.17"
+minisqlite = { git = "https://github.com/cursor/minisqlite" }
+sha2 = "0.10"
+rfd = "0.15"
+dirs = "6"
+log = "0.4"
+env_logger = "0.11"
