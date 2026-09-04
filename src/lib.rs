@@ -3,14 +3,16 @@
 //!
 //! A "rubble folder" is any directory that has been attached with
 //! [`Repo::init`]. Regular files dropped into it are, on the next scan,
-//! moved into a hidden `.blobs/` store addressed by their SHA-256 hash and
+//! moved into a hidden `.mbr/blobs/` store addressed by their SHA-256 hash and
 //! replaced by a relative symlink, so they keep opening normally:
 //!
 //! ```text
 //! folder/
-//!   .blobs/fa/2e/fa2e38…   actual content
-//!   .mbr.db                sqlite metadata (paths, blobs, remotes)
-//!   fruits.png -> .blobs/fa/2e/fa2e38…
+//!   .mbr/
+//!     blobs/fa/2e/fa2e38…   actual content
+//!     mbr.db                sqlite metadata (paths, blobs, remotes)
+//!     rclone.conf           repository-local rclone configuration
+//!   fruits.png -> .mbr/blobs/fa/2e/fa2e38…
 //! ```
 //!
 //! Blobs can be pushed to / fetched from rclone remotes, named on the

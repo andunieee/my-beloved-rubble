@@ -13,13 +13,14 @@ symlink, so it still opens like a normal file:
 
 ```
 folder/
-  .blobs/
-    fa/2e/fa2e38…(full sha256)   the actual content
-  .mbr.db                        sqlite metadata
-  fruits.png -> .blobs/fa/2e/fa2e38…
+  .mbr/
+    blobs/fa/2e/fa2e38…(full sha256)   the actual content
+    mbr.db                            sqlite metadata
+    rclone.conf                       repository-local rclone config
+  fruits.png -> .mbr/blobs/fa/2e/fa2e38…
 ```
 
-`.mbr.db` tracks:
+`.mbr/mbr.db` tracks:
 
 - **paths** — every name the folder ever held: which blob it pointed to,
   when it was added, when it was removed. Replacing a file's content
@@ -38,7 +39,8 @@ previous versions of the name with where those old blobs still live.
 
 Blobs are pushed to rclone remotes named purely by hash, in the same
 sharded `fa/2e/fa2e38…` layout, with no metadata. Encryption is rclone's
-job: point mbr at an rclone `crypt` remote if you want it.
+job: point mbr at an rclone `crypt` remote if you want it. Each attached
+folder owns its rclone configuration at `.mbr/rclone.conf`.
 
 ## CLI
 
@@ -47,7 +49,8 @@ mbr init [dir]                    attach mbr to a folder
 mbr scan                          ingest new files, record removals
 mbr ls                            list tracked files with metadata
 mbr info <path|hash>              full detail for one file or blob
-mbr remote add <name> <target>    add an rclone remote
+mbr remote add <name> <target>    add an existing rclone target
+mbr remote setup <name> <type>    configure an rclone remote interactively
 mbr remote rm <name>              remove a remote
 mbr remote ls                     list remotes
 mbr push <remote> [path|hash...]  push blobs (default: all not yet there)
@@ -63,8 +66,10 @@ prefix (≥ 6 hex chars).
 
 `my-beloved-rubble` shows the annotated file listing (green dot = present
 locally), a detail pane for the selected file, and remote management with
-Check / Push all / per-file Push and Fetch buttons. rclone operations run
-in the background. The last opened folder is reopened on start.
+Check / Push all / per-file Push and Fetch buttons, plus Add Existing
+Remote and an interactive Configure Remote flow (backend questions answered
+one at a time, backed by the repository-local `.mbr/rclone.conf`). rclone
+operations run in the background. The last opened folder is reopened on start.
 
 ## Building
 
@@ -72,4 +77,4 @@ in the background. The last opened folder is reopened on start.
 cargo build --release   # target/release/mbr and target/release/my-beloved-rubble
 ```
 
-Requires `rclone` on PATH for remote operations.
+Rclone is embedded through `librclone`; building requires a Go toolchain and C compiler, but no separate `rclone` executable is required at runtime.

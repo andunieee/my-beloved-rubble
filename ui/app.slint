@@ -61,6 +61,14 @@ export component AppWindow inherits Window {
 
     in-out property <string> new-remote-name: "";
     in-out property <string> new-remote-target: "";
+    in-out property <string> new-remote-backend: "dropbox";
+    in-out property <bool> setup-active: false;
+    in-out property <string> setup-state: "";
+    in-out property <string> setup-question: "";
+    in-out property <string> setup-help: "";
+    in-out property <string> setup-answer: "";
+    in-out property <string> setup-default: "";
+    in-out property <bool> setup-password: false;
 
     property <bool> has-selection: root.selected-index >= 0 && root.selected-index < root.files.length;
 
@@ -68,6 +76,9 @@ export component AppWindow inherits Window {
     callback open-folder();
     callback rescan();
     callback add-remote(name: string, target: string);
+    callback start-remote-setup(name: string, backend: string);
+    callback submit-remote-setup(name: string, backend: string, state: string, answer: string);
+    callback cancel-remote-setup();
     callback remove-remote(name: string);
     callback check-remote(name: string);
     callback push-all(remote: string);
@@ -392,7 +403,7 @@ export component AppWindow inherits Window {
                                 }
                             }
 
-                            // add remote form
+                            // add or configure a remote
                             VerticalLayout {
                                 spacing: 4px;
                                 LineEdit {
@@ -406,12 +417,79 @@ export component AppWindow inherits Window {
                                     edited(t) => { root.new-remote-target = t; }
                                 }
                                 Button {
-                                    text: "Add Remote";
+                                    text: "Add Existing Remote";
                                     enabled: root.folder != ""
                                         && root.new-remote-name != ""
                                         && root.new-remote-target != "";
                                     clicked => {
                                         root.add-remote(root.new-remote-name, root.new-remote-target);
+                                    }
+                                }
+                                LineEdit {
+                                    placeholder-text: "backend type (e.g. dropbox)";
+                                    text: root.new-remote-backend;
+                                    edited(t) => { root.new-remote-backend = t; }
+                                }
+                                Button {
+                                    text: "Configure Remote…";
+                                    enabled: root.folder != ""
+                                        && !root.setup-active
+                                        && root.new-remote-name != ""
+                                        && root.new-remote-backend != "";
+                                    clicked => {
+                                        root.start-remote-setup(root.new-remote-name, root.new-remote-backend);
+                                    }
+                                }
+                            }
+
+                            if root.setup-active: Rectangle {
+                                border-width: 1px;
+                                border-color: Palette.accent-background;
+                                border-radius: 6px;
+                                background: Palette.background;
+                                height: setup-layout.preferred-height + 20px;
+
+                                setup-layout := VerticalLayout {
+                                    padding: 10px;
+                                    spacing: 6px;
+                                    Text {
+                                        text: "Configure " + root.new-remote-name;
+                                        font-weight: 700;
+                                    }
+                                    Text {
+                                        text: root.setup-help;
+                                        font-size: 11px;
+                                        wrap: word-wrap;
+                                        color: Palette.foreground.transparentize(25%);
+                                    }
+                                    Text {
+                                        text: root.setup-question + (root.setup-default == "" ? "" : " [" + root.setup-default + "]");
+                                        font-size: 12px;
+                                        wrap: word-wrap;
+                                    }
+                                    LineEdit {
+                                        text: root.setup-answer;
+                                        input-type: root.setup-password ? InputType.password : InputType.text;
+                                        edited(t) => { root.setup-answer = t; }
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        Button {
+                                            text: "Continue";
+                                            enabled: root.setup-state != "";
+                                            clicked => {
+                                                root.submit-remote-setup(
+                                                    root.new-remote-name,
+                                                    root.new-remote-backend,
+                                                    root.setup-state,
+                                                    root.setup-answer
+                                                );
+                                            }
+                                        }
+                                        Button {
+                                            text: "Cancel";
+                                            clicked => { root.cancel-remote-setup(); }
+                                        }
                                     }
                                 }
                             }

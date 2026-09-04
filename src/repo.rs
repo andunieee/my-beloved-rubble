@@ -1,4 +1,4 @@
-//! A rubble folder: scanning, the `.blobs` content store, and the
+//! A rubble folder: scanning, the `.mbr/blobs` content store, and the
 //! metadata-backed file listing.
 
 use crate::db::{Db, Remote};
@@ -6,8 +6,9 @@ use crate::{rclone, util};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-pub const BLOBS_DIR: &str = ".blobs";
-pub const DB_FILE: &str = ".mbr.db";
+pub const BLOBS_DIR: &str = ".mbr/blobs";
+pub const DB_FILE: &str = ".mbr/mbr.db";
+pub const RCLONE_CONFIG_FILE: &str = ".mbr/rclone.conf";
 
 pub struct Repo {
     pub root: PathBuf,
@@ -40,7 +41,7 @@ pub struct FileStatus {
     pub hash: String,
     pub size: u64,
     pub added_at: i64,
-    /// The blob file exists in the local `.blobs` store.
+    /// The blob file exists in the local `.mbr/blobs` store.
     pub present_locally: bool,
     /// Remotes recorded as storing this blob.
     pub remotes: Vec<String>,
@@ -76,19 +77,26 @@ pub struct RemoteCheck {
 
 enum Entry {
     File(PathBuf),
-    /// A symlink into `.blobs`, carrying the hash it points at.
+    /// A symlink into `.mbr/blobs`, carrying the hash it names.
+
     BlobLink(PathBuf, String),
 }
 
 impl Repo {
-    /// Attach mbr to `root`: create the `.blobs` store and the database.
+    /// Attach mbr to `root`: create the `.mbr` store, database, and
+    /// repository-local rclone config (fresh folders only; no migration).
     pub fn init(root: &Path) -> Result<Self, String> {
         if !root.is_dir() {
             return Err(format!("{} is not a directory", root.display()));
         }
         std::fs::create_dir_all(root.join(BLOBS_DIR))
             .map_err(|e| format!("cannot create {BLOBS_DIR}: {e}"))?;
-        Self::open(root)
+        let root = root
+            .canonicalize()
+            .map_err(|e| format!("cannot resolve {}: {e}", root.display()))?;
+        ensure_rclone_config(&root.join(RCLONE_CONFIG_FILE))?;
+        let db = Db::open(&root.join(DB_FILE))?;
+        Ok(Self { root, db })
     }
 
     /// Open an already-attached folder (or one being initialized).
@@ -96,7 +104,7 @@ impl Repo {
         let root = root
             .canonicalize()
             .map_err(|e| format!("cannot resolve {}: {e}", root.display()))?;
-        if !root.join(BLOBS_DIR).is_dir() && !root.join(DB_FILE).is_file() {
+        if !root.join(BLOBS_DIR).is_dir() || !root.join(DB_FILE).is_file() {
             return Err(format!(
                 "{} is not an mbr folder (run `mbr init` there first)",
                 root.display()
@@ -130,13 +138,25 @@ impl Repo {
 
     // ── blob store ──
 
-    /// Local path of a blob: `.blobs/aa/bb/<hash>`.
+    /// Local path of a blob: `.mbr/blobs/aa/bb/<hash>`.
     pub fn blob_path(&self, hash: &str) -> PathBuf {
         self.root
             .join(BLOBS_DIR)
             .join(&hash[..2])
             .join(&hash[2..4])
             .join(hash)
+    }
+
+    /// The rclone config owned by this repository.
+    pub fn rclone_config_path(&self) -> PathBuf {
+        self.root.join(RCLONE_CONFIG_FILE)
+    }
+
+    /// Select this repository's rclone configuration for librclone.
+    pub fn configure_rclone(&self) -> Result<(), String> {
+        let path = self.rclone_config_path();
+        ensure_rclone_config(&path)?;
+        rclone::set_config_path(&path)
     }
 
     pub fn blob_present(&self, hash: &str) -> bool {
@@ -331,6 +351,7 @@ impl Repo {
 
     /// Push one blob to a remote and record it there.
     pub fn push_blob(&mut self, remote: &Remote, hash: &str) -> Result<(), String> {
+        self.configure_rclone()?;
         let blob = self.blob_path(hash);
         if !blob.is_file() {
             return Err(format!(
@@ -357,6 +378,7 @@ impl Repo {
     /// Download a blob from the first configured remote that has it,
     /// verifying its hash. Returns the name of the remote used.
     pub fn fetch_blob(&mut self, hash: &str) -> Result<String, String> {
+        self.configure_rclone()?;
         if self.blob_present(hash) {
             return Err(format!("blob {} is already present", util::short_hash(hash)));
         }
@@ -379,6 +401,7 @@ impl Repo {
     /// Verify a remote is reachable and compare its blobs against the
     /// database, updating `blob_remotes` to match reality.
     pub fn check_remote(&mut self, remote: &Remote) -> Result<RemoteCheck, String> {
+        self.configure_rclone()?;
         let found = rclone::list_blobs(&remote.target)?.into_iter().collect();
         self.apply_remote_listing(remote, found)
     }
@@ -463,7 +486,8 @@ fn rel_str(rel: &Path) -> String {
 }
 
 /// Recursively list ingestable entries under `dir`, as paths relative to
-/// `root`. Dot-entries (including `.blobs` and `.mbr.db`) are skipped, as
+/// Dot-entries (including `.mbr`) are skipped, as
+
 /// are symlinks that don't point into the blob store.
 fn collect_entries(root: &Path, dir: &Path, out: &mut Vec<Entry>) -> Result<(), String> {
     let entries =
@@ -491,13 +515,15 @@ fn collect_entries(root: &Path, dir: &Path, out: &mut Vec<Entry>) -> Result<(), 
     Ok(())
 }
 
-/// If `link` is a symlink into a `.blobs` store, the hash it names.
+/// If `link` is a symlink into the `.mbr/blobs` store, the hash it names.
 fn blob_link_hash(link: &Path) -> Option<String> {
     let target = std::fs::read_link(link).ok()?;
     let name = target.file_name()?.to_string_lossy().into_owned();
-    let in_blobs = target
-        .components()
-        .any(|c| c.as_os_str() == BLOBS_DIR);
+    let components: Vec<_> = target.components().collect();
+    let in_blobs = components.windows(2).any(|pair| {
+        pair[0].as_os_str() == std::ffi::OsStr::new(".mbr")
+            && pair[1].as_os_str() == std::ffi::OsStr::new("blobs")
+    });
     (in_blobs && util::is_hash(&name)).then_some(name)
 }
 
@@ -509,4 +535,34 @@ fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
 #[cfg(windows)]
 fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
     std::os::windows::fs::symlink_file(target, link)
+}
+
+/// Ensure the repository-local rclone config exists, with restrictive
+/// permissions since it holds OAuth tokens and other secrets.
+fn ensure_rclone_config(path: &Path) -> Result<(), String> {
+    if path.is_file() {
+        restrict_config_permissions(path)?;
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, "")
+        .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+    restrict_config_permissions(path)
+}
+
+fn restrict_config_permissions(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("cannot secure {}: {e}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
