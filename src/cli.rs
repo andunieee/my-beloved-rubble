@@ -1,61 +1,96 @@
 //! `mbr` — the My Beloved Rubble command-line interface.
 
+use clap::{Parser, Subcommand};
 use mbr::db::Remote;
 use mbr::repo::Repo;
 use mbr::util;
-use std::path::Path;
+use std::path::PathBuf;
 
-const USAGE: &str = "\
-mbr — my beloved rubble: content-addressed folders with rclone remotes
+#[derive(Parser)]
+#[command(
+    name = "mbr",
+    about = "my beloved rubble: content-addressed folders with rclone remotes",
+    after_help = "Commands other than `init` run inside an attached folder (or below one)."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
 
-USAGE:
-  mbr init [dir]                    attach mbr to a folder
-  mbr scan                          ingest new files, record removals
-  mbr ls                            list tracked files with metadata
-  mbr info <path|hash>              full detail for one file or blob
-  mbr remote add <name> <target>    add an existing rclone target
-  mbr remote setup <name> <type>    configure an rclone remote interactively
-  mbr remote rm <name>              remove a remote
-  mbr remote ls                     list remotes
-  mbr push <remote> [path|hash...]  push blobs (default: all not yet there)
-  mbr fetch <path|hash>...          download blobs missing locally
-  mbr check <remote>                verify remote is reachable and has our blobs
+#[derive(Subcommand)]
+enum Command {
+    /// attach mbr to a folder
+    Init {
+        /// folder to attach (defaults to the current directory)
+        dir: Option<PathBuf>,
+    },
+    /// ingest new files, record removals
+    Scan,
+    /// list tracked files with metadata
+    Ls,
+    /// full detail for one file or blob
+    Info { spec: String },
+    /// add an existing rclone target
+    #[command(name = "remote")]
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommand,
+    },
+    /// push blobs (default: all not yet there)
+    Push {
+        remote: String,
+        /// optional paths or hashes to push
+        specs: Vec<String>,
+    },
+    /// download blobs missing locally
+    Fetch {
+        /// paths or hashes to fetch
+        specs: Vec<String>,
+    },
+    /// verify remote is reachable and has our blobs
+    Check { remote: String },
+}
 
-Commands other than `init` run inside an attached folder (or below one).
-";
+#[derive(Subcommand)]
+enum RemoteCommand {
+    /// add an existing rclone target
+    Add { name: String, target: String },
+    /// list the rclone backends mbr can set up
+    Types,
+    /// configure an rclone remote interactively
+    Setup { name: String, backend: String },
+    /// remove a remote
+    Rm { name: String },
+    /// list remotes
+    Ls,
+}
 
 fn main() {
     env_logger::init();
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    if let Err(e) = run(&args) {
+    let cli = Cli::parse();
+    if let Err(e) = run(cli) {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
 }
 
-fn run(args: &[&str]) -> Result<(), String> {
-    match args {
-        [] | ["help"] | ["--help"] | ["-h"] => {
-            print!("{USAGE}");
-            Ok(())
-        }
-        ["init"] => init(Path::new(".")),
-        ["init", dir] => init(Path::new(dir)),
-        ["scan"] => scan(&mut open()?),
-        ["ls"] => ls(&mut open()?),
-        ["info", spec] => info(&mut open()?, spec),
-        ["remote", "add", name, target] => remote_add(&mut open()?, name, target),
-        ["remote", "setup", name, backend] => remote_setup(&mut open()?, name, backend),
-        ["remote", "rm", name] => remote_rm(&mut open()?, name),
-        ["remote", "ls"] => remote_ls(&mut open()?),
-        ["push", remote, specs @ ..] => push(&mut open()?, remote, specs),
-        ["fetch", specs @ ..] if !specs.is_empty() => fetch(&mut open()?, specs),
-        ["check", remote] => check(&mut open()?, remote),
-        _ => Err(format!(
-            "unrecognized command: {}\nrun `mbr help` for usage",
-            args.join(" ")
-        )),
+fn run(cli: Cli) -> Result<(), String> {
+    match cli.command {
+        Command::Init { dir } => init(&dir.unwrap_or_else(|| PathBuf::from("."))),
+        Command::Scan => scan(&mut open()?),
+        Command::Ls => ls(&mut open()?),
+        Command::Info { spec } => info(&mut open()?, &spec),
+        Command::Remote { command } => match command {
+            RemoteCommand::Add { name, target } => remote_add(&mut open()?, &name, &target),
+            RemoteCommand::Types => remote_types(),
+            RemoteCommand::Setup { name, backend } => remote_setup(&mut open()?, &name, &backend),
+            RemoteCommand::Rm { name } => remote_rm(&mut open()?, &name),
+            RemoteCommand::Ls => remote_ls(&mut open()?),
+        },
+        Command::Push { remote, specs } => push(&mut open()?, &remote, &specs),
+        Command::Fetch { specs } if !specs.is_empty() => fetch(&mut open()?, &specs),
+        Command::Check { remote } => check(&mut open()?, &remote),
+        Command::Fetch { .. } => Err("no specs given; usage: mbr fetch <path|hash>...".into()),
     }
 }
 
@@ -69,7 +104,7 @@ fn lookup_remote(repo: &mut Repo, name: &str) -> Result<Remote, String> {
         .ok_or_else(|| format!("no remote named '{name}' (see `mbr remote ls`)"))
 }
 
-fn init(dir: &Path) -> Result<(), String> {
+fn init(dir: &PathBuf) -> Result<(), String> {
     let mut repo = Repo::init(dir)?;
     let report = repo.scan()?;
     println!("attached mbr to {}", repo.root.display());
@@ -142,14 +177,24 @@ fn info(repo: &mut Repo, spec: &str) -> Result<(), String> {
         .find(|s| s.path == spec)
         .or_else(|| statuses.iter().find(|s| s.hash == hash))
     else {
-        return Err(format!("no active file uses blob {}", util::short_hash(&hash)));
+        return Err(format!(
+            "no active file uses blob {}",
+            util::short_hash(&hash)
+        ));
     };
 
     println!("path:     {}", s.path);
     println!("hash:     {}", s.hash);
     println!("size:     {} ({} bytes)", util::format_size(s.size), s.size);
     println!("added:    {}", util::format_time(s.added_at));
-    println!("local:    {}", if s.present_locally { "present" } else { "missing" });
+    println!(
+        "local:    {}",
+        if s.present_locally {
+            "present"
+        } else {
+            "missing"
+        }
+    );
     println!(
         "remotes:  {}",
         if s.remotes.is_empty() {
@@ -193,31 +238,124 @@ fn remote_add(repo: &mut Repo, name: &str, target: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// List the hardcoded backends with their form fields.
+fn remote_types() -> Result<(), String> {
+    for backend in mbr::backends::BACKENDS {
+        println!("{:<12} {} — {}", backend.name, backend.title, backend.description);
+        for field in backend.fields {
+            let kind = match field.kind {
+                mbr::backends::Kind::Secret => "secret",
+                mbr::backends::Kind::Choice => "choice",
+                mbr::backends::Kind::Text => "text",
+            };
+            let mut extras = Vec::new();
+            if field.required {
+                extras.push("required".to_owned());
+            }
+            if !field.default.is_empty() {
+                extras.push(format!("default: {}", field.default));
+            }
+            if !field.examples.is_empty() {
+                extras.push(format!("one of: {}", field.examples.join(", ")));
+            }
+            let extras = if extras.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", extras.join(", "))
+            };
+            println!("    {:<18} {kind:<7} {}{extras}", field.name, field.help);
+        }
+    }
+    Ok(())
+}
+
 fn remote_setup(repo: &mut Repo, name: &str, backend: &str) -> Result<(), String> {
     if repo.db.remote(name)?.is_some() {
         return Err(format!("remote '{name}' already exists"));
     }
     repo.configure_rclone()?;
-    if mbr::rclone::call("config/listremotes", serde_json::json!({}))?
-        .get("remotes")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|remotes| remotes.iter().any(|remote| remote.as_str() == Some(name)))
-    {
+    if mbr::rclone::remote_exists(name)? {
         return Err(format!("rclone remote '{name}' already exists"));
     }
+    let Some(backend) = mbr::backends::backend(backend) else {
+        return Err(format!(
+            "unknown backend '{backend}' (see `mbr remote types`)"
+        ));
+    };
 
-    println!("Configuring rclone remote '{name}' ({backend})");
-    mbr::rclone::setup_remote(name, backend)?;
-    let path = prompt("remote path within the backend", "mbr")?;
-    let target = format!("{name}:{path}");
+    println!("Configuring rclone remote '{name}' ({})", backend.title);
+    println!("{}", backend.description);
+
+    // Ask the hardcoded form fields, then hand everything to rclone in one go.
+    let mut values: Vec<String> = Vec::new();
+    for field in backend.fields {
+        let label = match field.kind {
+            mbr::backends::Kind::Choice => {
+                format!("{} [{}]", field.label, field.examples.join("/"))
+            }
+            _ => field.label.to_owned(),
+        };
+        let answer = if field.kind == mbr::backends::Kind::Secret {
+            rpassword::prompt_password(format!("{label}: ")).map_err(|e| e.to_string())?
+        } else {
+            prompt(&label, &field.default)?
+        };
+        if field.required && answer.trim().is_empty() {
+            return Err(format!("'{}' is required", field.label));
+        }
+        values.push(answer);
+    }
+    let spec = values
+        .iter()
+        .zip(backend.fields.iter())
+        .find(|(_, f)| f.to_target)
+        .map(|(v, _)| v.trim().to_owned())
+        .unwrap_or_default();
+    let target = mbr::backends::target_for(backend, &spec);
+
+    let parameters = form_parameters(backend, &values);
+    let mut outcome = mbr::rclone::begin_setup(name, backend.name, parameters.clone())?;
+    // Anything rclone still asks (OAuth, verification) goes through the
+    // generic question protocol.
+    while let mbr::rclone::SetupOutcome::Question(question) = outcome {
+        println!("{}", question.help);
+        let answer = if question.password {
+            rpassword::prompt_password(format!("{}: ", question.name)).map_err(|e| e.to_string())?
+        } else {
+            prompt(&question.name, &question.default)?
+        };
+        outcome = mbr::rclone::continue_setup(name, &question.state, &answer, parameters.clone())?;
+    }
+
     repo.db.add_remote(name, &target)?;
     println!("added remote {name} -> {target}");
     Ok(())
 }
 
+/// Build the rclone `parameters` object from the collected answers (the
+/// CLI's non-secret answers already have defaults filled in).
+fn form_parameters(
+    backend: &mbr::backends::Backend,
+    values: &[String],
+) -> serde_json::Value {
+    let mut parameters = serde_json::Map::new();
+    for (field, value) in backend.fields.iter().zip(values.iter()) {
+        let value = value.trim();
+        if !value.is_empty() {
+            parameters.insert(field.name.to_owned(), serde_json::Value::from(value));
+        }
+    }
+    serde_json::Value::Object(parameters)
+}
+
 fn prompt(label: &str, default: &str) -> Result<String, String> {
     use std::io::Write;
-    print!("{label} [{default}]: ");
+    let suffix = if default.is_empty() {
+        String::new()
+    } else {
+        format!(" [{default}]")
+    };
+    print!("{label}{suffix}: ");
     std::io::stdout().flush().map_err(|e| e.to_string())?;
     let mut answer = String::new();
     std::io::stdin()
@@ -241,7 +379,9 @@ fn remote_rm(repo: &mut Repo, name: &str) -> Result<(), String> {
 fn remote_ls(repo: &mut Repo) -> Result<(), String> {
     let remotes = repo.db.list_remotes()?;
     if remotes.is_empty() {
-        println!("no remotes configured (use `mbr remote setup <name> <type>`)");
+        println!(
+            "no remotes configured (see `mbr remote types` and `mbr remote setup <name> <type>`)"
+        );
     }
     for r in remotes {
         let count = repo.db.blobs_on_remote(&r.name)?.len();
@@ -250,7 +390,7 @@ fn remote_ls(repo: &mut Repo) -> Result<(), String> {
     Ok(())
 }
 
-fn push(repo: &mut Repo, remote_name: &str, specs: &[&str]) -> Result<(), String> {
+fn push(repo: &mut Repo, remote_name: &str, specs: &[String]) -> Result<(), String> {
     let remote = lookup_remote(repo, remote_name)?;
     let hashes: Vec<String> = if specs.is_empty() {
         repo.blobs_missing_on_remote(remote_name)?
@@ -275,7 +415,7 @@ fn push(repo: &mut Repo, remote_name: &str, specs: &[&str]) -> Result<(), String
     Ok(())
 }
 
-fn fetch(repo: &mut Repo, specs: &[&str]) -> Result<(), String> {
+fn fetch(repo: &mut Repo, specs: &[String]) -> Result<(), String> {
     for spec in specs {
         let hash = repo.resolve_spec(spec)?;
         if repo.blob_present(&hash) {
@@ -297,7 +437,10 @@ fn check(repo: &mut Repo, remote_name: &str) -> Result<(), String> {
         println!("  MISSING: {} (was recorded there; record dropped)", hash);
     }
     for hash in &check.discovered {
-        println!("  found unrecorded blob {} (record added)", util::short_hash(hash));
+        println!(
+            "  found unrecorded blob {} (record added)",
+            util::short_hash(hash)
+        );
     }
     if check.missing.is_empty() && check.discovered.is_empty() {
         println!("  database and remote agree");

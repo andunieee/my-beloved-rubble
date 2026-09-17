@@ -42,6 +42,26 @@ sharded `fa/2e/fa2e38…` layout, with no metadata. Encryption is rclone's
 job: point mbr at an rclone `crypt` remote if you want it. Each attached
 folder owns its rclone configuration at `.mbr/rclone.conf`.
 
+### Setting up a remote
+
+mbr hardcodes a short setup form for the backends it can prefill —
+local folders, SFTP, SMB, WebDAV, S3, B2, Azure Blob, GCS, Swift, and
+pCloud — derived from rclone's documentation and cross-checked against
+the embedded rclone's own metadata at test time (`cargo test`), so a
+renamed option upstream fails the build instead of producing a form
+rclone silently ignores.
+
+In the GUI, pick a backend and fill in the generated form; in the CLI,
+`mbr remote types` lists the backends and their fields, and
+`mbr remote setup <name> <type>` asks for them. Answers are handed to
+rclone in one shot (`config/create` with prefilled parameters); anything
+rclone still needs afterwards — typically a browser sign-in for OAuth
+backends — comes back as a single question the frontends relay.
+
+Backends with pure browser flows (Google Drive, Dropbox, OneDrive, …)
+have no form by design; `mbr remote add` still accepts any pre-existing
+rclone target, e.g. one configured with the `rclone` executable itself.
+
 ## CLI
 
 ```
@@ -50,6 +70,7 @@ mbr scan                          ingest new files, record removals
 mbr ls                            list tracked files with metadata
 mbr info <path|hash>              full detail for one file or blob
 mbr remote add <name> <target>    add an existing rclone target
+mbr remote types                  list the rclone backends mbr can set up
 mbr remote setup <name> <type>    configure an rclone remote interactively
 mbr remote rm <name>              remove a remote
 mbr remote ls                     list remotes
@@ -67,9 +88,12 @@ prefix (≥ 6 hex chars).
 `my-beloved-rubble` shows the annotated file listing (green dot = present
 locally), a detail pane for the selected file, and remote management with
 Check / Push all / per-file Push and Fetch buttons, plus Add Existing
-Remote and an interactive Configure Remote flow (backend questions answered
-one at a time, backed by the repository-local `.mbr/rclone.conf`). rclone
-operations run in the background. The last opened folder is reopened on start.
+Remote and a guided remote setup: pick a backend from the picker and fill
+in the generated form (secrets masked, choices as dropdowns, required
+fields marked). If rclone still needs an answer after the form — usually
+OAuth — the question is shown inline. rclone operations run in the
+background, backed by the repository-local `.mbr/rclone.conf`. The last
+opened folder is reopened on start.
 
 ## Building
 

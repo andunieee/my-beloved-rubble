@@ -35,101 +35,155 @@ pub fn set_config_path(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Configure a named rclone remote through rclone's non-interactive config API.
+/// One pending question in rclone's non-interactive config protocol.
+#[derive(Debug, Clone)]
+pub struct SetupQuestion {
+    /// Opaque protocol state; pass back to [`continue_setup`].
+    pub state: String,
+    /// Option name (e.g. `config_is_local`).
+    pub name: String,
+    /// Help text, including any answer examples.
+    pub help: String,
+    /// Default answer as display text (empty if none).
+    pub default: String,
+    /// Whether the answer should be hidden while typing.
+    pub password: bool,
+}
+
+/// Result of a setup step: either the next question or completion.
+#[derive(Debug)]
+pub enum SetupOutcome {
+    Done,
+    Question(SetupQuestion),
+}
+
+fn parse_setup_response(response: Value) -> Result<SetupOutcome, String> {
+    if let Some(error) = response.get("Error").and_then(Value::as_str)
+        && !error.is_empty()
+    {
+        return Err(error.to_owned());
+    }
+    let state = response
+        .get("State")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if state.is_empty() {
+        return Ok(SetupOutcome::Done);
+    }
+    let option = response
+        .get("Option")
+        .ok_or_else(|| "rclone returned a config state without a question".to_owned())?;
+    let mut help = option
+        .get("Help")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    if let Some(examples) = option.get("Examples").and_then(Value::as_array) {
+        for example in examples {
+            let value = example
+                .get("Value")
+                .map(display_value_for_ui)
+                .unwrap_or_default();
+            let example_help = example
+                .get("Help")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            help.push_str(&format!("\n  {value}: {example_help}"));
+        }
+    }
+    Ok(SetupOutcome::Question(SetupQuestion {
+        state: state.to_owned(),
+        name: option
+            .get("Name")
+            .and_then(Value::as_str)
+            .unwrap_or("value")
+            .to_owned(),
+        help,
+        default: option
+            .get("Default")
+            .map(display_value_for_ui)
+            .unwrap_or_default(),
+        password: option
+            .get("IsPassword")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }))
+}
+
+/// Start configuring a new remote, supplying `parameters` (form answers,
+/// config-key → value) as prefilled defaults. Password values are passed in
+/// the clear; rclone obscures them before storing (`obscure` opt).
 ///
-/// The API deliberately returns one question at a time. This keeps provider
-/// details (including OAuth) in rclone while allowing both frontends to share
-/// the configuration protocol.
-pub fn setup_remote(name: &str, backend: &str) -> Result<(), String> {
-    let mut response = call(
+/// Returns either completion or the first question rclone still needs —
+/// typically an OAuth flow, which backends with a full hardcoded form
+/// ([`crate::backends`]) never reach.
+pub fn begin_setup(name: &str, backend: &str, parameters: Value) -> Result<SetupOutcome, String> {
+    let response = call(
         "config/create",
         json!({
             "name": name,
             "type": backend,
-            "parameters": {},
-            "opt": {"nonInteractive": true, "all": true},
+            "parameters": parameters,
+            "opt": {
+                "nonInteractive": true,
+                "all": true,
+                "obscure": true,
+            },
         }),
     )?;
+    parse_setup_response(response)
+}
 
-    loop {
-        if let Some(error) = response.get("Error").and_then(Value::as_str)
-            && !error.is_empty()
-        {
-            return Err(error.to_owned());
-        }
-        let state = response
-            .get("State")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if state.is_empty() {
-            return Ok(());
-        }
+/// Answer one [`SetupQuestion`] and continue. `parameters` carries any
+/// default config values again, as the protocol requires; `answer` is
+/// passed in the clear and obscured here.
+pub fn continue_setup(
+    name: &str,
+    state: &str,
+    answer: &str,
+    parameters: Value,
+) -> Result<SetupOutcome, String> {
+    let response = call(
+        "config/update",
+        json!({
+            "name": name,
+            "parameters": parameters,
+            "opt": {
+                "nonInteractive": true,
+                "continue": true,
+                "obscure": true,
+                "state": state,
+                "result": answer,
+            },
+        }),
+    )?;
+    parse_setup_response(response)
+}
 
-        let option = response
-            .get("Option")
-            .ok_or_else(|| "rclone returned a config state without a question".to_owned())?;
-        let option_name = option
-            .get("Name")
-            .and_then(Value::as_str)
-            .unwrap_or("value");
-        if let Some(help) = option.get("Help").and_then(Value::as_str)
-            && !help.is_empty()
-        {
-            println!("{help}");
-        }
-        if let Some(examples) = option.get("Examples").and_then(Value::as_array) {
-            for example in examples {
-                let value = example
-                    .get("Value")
-                    .map(display_value_for_ui)
-                    .unwrap_or_default();
-                let help = example
-                    .get("Help")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                println!("  {value}: {help}");
-            }
-        }
-        let default = option
-            .get("Default")
-            .map(display_value_for_ui)
-            .unwrap_or_default();
-        let prompt = if default.is_empty() {
-            format!("{option_name}: ")
-        } else {
-            format!("{option_name} [{default}]: ")
-        };
-        let answer = if option
-            .get("IsPassword")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            rpassword::prompt_password(prompt).map_err(|e| e.to_string())?
-        } else {
-            use std::io::Write;
-            print!("{prompt}");
-            std::io::stdout().flush().map_err(|e| e.to_string())?;
-            let mut answer = String::new();
-            std::io::stdin()
-                .read_line(&mut answer)
-                .map_err(|e| e.to_string())?;
-            answer.trim_end().to_owned()
-        };
-        let answer = if answer.is_empty() { default } else { answer };
-        response = call(
-            "config/update",
-            json!({
-                "name": name,
-                "parameters": {},
-                "opt": {
-                    "nonInteractive": true,
-                    "continue": true,
-                    "state": state,
-                    "result": answer,
-                },
-            }),
-        )?;
-    }
+/// Abort an in-progress setup conversation.
+pub fn cancel_setup(state: &str) -> Result<(), String> {
+    call(
+        "config/update",
+        json!({
+            "parameters": {},
+            "opt": {
+                "nonInteractive": true,
+                "continue": true,
+                "state": state,
+                "result": "\u{0}cancel",
+            },
+        }),
+    )?;
+    Ok(())
+}
+
+/// The remote `name` already exists in the selected config.
+pub fn remote_exists(name: &str) -> Result<bool, String> {
+    let remotes = call("config/listremotes", json!({}))?;
+    Ok(remotes
+        .get("remotes")
+        .and_then(Value::as_array)
+        .is_some_and(|remotes| remotes.iter().any(|remote| remote.as_str() == Some(name))))
 }
 
 pub fn display_value_for_ui(value: &Value) -> String {

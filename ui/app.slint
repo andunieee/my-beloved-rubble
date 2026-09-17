@@ -19,6 +19,18 @@ export struct RemoteRow {
     blobs: string,
 }
 
+// One input of the per-backend setup form.
+export struct FormField {
+    key: string,
+    label: string,
+    help: string,
+    kind: int,          // 0 = text, 1 = secret, 2 = choice
+    default: string,
+    default-index: int, // preselected example for kind == 2
+    examples: [string],
+    required: bool,
+}
+
 component SectionTitle inherits Text {
     font-size: 11px;
     font-weight: 700;
@@ -61,8 +73,14 @@ export component AppWindow inherits Window {
 
     in-out property <string> new-remote-name: "";
     in-out property <string> new-remote-target: "";
-    in-out property <string> new-remote-backend: "dropbox";
+
+    // ── guided remote setup ──
+    in-out property <[string]> backend-titles: [];
+    in-out property <string> setup-backend: "";
     in-out property <bool> setup-active: false;
+    in-out property <[FormField]> form-fields: [];
+    in-out property <[string]> form-values: [];
+    // rclone question fallback (OAuth etc.)
     in-out property <string> setup-state: "";
     in-out property <string> setup-question: "";
     in-out property <string> setup-help: "";
@@ -76,7 +94,8 @@ export component AppWindow inherits Window {
     callback open-folder();
     callback rescan();
     callback add-remote(name: string, target: string);
-    callback start-remote-setup(name: string, backend: string);
+    callback select-backend(name: string);
+    callback submit-form(name: string, backend: string, values: [string]);
     callback submit-remote-setup(name: string, backend: string, state: string, answer: string);
     callback cancel-remote-setup();
     callback remove-remote(name: string);
@@ -258,7 +277,7 @@ export component AppWindow inherits Window {
 
             // ── Side panel ──
             Rectangle {
-                width: 360px;
+                width: 380px;
                 background: Palette.background.darker(0.03);
 
                 ScrollView {
@@ -404,92 +423,167 @@ export component AppWindow inherits Window {
                                 }
                             }
 
-                            // add or configure a remote
+                            // ── add an existing target directly ──
                             VerticalLayout {
                                 spacing: 4px;
-                                LineEdit {
-                                    placeholder-text: "name (e.g. backup)";
-                                    text: root.new-remote-name;
-                                    edited(t) => { root.new-remote-name = t; }
-                                }
-                                LineEdit {
-                                    placeholder-text: "rclone target (e.g. s3:bucket/mbr)";
-                                    text: root.new-remote-target;
-                                    edited(t) => { root.new-remote-target = t; }
-                                }
-                                Button {
-                                    text: "Add Existing Remote";
-                                    enabled: root.folder != ""
-                                        && root.new-remote-name != ""
-                                        && root.new-remote-target != "";
-                                    clicked => {
-                                        root.add-remote(root.new-remote-name, root.new-remote-target);
+                                SectionTitle { text: "ADD EXISTING TARGET"; }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    LineEdit {
+                                        placeholder-text: "name (e.g. backup)";
+                                        text: root.new-remote-name;
+                                        edited(t) => { root.new-remote-name = t; }
+                                        horizontal-stretch: 1;
                                     }
-                                }
-                                LineEdit {
-                                    placeholder-text: "backend type (e.g. dropbox)";
-                                    text: root.new-remote-backend;
-                                    edited(t) => { root.new-remote-backend = t; }
-                                }
-                                Button {
-                                    text: "Configure Remote…";
-                                    enabled: root.folder != ""
-                                        && !root.setup-active
-                                        && root.new-remote-name != ""
-                                        && root.new-remote-backend != "";
-                                    clicked => {
-                                        root.start-remote-setup(root.new-remote-name, root.new-remote-backend);
+                                    LineEdit {
+                                        placeholder-text: "target (s3:bucket/mbr)";
+                                        text: root.new-remote-target;
+                                        edited(t) => { root.new-remote-target = t; }
+                                        horizontal-stretch: 2;
+                                    }
+                                    Button {
+                                        text: "Add";
+                                        enabled: root.folder != ""
+                                            && root.new-remote-name != ""
+                                            && root.new-remote-target != "";
+                                        clicked => {
+                                            root.add-remote(root.new-remote-name, root.new-remote-target);
+                                        }
                                     }
                                 }
                             }
 
-                            if root.setup-active: Rectangle {
-                                border-width: 1px;
-                                border-color: Palette.accent-background;
-                                border-radius: 6px;
-                                background: Palette.background;
-                                height: setup-layout.preferred-height + 20px;
+                            // ── guided setup for a new remote ──
+                            VerticalLayout {
+                                spacing: 6px;
+                                SectionTitle { text: "SET UP A NEW REMOTE"; }
 
-                                setup-layout := VerticalLayout {
-                                    padding: 10px;
+                                HorizontalLayout {
                                     spacing: 6px;
-                                    Text {
-                                        text: "Configure " + root.new-remote-name;
-                                        font-weight: 700;
-                                    }
-                                    Text {
-                                        text: root.setup-help;
-                                        font-size: 11px;
-                                        wrap: word-wrap;
-                                        color: Palette.foreground.transparentize(25%);
-                                    }
-                                    Text {
-                                        text: root.setup-question + (root.setup-default == "" ? "" : " [" + root.setup-default + "]");
-                                        font-size: 12px;
-                                        wrap: word-wrap;
-                                    }
                                     LineEdit {
-                                        text: root.setup-answer;
-                                        input-type: root.setup-password ? InputType.password : InputType.text;
-                                        edited(t) => { root.setup-answer = t; }
+                                        placeholder-text: "name (e.g. backup)";
+                                        text: root.new-remote-name;
+                                        edited(t) => { root.new-remote-name = t; }
+                                        horizontal-stretch: 1;
                                     }
+                                    ComboBox {
+                                        model: root.backend-titles;
+                                        current-index: 0;
+                                        horizontal-stretch: 2;
+                                        enabled: !root.busy && root.setup-state == "";
+                                        selected(title) => { root.select-backend(title); }
+                                    }
+                                }
+
+                                // the generated form
+                                if root.setup-active && root.setup-state == "": VerticalLayout {
+                                    spacing: 8px;
+
+                                    for field[i] in root.form-fields: VerticalLayout {
+                                        spacing: 2px;
+                                        HorizontalLayout {
+                                            spacing: 2px;
+                                            Text {
+                                                text: field.required ? field.label + " *" : field.label;
+                                                font-size: 12px;
+                                                font-weight: 600;
+                                                vertical-alignment: center;
+                                            }
+                                            if field.required: Text {
+                                                text: "required";
+                                                font-size: 9px;
+                                                color: #e0a94f;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                        if field.help != "": Text {
+                                            text: field.help;
+                                            font-size: 10px;
+                                            wrap: word-wrap;
+                                            color: Palette.foreground.transparentize(40%);
+                                        }
+                                        if field.kind == 2: ComboBox {
+                                            model: field.examples;
+                                            current-index: field.default-index;
+                                            enabled: !root.busy;
+                                            selected(value) => { root.form-values[i] = value; }
+                                        }
+                                        if field.kind != 2: LineEdit {
+                                            text: root.form-values[i];
+                                            input-type: field.kind == 1 ? InputType.password : InputType.text;
+                                            enabled: !root.busy;
+                                            placeholder-text: field.default;
+                                            edited(t) => { root.form-values[i] = t; }
+                                        }
+                                    }
+
                                     HorizontalLayout {
                                         spacing: 6px;
                                         Button {
-                                            text: "Continue";
-                                            enabled: root.setup-state != "";
+                                            text: "Save Remote";
+                                            primary: true;
+                                            enabled: root.folder != ""
+                                                && !root.busy
+                                                && root.new-remote-name != ""
+                                                && root.setup-backend != "";
                                             clicked => {
-                                                root.submit-remote-setup(
-                                                    root.new-remote-name,
-                                                    root.new-remote-backend,
-                                                    root.setup-state,
-                                                    root.setup-answer
-                                                );
+                                                root.submit-form(root.new-remote-name, root.setup-backend, root.form-values);
                                             }
                                         }
                                         Button {
                                             text: "Cancel";
+                                            enabled: !root.busy;
                                             clicked => { root.cancel-remote-setup(); }
+                                        }
+                                    }
+                                }
+
+                                // rclone question fallback (OAuth, verification…)
+                                if root.setup-state != "": Rectangle {
+                                    border-width: 1px;
+                                    border-color: Palette.accent-background;
+                                    border-radius: 6px;
+                                    background: Palette.background;
+                                    height: question-layout.preferred-height + 20px;
+
+                                    question-layout := VerticalLayout {
+                                        padding: 10px;
+                                        spacing: 6px;
+                                        Text {
+                                            text: root.setup-question + (root.setup-default == "" ? "" : " [" + root.setup-default + "]");
+                                            font-size: 12px;
+                                            font-weight: 600;
+                                            wrap: word-wrap;
+                                        }
+                                        Text {
+                                            text: root.setup-help;
+                                            font-size: 11px;
+                                            wrap: word-wrap;
+                                            color: Palette.foreground.transparentize(25%);
+                                        }
+                                        LineEdit {
+                                            text: root.setup-answer;
+                                            input-type: root.setup-password ? InputType.password : InputType.text;
+                                            edited(t) => { root.setup-answer = t; }
+                                        }
+                                        HorizontalLayout {
+                                            spacing: 6px;
+                                            Button {
+                                                text: "Continue";
+                                                enabled: root.setup-state != "" && !root.busy;
+                                                clicked => {
+                                                    root.submit-remote-setup(
+                                                        root.new-remote-name,
+                                                        root.setup-backend,
+                                                        root.setup-state,
+                                                        root.setup-answer
+                                                    );
+                                                }
+                                            }
+                                            Button {
+                                                text: "Cancel";
+                                                clicked => { root.cancel-remote-setup(); }
+                                            }
                                         }
                                     }
                                 }

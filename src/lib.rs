@@ -18,6 +18,7 @@
 //! Blobs can be pushed to / fetched from rclone remotes, named on the
 //! remote purely by hash (sharded `fa/2e/fa2e38…`, no metadata).
 
+pub mod backends;
 pub mod db;
 pub mod rclone;
 pub mod repo;
