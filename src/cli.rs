@@ -241,7 +241,10 @@ fn remote_add(repo: &mut Repo, name: &str, target: &str) -> Result<(), String> {
 /// List the hardcoded backends with their form fields.
 fn remote_types() -> Result<(), String> {
     for backend in mbr::backends::BACKENDS {
-        println!("{:<12} {} — {}", backend.name, backend.title, backend.description);
+        println!(
+            "{:<12} {} — {}",
+            backend.name, backend.title, backend.description
+        );
         for field in backend.fields {
             let kind = match field.kind {
                 mbr::backends::Kind::Secret => "secret",
@@ -324,7 +327,13 @@ fn remote_setup(repo: &mut Repo, name: &str, backend: &str) -> Result<(), String
         } else {
             prompt(&question.name, &question.default)?
         };
-        outcome = mbr::rclone::continue_setup(name, &question.state, &answer, parameters.clone())?;
+        outcome = mbr::rclone::continue_setup_watching(
+            name,
+            &question.state,
+            &answer,
+            parameters.clone(),
+            &mut |url| println!("\nIf your browser didn't open, open this link:\n  {url}\n"),
+        )?;
     }
 
     repo.db.add_remote(name, &target)?;
@@ -334,10 +343,7 @@ fn remote_setup(repo: &mut Repo, name: &str, backend: &str) -> Result<(), String
 
 /// Build the rclone `parameters` object from the collected answers (the
 /// CLI's non-secret answers already have defaults filled in).
-fn form_parameters(
-    backend: &mbr::backends::Backend,
-    values: &[String],
-) -> serde_json::Value {
+fn form_parameters(backend: &mbr::backends::Backend, values: &[String]) -> serde_json::Value {
     let mut parameters = serde_json::Map::new();
     for (field, value) in backend.fields.iter().zip(values.iter()) {
         let value = value.trim();
