@@ -27,7 +27,8 @@ export struct FormField {
     kind: int,          // 0 = text, 1 = secret, 2 = choice
     default: string,
     default-index: int, // preselected example for kind == 2
-    examples: [string],
+    examples: [string], // values for kind == 2
+    labels: [string],   // how each example is shown
     required: bool,
 }
 
@@ -504,10 +505,10 @@ export component AppWindow inherits Window {
                                             color: Palette.foreground.transparentize(40%);
                                         }
                                         if field.kind == 2: ComboBox {
-                                            model: field.examples;
+                                            model: field.labels;
                                             current-index: field.default-index;
                                             enabled: !root.busy;
-                                            selected(value) => { root.form-values[i] = value; }
+                                            selected => { root.form-values[i] = field.examples[self.current-index]; }
                                         }
                                         if field.kind != 2: LineEdit {
                                             text: root.form-values[i];

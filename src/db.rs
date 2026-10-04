@@ -8,8 +8,8 @@
 //! - `remotes`: configured rclone remotes (name → rclone target).
 //! - `blob_remotes`: which blobs are known to be stored on which remotes.
 //!
-//! minisqlite has no parameter binding, so values are inlined with
-//! [`quote`]; hashes and integers are inlined directly (always safe).
+//! minisqlite has no parameter binding, so every string value is inlined
+//! through [`quote`] (integers are inlined directly, which is always safe).
 
 use minisqlite::{Connection, Value};
 use std::path::Path;
@@ -69,6 +69,26 @@ fn as_text(v: &Value) -> Option<String> {
 }
 
 impl Db {
+    /// Run `f` inside one transaction: committed if it returns `Ok`, rolled
+    /// back otherwise. Much faster than autocommitting each statement, and
+    /// keeps a multi-statement update all-or-nothing.
+    pub fn transaction<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.conn.execute("BEGIN").map_err(|e| e.to_string())?;
+        match f(self) {
+            Ok(value) => {
+                self.conn.execute("COMMIT").map_err(|e| e.to_string())?;
+                Ok(value)
+            }
+            Err(e) => {
+                self.conn.execute("ROLLBACK").ok();
+                Err(e)
+            }
+        }
+    }
+
     pub fn open(path: &Path) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
         let mut db = Self { conn };
@@ -146,8 +166,9 @@ impl Db {
 
     pub fn insert_path(&mut self, path: &str, hash: &str, added_at: i64) -> Result<(), String> {
         let sql = format!(
-            "INSERT INTO paths (path, hash, added_at, removed_at) VALUES ({}, '{hash}', {added_at}, NULL)",
-            quote(path)
+            "INSERT INTO paths (path, hash, added_at, removed_at) VALUES ({}, {}, {added_at}, NULL)",
+            quote(path),
+            quote(hash)
         );
         self.conn.execute(&sql).map_err(|e| e.to_string())
     }
@@ -162,8 +183,9 @@ impl Db {
     pub fn upsert_blob(&mut self, hash: &str, size: u64) -> Result<(), String> {
         self.conn
             .execute(&format!(
-                "DELETE FROM blobs WHERE hash = '{hash}';
-                 INSERT INTO blobs (hash, size) VALUES ('{hash}', {size})"
+                "INSERT INTO blobs (hash, size) VALUES ({}, {size})
+                 ON CONFLICT (hash) DO UPDATE SET size = excluded.size",
+                quote(hash)
             ))
             .map_err(|e| e.to_string())
     }
@@ -222,27 +244,33 @@ impl Db {
     }
 
     pub fn remote(&mut self, name: &str) -> Result<Option<Remote>, String> {
-        Ok(self
-            .list_remotes()?
-            .into_iter()
-            .find(|r| r.name == name))
+        let sql = format!("SELECT name, target FROM remotes WHERE name = {}", quote(name));
+        let r = self.conn.query(&sql).map_err(|e| e.to_string())?;
+        Ok(r.rows.first().and_then(|row| {
+            Some(Remote {
+                name: as_text(&row[0])?,
+                target: as_text(&row[1])?,
+            })
+        }))
     }
 
     // ── blob ↔ remote presence ──
 
     pub fn set_blob_on_remote(&mut self, hash: &str, remote: &str) -> Result<(), String> {
-        let q = quote(remote);
         self.conn
             .execute(&format!(
-                "DELETE FROM blob_remotes WHERE hash = '{hash}' AND remote = {q};
-                 INSERT INTO blob_remotes (hash, remote) VALUES ('{hash}', {q})"
+                "INSERT INTO blob_remotes (hash, remote) VALUES ({}, {})
+                 ON CONFLICT DO NOTHING",
+                quote(hash),
+                quote(remote)
             ))
             .map_err(|e| e.to_string())
     }
 
     pub fn unset_blob_on_remote(&mut self, hash: &str, remote: &str) -> Result<(), String> {
         let sql = format!(
-            "DELETE FROM blob_remotes WHERE hash = '{hash}' AND remote = {}",
+            "DELETE FROM blob_remotes WHERE hash = {} AND remote = {}",
+            quote(hash),
             quote(remote)
         );
         self.conn.execute(&sql).map_err(|e| e.to_string())
@@ -262,8 +290,10 @@ impl Db {
 
     /// Remotes recorded as storing `hash`.
     pub fn remotes_for_blob(&mut self, hash: &str) -> Result<Vec<String>, String> {
-        let sql =
-            format!("SELECT remote FROM blob_remotes WHERE hash = '{hash}' ORDER BY remote");
+        let sql = format!(
+            "SELECT remote FROM blob_remotes WHERE hash = {} ORDER BY remote",
+            quote(hash)
+        );
         let r = self.conn.query(&sql).map_err(|e| e.to_string())?;
         Ok(r.rows.iter().filter_map(|row| as_text(&row[0])).collect())
     }
@@ -276,5 +306,50 @@ impl Db {
         );
         let r = self.conn.query(&sql).map_err(|e| e.to_string())?;
         Ok(r.rows.iter().filter_map(|row| as_text(&row[0])).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn db() -> Db {
+        let mut db = Db {
+            conn: Connection::open_in_memory().unwrap(),
+        };
+        db.init_schema().unwrap();
+        db
+    }
+
+    #[test]
+    fn upserts_are_idempotent() {
+        let mut db = db();
+        db.upsert_blob("ab", 1).unwrap();
+        db.upsert_blob("ab", 2).unwrap();
+        assert_eq!(db.list_blobs().unwrap()[0].size, 2);
+        db.set_blob_on_remote("ab", "r").unwrap();
+        db.set_blob_on_remote("ab", "r").unwrap();
+        assert_eq!(db.remotes_for_blob("ab").unwrap(), ["r"]);
+    }
+
+    #[test]
+    fn transactions_roll_back_on_error() {
+        let mut db = db();
+        let result: Result<(), String> = db.transaction(|db| {
+            db.add_remote("r", "x:")?;
+            Err("boom".into())
+        });
+        assert!(result.is_err());
+        assert!(db.remote("r").unwrap().is_none());
+        db.transaction(|db| db.add_remote("r", "x:")).unwrap();
+        assert_eq!(db.remote("r").unwrap().unwrap().target, "x:");
+    }
+
+    #[test]
+    fn quoting_survives_hostile_names() {
+        let mut db = db();
+        let name = "it's'; DROP TABLE remotes; --";
+        db.add_remote(name, "t:").unwrap();
+        assert!(db.remote(name).unwrap().is_some());
     }
 }

@@ -268,9 +268,6 @@ fn remote_setup(repo: &mut Repo, name: &str, backend: &str) -> Result<(), String
         return Err(format!("remote '{name}' already exists"));
     }
     repo.configure_rclone()?;
-    if mbr::rclone::remote_exists(name)? {
-        return Err(format!("rclone remote '{name}' already exists"));
-    }
     let Some(backend) = mbr::backends::backend(backend) else {
         return Err(format!(
             "unknown backend '{backend}' (see `mbr remote types`)"
@@ -309,9 +306,16 @@ fn remote_setup(repo: &mut Repo, name: &str, backend: &str) -> Result<(), String
     while let mbr::rclone::SetupOutcome::Question(question) = outcome {
         println!("{}", question.help);
         let answer = if question.password {
-            rpassword::prompt_password(format!("{}: ", question.name)).map_err(|e| e.to_string())?
+            rpassword::prompt_password(format!("{}: ", question.name)).map_err(|e| e.to_string())
         } else {
-            prompt(&question.name, &question.default)?
+            prompt(&question.name, &question.default)
+        };
+        let answer = match answer {
+            Ok(answer) => answer,
+            Err(e) => {
+                mbr::rclone::cancel_setup(name, &question.state).ok();
+                return Err(e);
+            }
         };
         outcome = mbr::rclone::continue_setup_watching(
             name,

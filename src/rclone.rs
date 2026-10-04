@@ -13,23 +13,27 @@ use std::time::Duration;
 
 static INITIALIZED: Once = Once::new();
 static RPC_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+/// Held for a whole multi-call operation, so its config path can't be
+/// switched underneath it by another thread.
+static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 fn lock() -> &'static Mutex<()> {
     RPC_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/// Where rclone writes its log. mbr redirects it here so the GUI can surface
-/// the OAuth URL instead of losing it to stderr.
+/// Where rclone writes its log. mbr redirects it here so the frontends can
+/// surface the OAuth URL instead of losing it to stderr. The file is
+/// per-process, so concurrent mbr processes never read each other's URLs.
 pub fn log_path() -> PathBuf {
     LOG_PATH
-        .get_or_init(|| {
-            dirs::config_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("mbr")
-                .join("rclone.log")
-        })
+        .get_or_init(|| std::env::temp_dir().join(format!("mbr-rclone-{}.log", std::process::id())))
         .clone()
+}
+
+/// Current length of the rclone log, to read only what comes after it.
+fn log_len() -> u64 {
+    std::fs::metadata(log_path()).map(|m| m.len()).unwrap_or(0)
 }
 
 fn ensure_initialized() {
@@ -40,10 +44,15 @@ fn ensure_initialized() {
     });
 }
 
-/// The OAuth auth URL rclone most recently wrote to its log, if any.
-pub fn auth_url() -> Option<String> {
-    let text = std::fs::read_to_string(log_path()).ok()?;
-    text.lines().rev().find_map(extract_url)
+/// The OAuth auth URL rclone most recently wrote to its log after byte
+/// offset `since`, if any.
+pub fn auth_url(since: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(log_path()).ok()?;
+    file.seek(SeekFrom::Start(since)).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    String::from_utf8_lossy(&bytes).lines().rev().find_map(extract_url)
 }
 
 fn extract_url(line: &str) -> Option<String> {
@@ -64,10 +73,22 @@ pub fn call(method: &str, input: Value) -> Result<Value, String> {
     serde_json::from_str(&output).map_err(|e| format!("invalid rclone response: {e}"))
 }
 
-/// Point librclone at the config owned by a repository.
+/// Point librclone at the config owned by a repository. Prefer
+/// [`with_config`] when other threads may use a different config.
 pub fn set_config_path(path: &Path) -> Result<(), String> {
     call("config/setpath", json!({"path": path}))?;
     Ok(())
+}
+
+/// Run `f` with librclone pointed at the config at `path`, keeping other
+/// [`with_config`] callers (possibly using another repository's config)
+/// out until it returns.
+pub fn with_config<T>(path: &Path, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let _guard = CONFIG_LOCK
+        .lock()
+        .map_err(|_| "rclone config lock poisoned".to_owned())?;
+    set_config_path(path)?;
+    f()
 }
 
 /// One pending question in rclone's non-interactive config protocol.
@@ -150,9 +171,12 @@ fn parse_setup_response(response: Value) -> Result<SetupOutcome, String> {
 /// the clear; rclone obscures them before storing (`obscure` opt).
 ///
 /// Returns either completion or the first question rclone still needs —
-/// typically an OAuth flow, which backends with a full hardcoded form
-/// ([`crate::backends`]) never reach.
+/// typically an OAuth flow. Refuses to touch an existing remote `name`; if
+/// the step fails, the half-created remote is deleted again.
 pub fn begin_setup(name: &str, backend: &str, parameters: Value) -> Result<SetupOutcome, String> {
+    if remote_exists(name)? {
+        return Err(format!("rclone remote '{name}' already exists"));
+    }
     let response = call(
         "config/create",
         json!({
@@ -161,17 +185,17 @@ pub fn begin_setup(name: &str, backend: &str, parameters: Value) -> Result<Setup
             "parameters": parameters,
             "opt": {
                 "nonInteractive": true,
-                "all": true,
                 "obscure": true,
             },
         }),
-    )?;
-    parse_setup_response(response)
+    );
+    discard_on_error(name, response.and_then(parse_setup_response))
 }
 
 /// Answer one [`SetupQuestion`] and continue. `parameters` carries any
 /// default config values again, as the protocol requires; `answer` is
-/// passed in the clear and obscured here.
+/// passed in the clear and obscured here. If the step fails, the
+/// half-configured remote is deleted (the conversation can't be resumed).
 pub fn continue_setup(
     name: &str,
     state: &str,
@@ -191,13 +215,29 @@ pub fn continue_setup(
                 "result": answer,
             },
         }),
-    )?;
-    parse_setup_response(response)
+    );
+    discard_on_error(name, response.and_then(parse_setup_response))
 }
 
-/// Abort an in-progress setup conversation.
-pub fn cancel_setup(state: &str) -> Result<(), String> {
-    call(
+/// Delete the remote `name` from the selected config.
+pub fn delete_remote(name: &str) -> Result<(), String> {
+    call("config/delete", json!({"name": name}))?;
+    Ok(())
+}
+
+/// Pass `result` through, deleting the half-configured remote `name` if it
+/// is an error.
+fn discard_on_error<T>(name: &str, result: Result<T, String>) -> Result<T, String> {
+    if result.is_err() {
+        delete_remote(name).ok();
+    }
+    result
+}
+
+/// Abort an in-progress setup conversation for remote `name` and delete
+/// the half-configured remote.
+pub fn cancel_setup(name: &str, state: &str) -> Result<(), String> {
+    let cancelled = call(
         "config/update",
         json!({
             "parameters": {},
@@ -208,8 +248,9 @@ pub fn cancel_setup(state: &str) -> Result<(), String> {
                 "result": "\u{0}cancel",
             },
         }),
-    )?;
-    Ok(())
+    );
+    delete_remote(name)?;
+    cancelled.map(|_| ())
 }
 
 /// Like [`continue_setup`], but while rclone blocks doing OAuth (browser
@@ -222,6 +263,8 @@ pub fn continue_setup_watching(
     parameters: Value,
     on_url: &mut dyn FnMut(String),
 ) -> Result<SetupOutcome, String> {
+    // Only URLs logged by this step count, not ones from earlier setups.
+    let since = log_len();
     let (tx, rx) = std::sync::mpsc::channel::<Result<SetupOutcome, String>>();
     let name = name.to_owned();
     let state = state.to_owned();
@@ -236,7 +279,7 @@ pub fn continue_setup_watching(
         match rx.recv_timeout(Duration::from_millis(300)) {
             Ok(result) => return result,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if let Some(url) = auth_url()
+                if let Some(url) = auth_url(since)
                     && reported.as_deref() != Some(url.as_str())
                 {
                     reported = Some(url.clone());

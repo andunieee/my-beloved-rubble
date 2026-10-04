@@ -86,7 +86,7 @@ pub const BACKENDS: &[Backend] = &[
         Field { name: "region", label: "Region", help: "Region to connect to. Leave blank if you are using an S3 clone and you don't have a region.", kind: Kind::Text, default: "", examples: &["", "other-v2-signature"], required: false, to_target: false },
         Field { name: "endpoint", label: "Endpoint", help: "Endpoint for S3 API. Required when using an S3 clone.", kind: Kind::Text, default: "", examples: &["objects-us-east-1.dream.io", "syd1.digitaloceanspaces.com", "sfo3.digitaloceanspaces.com", "fra1.digitaloceanspaces.com", "nyc3.digitaloceanspaces.com", "ams3.digitaloceanspaces.com", "sgp1.digitaloceanspaces.com", "localhost:8333", "s3.us-east-1.lyvecloud.seagate.com", "s3.us-west-1.lyvecloud.seagate.com", "s3.ap-southeast-1.lyvecloud.seagate.com", "oos.eu-west-2.outscale.com", "oos.us-east-2.outscale.com", "oos.us-west-1.outscale.com", "oos.cloudgouv-eu-west-1.outscale.com", "oos.ap-northeast-1.outscale.com", "s3.wasabisys.com", "s3.us-east-2.wasabisys.com", "s3.us-central-1.wasabisys.com", "s3.us-west-1.wasabisys.com", "s3.ca-central-1.wasabisys.com", "s3.eu-central-1.wasabisys.com", "s3.eu-central-2.wasabisys.com", "s3.eu-west-1.wasabisys.com", "s3.eu-west-2.wasabisys.com", "s3.eu-south-1.wasabisys.com", "s3.ap-northeast-1.wasabisys.com", "s3.ap-northeast-2.wasabisys.com", "s3.ap-southeast-1.wasabisys.com", "s3.ap-southeast-2.wasabisys.com", "storage.iran.liara.space", "s3.ir-thr-at1.arvanstorage.ir", "s3.ir-tbz-sh1.arvanstorage.ir", "br-se1.magaluobjects.com", "br-ne1.magaluobjects.com"], required: false, to_target: false },
         Field { name: "location_constraint", label: "Location Constraint", help: "Location constraint - must be set to match the Region. Leave blank if not sure. Used when creating buckets only.", kind: Kind::Text, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "acl", label: "ACL", help: "Canned ACL used when creating buckets and storing or copying objects. This ACL is used for creating objects and if bucket_acl isn't set, for creating buckets too. For more info visit https://docs.aws.amazon.com/AmazonS3/latest/dev/acl-overview.html#canned-acl Note that this ACL is applied when serve…", kind: Kind::Text, default: "", examples: &["default", "private", "public-read", "public-read-write", "authenticated-read", "bucket-owner-read", "bucket-owner-full-control", "private", "public-read", "public-read-write", "authenticated-read"], required: false, to_target: false },
+        Field { name: "acl", label: "ACL", help: "Canned ACL used when creating buckets and storing or copying objects. This ACL is used for creating objects and if bucket_acl isn't set, for creating buckets too. For more info visit https://docs.aws.amazon.com/AmazonS3/latest/dev/acl-overview.html#canned-acl Note that this ACL is applied when serve…", kind: Kind::Text, default: "", examples: &["default", "private", "public-read", "public-read-write", "authenticated-read", "bucket-owner-read", "bucket-owner-full-control"], required: false, to_target: false },
         Field { name: "server_side_encryption", label: "Server Side Encryption", help: "The server-side encryption algorithm used when storing this object in S3.", kind: Kind::Text, default: "", examples: &["", "AES256", "aws:kms"], required: false, to_target: false },
         Field { name: "sse_kms_key_id", label: "SSE KMS Key ID", help: "If using KMS ID you must provide the ARN of Key.", kind: Kind::Secret, default: "", examples: &["", "arn:aws:kms:us-east-1:*"], required: false, to_target: false },
         Field { name: "storage_class", label: "Storage Class", help: "The storage class to use when storing new objects in S3.", kind: Kind::Text, default: "", examples: &["", "STANDARD", "REDUCED_REDUNDANCY", "STANDARD_IA", "ONEZONE_IA", "GLACIER", "DEEP_ARCHIVE", "INTELLIGENT_TIERING", "GLACIER_IR"], required: false, to_target: false },
@@ -104,16 +104,6 @@ pub const BACKENDS: &[Backend] = &[
         Field { name: "box_config_file", label: "Box Config File", help: "Box App config.json location Leave blank normally. Leading `~` will be expanded in the file name as will environment variables such as `${RCLONE_CONFIG_DIR}`.", kind: Kind::Text, default: "", examples: &[], required: false, to_target: false },
         Field { name: "access_token", label: "Access Token", help: "Box App Primary Access Token Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "box_sub_type", label: "Box Sub Type", help: "Box Sub Type", kind: Kind::Choice, default: "user", examples: &["user", "enterprise"], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
-    ] },
-    Backend { name: "cache", title: "Cache", description: "Cache a remote", needs_path: true, fields: &[
-        Field { name: "remote", label: "Remote", help: "Remote to cache. Normally should contain a ':' and a path, e.g. \"myremote:path/to/dir\", \"myremote:bucket\" or maybe \"myremote:\" (not recommended).", kind: Kind::Text, default: "", examples: &[], required: true, to_target: false },
-        Field { name: "plex_url", label: "Plex URL", help: "The URL of the Plex server.", kind: Kind::Text, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "plex_username", label: "Plex Username", help: "The username of the Plex user.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "plex_password", label: "Plex Password", help: "The password of the Plex user.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "chunk_size", label: "Chunk Size", help: "The size of a chunk (partial file data). Use lower numbers for slower connections. If the chunk size is changed, any downloaded chunks will be invalid and cache-chunk-path will need to be cleared or unexpected EOF errors will occur.", kind: Kind::Choice, default: "5Mi", examples: &["1M", "5M", "10M"], required: false, to_target: false },
-        Field { name: "info_age", label: "Info Age", help: "How long to cache file structure information (directory listings, file size, times, etc.). If all write operations are done through the cache then you can safely make this value very large as the cache store will also be updated in real time.", kind: Kind::Choice, default: "6h0m0s", examples: &["1h", "24h", "48h"], required: false, to_target: false },
-        Field { name: "chunk_total_size", label: "Chunk Total Size", help: "The total size that the chunks can take up on the local disk. If the cache exceeds this value then it will start to delete the oldest chunks until it goes under this value.", kind: Kind::Choice, default: "10Gi", examples: &["500M", "1G", "10G"], required: false, to_target: false },
         Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
     Backend { name: "chunker", title: "Chunker", description: "Transparently chunk/split large files", needs_path: true, fields: &[
@@ -271,8 +261,6 @@ pub const BACKENDS: &[Backend] = &[
         Field { name: "user", label: "User", help: "User name.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "pass", label: "Pass", help: "Password.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
-    ] },
-    Backend { name: "memory", title: "Memory", description: "In memory object storage system.", needs_path: false, fields: &[
     ] },
     Backend { name: "azureblob", title: "Microsoft Azure Blob Storage", description: "Azure containers", needs_path: false, fields: &[
         Field { name: "account", label: "Account", help: "Azure Storage Account Name. Set this to the Azure Storage Account Name in use. Leave blank to use SAS URL or Emulator, otherwise it needs to be set. If this is blank and if env_auth is set it will be read from the environment variable `AZURE_STORAGE_ACCOUNT_NAME` if possible.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
@@ -490,6 +478,17 @@ pub fn backend(name: &str) -> Option<&'static Backend> {
     BACKENDS.iter().find(|b| b.name == name)
 }
 
+/// The options a [`Kind::Choice`] field offers: its examples, preceded by
+/// its default when that isn't one of them (often `""`, meaning "leave it
+/// to rclone"), so the default can always be preselected.
+pub fn choice_values(field: &Field) -> Vec<&'static str> {
+    let mut values = field.examples.to_vec();
+    if !values.contains(&field.default) {
+        values.insert(0, field.default);
+    }
+    values
+}
+
 /// Backend names for pickers and `mbr remote types`.
 pub fn backend_names() -> Vec<&'static str> {
     BACKENDS.iter().map(|b| b.name).collect()
@@ -555,6 +554,16 @@ mod tests {
             for f in b.fields {
                 assert!(!f.label.is_empty(), "{}.{}", b.name, f.name);
                 assert!(!f.help.is_empty(), "{}.{} lacks help text", b.name, f.name);
+                let mut examples = f.examples.to_vec();
+                examples.sort();
+                examples.dedup();
+                assert_eq!(
+                    examples.len(),
+                    f.examples.len(),
+                    "{}.{} has duplicate examples",
+                    b.name,
+                    f.name
+                );
                 match f.kind {
                     Kind::Choice => assert!(
                         !f.examples.is_empty(),
@@ -588,6 +597,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn choices_offer_the_default() {
+        for b in BACKENDS {
+            for f in b.fields.iter().filter(|f| f.kind == Kind::Choice) {
+                assert!(choice_values(f).contains(&f.default), "{}.{}", b.name, f.name);
+            }
+        }
+        let s3 = backend("s3").unwrap();
+        let provider = s3.fields.iter().find(|f| f.name == "provider").unwrap();
+        assert_eq!(choice_values(provider)[..2], ["", "AWS"]);
     }
 
     #[test]

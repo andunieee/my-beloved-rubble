@@ -1,8 +1,10 @@
 //! `my-beloved-rubble` — the Slint GUI.
 //!
-//! rclone operations (push / fetch / check) run on background threads and
-//! report back through an mpsc channel drained by a UI timer, so the window
-//! stays responsive; database writes always happen on the UI thread.
+//! Slow work — rclone operations (push / fetch / check) and the filesystem
+//! half of a scan (hashing, moving files into the store) — runs on
+//! background threads and reports back through an mpsc channel drained by a
+//! UI timer, so the window stays responsive; database writes always happen
+//! on the UI thread.
 
 use mbr::backends::{self, Kind};
 use mbr::db::Remote;
@@ -34,6 +36,12 @@ enum Msg {
         remote: String,
         result: Result<Vec<String>, String>,
     },
+    /// The filesystem half of a scan of `root` finished; on success,
+    /// record it in the db.
+    Scanned {
+        root: PathBuf,
+        result: Result<Vec<repo::ScannedEntry>, String>,
+    },
     /// A background task ended.
     Done,
     /// A remote configuration step returned from librclone.
@@ -54,6 +62,8 @@ struct App {
     repo: Rc<RefCell<Option<Repo>>>,
     tx: mpsc::Sender<Msg>,
     tasks: Rc<Cell<u32>>,
+    /// A scan is running in the background.
+    scanning: Cell<bool>,
 }
 
 fn main() -> Result<(), slint::PlatformError> {
@@ -66,6 +76,7 @@ fn main() -> Result<(), slint::PlatformError> {
         repo: Rc::new(RefCell::new(None)),
         tx,
         tasks: Rc::new(Cell::new(0)),
+        scanning: Cell::new(false),
     });
 
     // ── message pump for background rclone tasks ──
@@ -240,29 +251,34 @@ impl App {
         }
         match Repo::init(&dir) {
             Ok(repo) => {
+                save_last_folder(&repo.root);
                 *self.repo.borrow_mut() = Some(repo);
-                save_last_folder(&dir);
+                self.refresh();
                 self.rescan();
             }
             Err(e) => self.status(format!("Error: {e}")),
         }
     }
 
+    /// Start a scan: ingest on a background thread, then record the result
+    /// on the UI thread (see [`Msg::Scanned`]).
     fn rescan(&self) {
-        self.with_repo("scan", |repo| {
-            let report = repo.scan()?;
-            Ok(if report.is_empty() {
-                "Scan finished: nothing changed".to_owned()
-            } else {
-                format!(
-                    "Scan finished: {} added, {} replaced, {} removed",
-                    report.added.len(),
-                    report.replaced.len(),
-                    report.removed.len()
-                )
-            })
+        let Some(root) = self.repo.borrow().as_ref().map(|r| r.root.clone()) else {
+            self.status("Cannot scan: no folder open");
+            return;
+        };
+        if self.scanning.replace(true) {
+            self.status("A scan is already running");
+            return;
+        }
+        self.begin_task();
+        self.status("Scanning…");
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = repo::ingest_tree(&root);
+            tx.send(Msg::Scanned { root, result }).ok();
+            tx.send(Msg::Done).ok();
         });
-        self.refresh();
     }
 
     // ── background rclone tasks ──
@@ -299,22 +315,23 @@ impl App {
         self.status(format!("Pushing {} blob(s) to {remote_name}…", blobs.len()));
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            if let Err(e) = mbr::rclone::set_config_path(&config_path) {
+            let configured = mbr::rclone::with_config(&config_path, || {
+                for (hash, blob) in blobs {
+                    let result = mbr::rclone::push_blob(&remote.target, &blob, &hash);
+                    tx.send(Msg::Pushed {
+                        remote: remote.name.clone(),
+                        hash,
+                        result,
+                    })
+                    .ok();
+                }
+                Ok(())
+            });
+            if let Err(e) = configured {
                 tx.send(Msg::Pushed {
                     remote: remote.name.clone(),
                     hash: String::new(),
                     result: Err(e),
-                })
-                .ok();
-                tx.send(Msg::Done).ok();
-                return;
-            }
-            for (hash, blob) in blobs {
-                let result = mbr::rclone::push_blob(&remote.target, &blob, &hash);
-                tx.send(Msg::Pushed {
-                    remote: remote.name.clone(),
-                    hash,
-                    result,
                 })
                 .ok();
             }
@@ -351,8 +368,9 @@ impl App {
         let tx = self.tx.clone();
         let hash = hash.to_owned();
         std::thread::spawn(move || {
-            let result = mbr::rclone::set_config_path(&config_path)
-                .and_then(|()| repo::download_blob(&holders, &hash, &blob));
+            let result = mbr::rclone::with_config(&config_path, || {
+                repo::download_blob(&holders, &hash, &blob)
+            });
             tx.send(Msg::Fetched { hash, result }).ok();
             tx.send(Msg::Done).ok();
         });
@@ -374,8 +392,9 @@ impl App {
         self.status(format!("Checking remote '{name}'…"));
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let result = mbr::rclone::set_config_path(&config_path)
-                .and_then(|()| mbr::rclone::list_blobs(&remote.target));
+            let result = mbr::rclone::with_config(&config_path, || {
+                mbr::rclone::list_blobs(&remote.target)
+            });
             tx.send(Msg::Listed {
                 remote: remote.name,
                 result,
@@ -406,17 +425,21 @@ impl App {
             .unwrap_or_default()
             .iter()
             .map(|field| {
-                let examples: Vec<SharedString> = field
-                    .examples
-                    .iter()
-                    .map(|e| SharedString::from(*e))
-                    .collect();
-                let default_index = field
-                    .examples
+                let values = match field.kind {
+                    Kind::Choice => backends::choice_values(field),
+                    _ => field.examples.to_vec(),
+                };
+                let default_index = values
                     .iter()
                     .position(|e| *e == field.default)
                     .map(|i| i as i32)
                     .unwrap_or(0);
+                let labels: Vec<SharedString> = values
+                    .iter()
+                    .map(|v| SharedString::from(if v.is_empty() { "(rclone default)" } else { v }))
+                    .collect();
+                let examples: Vec<SharedString> =
+                    values.iter().map(|v| SharedString::from(*v)).collect();
                 FormField {
                     key: field.name.into(),
                     label: field.label.into(),
@@ -429,6 +452,7 @@ impl App {
                     default: field.default.into(),
                     default_index,
                     examples: ModelRc::new(VecModel::from(examples)),
+                    labels: ModelRc::new(VecModel::from(labels)),
                     required: field.required,
                 }
             })
@@ -467,10 +491,7 @@ impl App {
             let parameters = parameters.clone();
             let target = target.clone();
             Box::new(move || {
-                let result = mbr::rclone::set_config_path(&config_path).and_then(|()| {
-                    if mbr::rclone::remote_exists(&name)? {
-                        return Err(format!("rclone remote '{name}' already exists"));
-                    }
+                let result = mbr::rclone::with_config(&config_path, || {
                     mbr::rclone::begin_setup(&name, &backend_name, parameters)
                 });
                 tx.send(Msg::Setup {
@@ -506,7 +527,7 @@ impl App {
                 let mut on_url = |url| {
                     let _ = tx.send(Msg::OAuthUrl(url));
                 };
-                let result = mbr::rclone::set_config_path(&config_path).and_then(|()| {
+                let result = mbr::rclone::with_config(&config_path, || {
                     mbr::rclone::continue_setup_watching(
                         &name,
                         &state,
@@ -553,12 +574,16 @@ impl App {
 
     fn cancel_remote_setup(&self) {
         let state = self.window.get_setup_state().to_string();
+        let name = self.window.get_new_remote_name().to_string();
+        let config_path = self.repo.borrow().as_ref().map(Repo::rclone_config_path);
         self.reset_setup_ui();
-        if !state.is_empty() {
+        if let (false, Some(config_path)) = (state.is_empty(), config_path) {
             self.begin_task();
             let tx = self.tx.clone();
             std::thread::spawn(move || {
-                let result = mbr::rclone::cancel_setup(&state);
+                let result = mbr::rclone::with_config(&config_path, || {
+                    mbr::rclone::cancel_setup(&name, &state)
+                });
                 tx.send(Msg::Cancelled { result }).ok();
                 tx.send(Msg::Done).ok();
             });
@@ -659,6 +684,34 @@ impl App {
             Msg::Cancelled { result } => {
                 if let Err(e) = result {
                     self.status(format!("Note: {e}"));
+                }
+            }
+            Msg::Scanned { root, result } => {
+                self.scanning.set(false);
+                let current = self.repo.borrow().as_ref().map(|r| r.root.clone());
+                if current.as_ref() != Some(&root) {
+                    // Another folder was opened meanwhile; its own scan
+                    // will be (or was) started by `attach`.
+                    if current.is_some() {
+                        self.rescan();
+                    }
+                    return;
+                }
+                match result {
+                    Ok(entries) => self.with_repo("scan", |repo| {
+                        let report = repo.apply_scan(entries)?;
+                        Ok(if report.is_empty() {
+                            "Scan finished: nothing changed".to_owned()
+                        } else {
+                            format!(
+                                "Scan finished: {} added, {} replaced, {} removed",
+                                report.added.len(),
+                                report.replaced.len(),
+                                report.removed.len()
+                            )
+                        })
+                    }),
+                    Err(e) => self.status(format!("Scan failed: {e}")),
                 }
             }
             Msg::Done => {
