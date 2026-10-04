@@ -297,6 +297,7 @@ fn remote_setup(repo: &mut Repo, name: &str, backend: &str) -> Result<(), String
         values.push(answer);
     }
     let spec = mbr::backends::target_spec(backend, &values);
+    mbr::backends::check_target_spec(backend, &spec)?;
     let target = mbr::backends::target_for(name, backend, &spec);
 
     let parameters = mbr::backends::form_parameters(backend, &values);

@@ -71,8 +71,13 @@ export component AppWindow inherits Window {
     in-out property <int> selected-index: -1;
     in-out property <string> status-text: "Open a folder to get started";
     in-out property <bool> busy: false;
+    // Side panel width; drag the divider to change it.
+    in-out property <length> sidebar-width: 460px;
 
+    // Name for the guided remote setup.
     in-out property <string> new-remote-name: "";
+    // "Add existing target" inputs.
+    in-out property <string> existing-remote-name: "";
     in-out property <string> new-remote-target: "";
 
     // ── guided remote setup ──
@@ -177,7 +182,7 @@ export component AppWindow inherits Window {
                                 color: Palette.foreground.transparentize(40%);
                             }
                             Text {
-                                text: "Open a folder to attach mbr to it.\nFiles you drop there are content-addressed into .blobs/ and symlinked back.";
+                                text: "Open a folder to attach mbr to it.\nFiles you drop there are content-addressed into .mbr/blobs/ and symlinked back.";
                                 font-size: 12px;
                                 horizontal-alignment: center;
                                 color: Palette.foreground.transparentize(50%);
@@ -275,11 +280,32 @@ export component AppWindow inherits Window {
                 }
             }
 
-            Rectangle { width: 1px; background: Palette.border; }
+            // Draggable divider between file list and side panel.
+            Rectangle {
+                width: 7px;
+                background: Palette.background;
+
+                Rectangle {
+                    x: (parent.width - self.width) / 2;
+                    width: divider-touch.has-hover || divider-touch.pressed ? 3px : 1px;
+                    background: divider-touch.has-hover || divider-touch.pressed
+                        ? Palette.accent-background : Palette.border;
+                }
+
+                divider-touch := TouchArea {
+                    mouse-cursor: col-resize;
+                    moved => {
+                        root.sidebar-width = clamp(
+                            root.sidebar-width - (self.mouse-x - self.pressed-x),
+                            340px,
+                            max(340px, root.width - 360px));
+                    }
+                }
+            }
 
             // ── Side panel ──
             Rectangle {
-                width: 380px;
+                width: root.sidebar-width;
                 background: Palette.background.darker(0.03);
 
                 ScrollView {
@@ -433,23 +459,21 @@ export component AppWindow inherits Window {
                                     spacing: 6px;
                                     LineEdit {
                                         placeholder-text: "name (e.g. backup)";
-                                        text: root.new-remote-name;
-                                        edited(t) => { root.new-remote-name = t; }
+                                        text <=> root.existing-remote-name;
                                         horizontal-stretch: 1;
                                     }
                                     LineEdit {
                                         placeholder-text: "target (s3:bucket/mbr)";
-                                        text: root.new-remote-target;
-                                        edited(t) => { root.new-remote-target = t; }
+                                        text <=> root.new-remote-target;
                                         horizontal-stretch: 2;
                                     }
                                     Button {
                                         text: "Add";
                                         enabled: root.folder != ""
-                                            && root.new-remote-name != ""
+                                            && root.existing-remote-name != ""
                                             && root.new-remote-target != "";
                                         clicked => {
-                                            root.add-remote(root.new-remote-name, root.new-remote-target);
+                                            root.add-remote(root.existing-remote-name, root.new-remote-target);
                                         }
                                     }
                                 }
@@ -464,8 +488,7 @@ export component AppWindow inherits Window {
                                     spacing: 6px;
                                     LineEdit {
                                         placeholder-text: "name (e.g. backup)";
-                                        text: root.new-remote-name;
-                                        edited(t) => { root.new-remote-name = t; }
+                                        text <=> root.new-remote-name;
                                         horizontal-stretch: 1;
                                     }
                                     ComboBox {
@@ -484,7 +507,8 @@ export component AppWindow inherits Window {
                                     for field[i] in root.form-fields: VerticalLayout {
                                         spacing: 2px;
                                         HorizontalLayout {
-                                            spacing: 2px;
+                                            spacing: 6px;
+                                            alignment: start;
                                             Text {
                                                 text: field.required ? field.label + " *" : field.label;
                                                 font-size: 12px;
@@ -570,9 +594,8 @@ export component AppWindow inherits Window {
                                             color: Palette.accent-background;
                                         }
                                         LineEdit {
-                                            text: root.setup-answer;
+                                            text <=> root.setup-answer;
                                             input-type: root.setup-password ? InputType.password : InputType.text;
-                                            edited(t) => { root.setup-answer = t; }
                                         }
                                         HorizontalLayout {
                                             spacing: 6px;

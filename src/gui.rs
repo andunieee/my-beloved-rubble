@@ -122,7 +122,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 repo.db.add_remote(&name, &target)?;
                 Ok(format!("Added remote {name} -> {target}"))
             });
-            app.window.set_new_remote_name(SharedString::default());
+            app.window.set_existing_remote_name(SharedString::default());
             app.window.set_new_remote_target(SharedString::default());
             app.refresh();
         });
@@ -484,8 +484,13 @@ impl App {
                 return;
             }
         }
+        let spec = backends::target_spec(backend, values);
+        if let Err(e) = backends::check_target_spec(backend, &spec) {
+            self.status(format!("Error: {e}"));
+            return;
+        }
         let parameters = backends::form_parameters(backend, values);
-        let target = backends::target_for(name, backend, &backends::target_spec(backend, values));
+        let target = backends::target_for(name, backend, &spec);
         let backend_name = backend_name.to_owned();
         self.run_setup_step(name, |tx, name, config_path| {
             let parameters = parameters.clone();
@@ -568,8 +573,11 @@ impl App {
         self.status("Talking to rclone…");
         let tx = self.tx.clone();
         let name = name.to_owned();
-        let step = step(tx, name.clone(), config_path);
-        std::thread::spawn(step);
+        let step = step(tx.clone(), name.clone(), config_path);
+        std::thread::spawn(move || {
+            step();
+            tx.send(Msg::Done).ok();
+        });
     }
 
     fn cancel_remote_setup(&self) {
@@ -603,6 +611,11 @@ impl App {
         self.window.set_form_fields(ModelRc::default());
         self.window.set_form_values(ModelRc::default());
         self.window.set_new_remote_name(SharedString::default());
+        // Offer a fresh form for the backend still selected in the picker.
+        let backend = self.window.get_setup_backend();
+        if !backend.is_empty() {
+            self.show_form(&backend);
+        }
     }
 
     /// Apply a completion message from a background task (UI thread).
