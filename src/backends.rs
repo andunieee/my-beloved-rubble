@@ -498,16 +498,43 @@ pub fn backend_names() -> Vec<&'static str> {
 /// Default path prefix mbr uses when no user path is supplied.
 pub const DEFAULT_PATH: &str = "mbr";
 
-/// Build the rclone target for a configured remote. `spec` is the user's
-/// bucket or path answer; empty answers fall back to [`DEFAULT_PATH`].
-pub fn target_for(backend: &Backend, spec: &str) -> String {
+/// Build the mbr target for the rclone remote `remote_name`. `spec` is the
+/// user's bucket or path answer; empty answers fall back to [`DEFAULT_PATH`].
+pub fn target_for(remote_name: &str, backend: &Backend, spec: &str) -> String {
     let spec = spec.trim().trim_matches('/');
     let spec = if spec.is_empty() && backend.needs_path {
         DEFAULT_PATH
     } else {
         spec
     };
-    format!("{}:{}", backend.name, spec)
+    format!("{remote_name}:{spec}")
+}
+
+/// The bucket/path answer among form `values` (in field order): the first
+/// field flagged [`Field::to_target`], or empty if there is none.
+pub fn target_spec<S: AsRef<str>>(backend: &Backend, values: &[S]) -> String {
+    backend
+        .fields
+        .iter()
+        .zip(values)
+        .find(|(field, _)| field.to_target)
+        .map(|(_, value)| value.as_ref().trim().to_owned())
+        .unwrap_or_default()
+}
+
+/// Build the rclone `parameters` object from form `values` (in field
+/// order): non-empty answers keyed by config name, in the clear (rclone
+/// obscures secrets). [`Field::to_target`] answers are not rclone config
+/// and are left out.
+pub fn form_parameters<S: AsRef<str>>(backend: &Backend, values: &[S]) -> serde_json::Value {
+    let mut parameters = serde_json::Map::new();
+    for (field, value) in backend.fields.iter().zip(values) {
+        let value = value.as_ref().trim();
+        if !field.to_target && !value.is_empty() {
+            parameters.insert(field.name.to_owned(), serde_json::Value::from(value));
+        }
+    }
+    serde_json::Value::Object(parameters)
 }
 
 #[cfg(test)]
@@ -572,10 +599,22 @@ mod tests {
     #[test]
     fn target_building() {
         let smb = backend("smb").unwrap();
-        assert_eq!(target_for(smb, "share/sub"), "smb:share/sub");
-        assert_eq!(target_for(smb, ""), "smb:mbr");
+        assert_eq!(target_for("nas", smb, "share/sub"), "nas:share/sub");
+        assert_eq!(target_for("nas", smb, ""), "nas:mbr");
         let s3 = backend("s3").unwrap();
-        assert_eq!(target_for(s3, "mybucket"), "s3:mybucket");
-        assert_eq!(target_for(s3, "mybucket/"), "s3:mybucket");
+        assert_eq!(target_for("backup", s3, "mybucket"), "backup:mybucket");
+        assert_eq!(target_for("backup", s3, "mybucket/"), "backup:mybucket");
+    }
+
+    #[test]
+    fn form_answers() {
+        let s3 = backend("s3").unwrap();
+        let mut values = vec![String::new(); s3.fields.len()];
+        let at = |name| s3.fields.iter().position(|f| f.name == name).unwrap();
+        values[at("provider")] = "AWS".into();
+        values[at("bucket")] = " photos/ ".into();
+        assert_eq!(target_spec(s3, &values), "photos/");
+        let parameters = form_parameters(s3, &values);
+        assert_eq!(parameters, serde_json::json!({"provider": "AWS"}));
     }
 }
