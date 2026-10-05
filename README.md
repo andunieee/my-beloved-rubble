@@ -65,6 +65,16 @@ browser, and the auth link is also printed (CLI) or shown inline (GUI) in
 case no browser opens. `mbr remote add` still accepts any pre-existing
 rclone target, e.g. one configured with the `rclone` executable itself.
 
+### Scanning remotes
+
+Scanning a remote lists everything stored there and makes the database
+match: blobs recorded there but gone lose their record, and every blob
+found is recorded as stored there. Blobs the database has never heard of
+(pushed from another folder, say) are added too, and given a name in the
+`unnamed/` folder: `unnamed/<hash>`, a symlink like any other tracked
+file, dangling until the blob is downloaded. Rename or move it like any
+other file.
+
 ## CLI
 
 ```
@@ -75,11 +85,18 @@ mbr info <path|hash>              full detail for one file or blob
 mbr remote add <name> <target>    add an existing rclone target
 mbr remote types                  list the rclone backends mbr can set up
 mbr remote setup <name> <type>    configure an rclone remote interactively
-mbr remote rm <name>              remove a remote
 mbr remote ls                     list remotes
-mbr push <remote> [path|hash...]  push blobs (default: all not yet there)
-mbr fetch <path|hash>...          download blobs missing locally
-mbr check <remote>                verify reachability and blob presence
+mbr remote show <name>            target and rclone settings (secrets hidden)
+mbr remote edit <name> [--rename NEW] [--target T] [--set KEY=VALUE...]
+                                  rename, retarget, or change rclone settings
+mbr remote scan [name...]         list remotes fully, record what they hold
+mbr remote rm <name>              remove a remote
+mbr push <remote> [path|hash...]  upload blobs (default: all not yet there)
+mbr pull <remote> [path|hash...]  download from one remote (default: all it
+                                  holds that is missing here)
+mbr fetch <path|hash>...          download blobs from any remote holding them
+mbr check <remote> [path|hash...] ask a remote about specific blobs
+                                  (without any: same as `remote scan`)
 ```
 
 Every command except `init` works from anywhere inside an attached folder.
@@ -88,16 +105,27 @@ prefix (≥ 6 hex chars).
 
 ## GUI
 
-`my-beloved-rubble` shows the annotated file listing (green dot = present
-locally), a detail pane for the selected file, and remote management with
-Check / Push all / per-file Push and Fetch buttons, plus Add Existing
-Remote and a guided remote setup: pick a backend from the picker and fill
-in the generated form (secrets masked, choices as dropdowns, required
-fields marked). If rclone still needs an answer after the form — usually
-OAuth — the question is shown inline. Scans and rclone operations run in
-the background, the latter backed by the repository-local
-`.mbr/rclone.conf`. The last
-opened folder is reopened on start.
+`my-beloved-rubble` has two tabs.
+
+**Blobs** shows the annotated file listing (green dot = present locally).
+Select files with a click, Ctrl/⌘+click (toggle), Shift+click (range),
+by dragging across rows, or Ctrl+A (all; Esc clears). The sidebar shows
+the details of a single selected file, or a summary of several, and acts
+on the selected blobs: upload them to a remote, check whether a remote
+holds them, or download the ones missing locally.
+
+**Remotes** lists the remotes with Scan (and Scan all), Download all
+(everything recorded there that is missing here), Upload all, Edit and
+Remove. The sidebar adds remotes — an existing rclone target, or a
+guided setup: pick a backend and fill in the generated form (secrets
+masked, choices as dropdowns, required fields marked); if rclone still
+needs an answer — usually OAuth — the question is shown inline. Edit
+renames or retargets a remote and, for backends mbr has a form for,
+changes its rclone settings (secrets stay hidden; blank keeps them).
+
+Scans and rclone operations run in the background, backed by the
+repository-local `.mbr/rclone.conf`. The last opened folder is reopened
+on start.
 
 ## Building
 

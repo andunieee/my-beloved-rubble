@@ -11,12 +11,15 @@ export struct FileRow {
     other-names: string,
     past-names: string,
     versions: string,
+    selected: bool,
 }
 
 export struct RemoteRow {
     name: string,
     target: string,
     blobs: string,
+    // Blobs recorded on this remote that are not present locally.
+    missing-locally: int,
 }
 
 // One input of the per-backend setup form.
@@ -25,11 +28,26 @@ export struct FormField {
     label: string,
     help: string,
     kind: int,          // 0 = text, 1 = secret, 2 = choice
-    default: string,
+    default: string,    // placeholder shown while the input is empty
     default-index: int, // preselected example for kind == 2
     examples: [string], // values for kind == 2
     labels: [string],   // how each example is shown
     required: bool,
+}
+
+// Wrapped text only reserves the right height when its width is known
+// up front, so sidebar text is sized from the panel width explicitly.
+global Side {
+    in-out property <length> width: 460px;
+    // Width available to text inside the panel's padding.
+    out property <length> text-width: self.width - 28px;
+}
+
+component Hint inherits Text {
+    font-size: 11px;
+    wrap: word-wrap;
+    color: Palette.foreground.transparentize(40%);
+    width: Side.text-width;
 }
 
 component SectionTitle inherits Text {
@@ -52,7 +70,79 @@ component DetailLine inherits HorizontalLayout {
         text: root.value;
         font-size: 12px;
         wrap: word-wrap;
-        horizontal-stretch: 1;
+        width: Side.text-width - 66px;
+    }
+}
+
+component TabButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    callback clicked();
+    min-width: label.preferred-width + 24px;
+    border-radius: 6px;
+    background: root.active ? Palette.accent-background
+        : touch.has-hover ? Palette.background.darker(0.08) : transparent;
+
+    label := Text {
+        text: root.text;
+        font-size: 13px;
+        font-weight: root.active ? 700 : 500;
+        color: root.active ? Palette.accent-foreground : Palette.foreground;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+    }
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+// The labelled inputs of a backend form, writing answers into `values`.
+component BackendForm inherits VerticalLayout {
+    in property <[FormField]> fields;
+    in-out property <[string]> values;
+    in property <bool> enabled: true;
+    spacing: 8px;
+
+    for field[i] in root.fields: VerticalLayout {
+        spacing: 2px;
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: start;
+            Text {
+                text: field.required ? field.label + " *" : field.label;
+                font-size: 12px;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+            if field.required: Text {
+                text: "required";
+                font-size: 9px;
+                color: #e0a94f;
+                vertical-alignment: center;
+            }
+        }
+        if field.help != "": Text {
+            text: field.help;
+            font-size: 10px;
+            wrap: word-wrap;
+            width: Side.text-width;
+            color: Palette.foreground.transparentize(40%);
+        }
+        if field.kind == 2: ComboBox {
+            // Reports a far too tall preferred height in sidebar layouts.
+            max-height: self.min-height;
+            model: field.labels;
+            current-index: field.default-index;
+            enabled: root.enabled;
+            selected => { root.values[i] = field.examples[self.current-index]; }
+        }
+        if field.kind != 2: LineEdit {
+            text: root.values[i];
+            input-type: field.kind == 1 ? InputType.password : InputType.text;
+            enabled: root.enabled;
+            placeholder-text: field.default;
+            edited(t) => { root.values[i] = t; }
+        }
     }
 }
 
@@ -68,11 +158,21 @@ export component AppWindow inherits Window {
     in-out property <[FileRow]> files: [];
     in-out property <[RemoteRow]> remotes: [];
     in-out property <[string]> remote-names: [];
-    in-out property <int> selected-index: -1;
     in-out property <string> status-text: "Open a folder to get started";
     in-out property <bool> busy: false;
+    // 0 = Blobs, 1 = Remotes.
+    in-out property <int> active-tab: 0;
     // Side panel width; drag the divider to change it.
-    in-out property <length> sidebar-width: 460px;
+    in-out property <length> sidebar-width <=> Side.width;
+
+    // ── blob selection (kept by the Rust side) ──
+    in-out property <int> selected-count: 0;
+    // The one selected row, when exactly one is selected; else -1.
+    in-out property <int> detail-index: -1;
+    in-out property <string> selection-summary: "";
+    // Distinct selected blobs present / missing locally.
+    in-out property <int> selection-local: 0;
+    in-out property <int> selection-missing: 0;
 
     // Name for the guided remote setup.
     in-out property <string> new-remote-name: "";
@@ -95,21 +195,49 @@ export component AppWindow inherits Window {
     in-out property <string> setup-url: "";
     in-out property <bool> setup-password: false;
 
-    property <bool> has-selection: root.selected-index >= 0 && root.selected-index < root.files.length;
+    // ── editing an existing remote ──
+    in-out property <bool> editing: false;
+    in-out property <string> edit-original: "";
+    in-out property <string> edit-name: "";
+    in-out property <string> edit-target: "";
+    in-out property <string> edit-section: "";
+    in-out property <string> edit-note: "";
+    in-out property <[FormField]> edit-fields: [];
+    in-out property <[string]> edit-values: [];
+
+    // The remote picked for actions on the selected blobs.
+    in-out property <int> action-remote-index: 0;
+    property <string> action-remote: root.remote-names[clamp(root.action-remote-index, 0, max(0, root.remote-names.length - 1))];
+
+    property <length> row-height: 40px;
+    property <bool> has-detail: root.detail-index >= 0 && root.detail-index < root.files.length;
 
     // ── Callbacks ──
     callback open-folder();
     callback rescan();
+    // blob selection: `toggle` is Ctrl/Cmd, `extend` is Shift
+    callback row-pressed(index: int, toggle: bool, extend: bool);
+    callback row-dragged(index: int);
+    callback select-all();
+    callback clear-selection();
+    // actions on the selected blobs
+    callback upload-selected(remote: string);
+    callback check-selected(remote: string);
+    callback download-selected(remote: string);
+    // remote management
+    callback scan-remote(name: string);
+    callback scan-all-remotes();
+    callback download-all(name: string);
+    callback push-all(remote: string);
+    callback edit-remote(name: string);
+    callback save-remote-edit();
+    callback cancel-remote-edit();
+    callback remove-remote(name: string);
     callback add-remote(name: string, target: string);
     callback select-backend(name: string);
     callback submit-form(name: string, backend: string, values: [string]);
     callback submit-remote-setup(name: string, backend: string, state: string, answer: string);
     callback cancel-remote-setup();
-    callback remove-remote(name: string);
-    callback check-remote(name: string);
-    callback push-all(remote: string);
-    callback push-file(hash: string, remote: string);
-    callback fetch-file(hash: string);
 
     VerticalLayout {
         padding: 0px;
@@ -133,11 +261,26 @@ export component AppWindow inherits Window {
                     font-size: 16px;
                     vertical-alignment: center;
                 }
+                HorizontalLayout {
+                    spacing: 4px;
+                    padding-left: 8px;
+                    TabButton {
+                        text: "Blobs (" + root.files.length + ")";
+                        active: root.active-tab == 0;
+                        clicked => { root.active-tab = 0; }
+                    }
+                    TabButton {
+                        text: "Remotes (" + root.remotes.length + ")";
+                        active: root.active-tab == 1;
+                        clicked => { root.active-tab = 1; }
+                    }
+                }
                 Text {
                     text: root.folder;
                     font-size: 12px;
                     color: Palette.foreground.transparentize(40%);
                     vertical-alignment: center;
+                    horizontal-alignment: right;
                     overflow: elide;
                     horizontal-stretch: 1;
                 }
@@ -161,7 +304,7 @@ export component AppWindow inherits Window {
             padding: 0px;
             spacing: 0px;
 
-            // ── File list ──
+            // ── Main area ──
             Rectangle {
                 horizontal-stretch: 1;
                 background: Palette.background;
@@ -198,7 +341,8 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    if root.folder != "" && root.files.length == 0: Rectangle {
+                    // ── Blobs tab: the file list ──
+                    if root.folder != "" && root.active-tab == 0 && root.files.length == 0: Rectangle {
                         vertical-stretch: 1;
                         Text {
                             text: "No tracked files yet.\nDrop files into the folder and hit Rescan.";
@@ -208,71 +352,199 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    if root.folder != "" && root.files.length > 0: ListView {
+                    if root.folder != "" && root.active-tab == 0 && root.files.length > 0: list-keys := FocusScope {
                         vertical-stretch: 1;
-                        for file[idx] in root.files: Rectangle {
-                            height: 40px;
-                            background: idx == root.selected-index
-                                ? Palette.accent-background
-                                : row-touch.has-hover ? Palette.background.darker(0.04) : transparent;
-                            border-radius: 6px;
-
-                            row-touch := TouchArea {
-                                clicked => { root.selected-index = idx; }
+                        key-pressed(event) => {
+                            if ((event.modifiers.control || event.modifiers.meta)
+                                && (event.text == "a" || event.text == "A")) {
+                                root.select-all();
+                                return accept;
                             }
+                            if (event.text == Key.Escape) {
+                                root.clear-selection();
+                                return accept;
+                            }
+                            reject
+                        }
 
-                            HorizontalLayout {
-                                padding-left: 10px;
-                                padding-right: 10px;
-                                spacing: 10px;
+                        ListView {
+                            for file[idx] in root.files: Rectangle {
+                                height: root.row-height;
+                                background: file.selected
+                                    ? Palette.accent-background
+                                    : row-touch.has-hover ? Palette.background.darker(0.04) : transparent;
+                                border-radius: 6px;
 
-                                // local presence dot
-                                Text {
-                                    text: file.present ? "●" : "○";
-                                    color: file.present
-                                        ? #2fbf71
-                                        : #e05f5f;
-                                    font-size: 13px;
-                                    vertical-alignment: center;
-                                    width: 14px;
+                                row-touch := TouchArea {
+                                    pointer-event(event) => {
+                                        if (event.kind == PointerEventKind.down
+                                            && event.button == PointerEventButton.left) {
+                                            list-keys.focus();
+                                            root.row-pressed(
+                                                idx,
+                                                event.modifiers.control || event.modifiers.meta,
+                                                event.modifiers.shift);
+                                        }
+                                    }
+                                    // Dragging across rows selects them.
+                                    moved => {
+                                        if (self.pressed) {
+                                            root.row-dragged(idx + floor(self.mouse-y / root.row-height));
+                                        }
+                                    }
                                 }
-                                Text {
-                                    text: file.path;
-                                    font-size: 13px;
-                                    font-weight: 500;
-                                    vertical-alignment: center;
-                                    overflow: elide;
-                                    horizontal-stretch: 1;
-                                    color: idx == root.selected-index
-                                        ? Palette.accent-foreground : Palette.foreground;
-                                }
-                                Text {
-                                    text: file.size;
-                                    font-size: 12px;
-                                    vertical-alignment: center;
-                                    color: idx == root.selected-index
-                                        ? Palette.accent-foreground.transparentize(20%)
-                                        : Palette.foreground.transparentize(35%);
-                                }
-                                Text {
-                                    text: file.remotes == "" ? "no remote" : file.remotes;
-                                    font-size: 12px;
-                                    vertical-alignment: center;
-                                    width: 140px;
-                                    overflow: elide;
-                                    color: file.remotes == ""
-                                        ? #e0a94f
-                                        : idx == root.selected-index
+
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    spacing: 10px;
+
+                                    // local presence dot
+                                    Text {
+                                        text: file.present ? "●" : "○";
+                                        color: file.present
+                                            ? #2fbf71
+                                            : #e05f5f;
+                                        font-size: 13px;
+                                        vertical-alignment: center;
+                                        width: 14px;
+                                    }
+                                    Text {
+                                        text: file.path;
+                                        font-size: 13px;
+                                        font-weight: 500;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                        horizontal-stretch: 1;
+                                        color: file.selected
+                                            ? Palette.accent-foreground : Palette.foreground;
+                                    }
+                                    Text {
+                                        text: file.size;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                        color: file.selected
                                             ? Palette.accent-foreground.transparentize(20%)
                                             : Palette.foreground.transparentize(35%);
+                                    }
+                                    Text {
+                                        text: file.remotes == "" ? "no remote" : file.remotes;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                        width: 140px;
+                                        overflow: elide;
+                                        color: file.remotes == ""
+                                            ? #e0a94f
+                                            : file.selected
+                                                ? Palette.accent-foreground.transparentize(20%)
+                                                : Palette.foreground.transparentize(35%);
+                                    }
+                                    Text {
+                                        text: file.short-hash;
+                                        font-size: 11px;
+                                        vertical-alignment: center;
+                                        color: file.selected
+                                            ? Palette.accent-foreground.transparentize(30%)
+                                            : Palette.foreground.transparentize(50%);
+                                    }
                                 }
-                                Text {
-                                    text: file.short-hash;
-                                    font-size: 11px;
-                                    vertical-alignment: center;
-                                    color: idx == root.selected-index
-                                        ? Palette.accent-foreground.transparentize(30%)
-                                        : Palette.foreground.transparentize(50%);
+                            }
+                        }
+                    }
+
+                    // ── Remotes tab: the remote list ──
+                    if root.folder != "" && root.active-tab == 1: HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: root.remotes.length == 0
+                                ? "No remotes configured yet; add or set one up on the right."
+                                : "Scanning lists a remote fully: every blob found is recorded, and blobs never seen before appear under unnamed/.";
+                            font-size: 12px;
+                            wrap: word-wrap;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            color: Palette.foreground.transparentize(40%);
+                        }
+                        Button {
+                            text: "Scan all";
+                            enabled: !root.busy && root.remotes.length > 0;
+                            clicked => { root.scan-all-remotes(); }
+                        }
+                    }
+
+                    if root.folder != "" && root.active-tab == 1: ListView {
+                        vertical-stretch: 1;
+                        for remote in root.remotes: VerticalLayout {
+                            padding-bottom: 8px;
+                            Rectangle {
+                                border-width: 1px;
+                                border-color: root.editing && root.edit-original == remote.name
+                                    ? Palette.accent-background : Palette.border;
+                                border-radius: 6px;
+                                background: Palette.background.darker(0.02);
+                                height: remote-layout.preferred-height;
+
+                                remote-layout := VerticalLayout {
+                                    padding: 10px;
+                                    spacing: 6px;
+
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        Text {
+                                            text: remote.name;
+                                            font-weight: 700;
+                                            font-size: 13px;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                        }
+                                        Text {
+                                            text: remote.blobs;
+                                            font-size: 11px;
+                                            vertical-alignment: center;
+                                            color: Palette.foreground.transparentize(40%);
+                                        }
+                                        if remote.missing-locally > 0: Text {
+                                            text: "· " + remote.missing-locally + " not here";
+                                            font-size: 11px;
+                                            vertical-alignment: center;
+                                            color: #e0a94f;
+                                        }
+                                    }
+                                    Text {
+                                        text: remote.target;
+                                        font-size: 11px;
+                                        color: Palette.foreground.transparentize(35%);
+                                        overflow: elide;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        alignment: start;
+                                        Button {
+                                            text: "Scan";
+                                            enabled: !root.busy;
+                                            clicked => { root.scan-remote(remote.name); }
+                                        }
+                                        Button {
+                                            text: "Download all";
+                                            enabled: !root.busy && remote.missing-locally > 0;
+                                            clicked => { root.download-all(remote.name); }
+                                        }
+                                        Button {
+                                            text: "Upload all";
+                                            enabled: !root.busy;
+                                            clicked => { root.push-all(remote.name); }
+                                        }
+                                        Button {
+                                            text: "Edit";
+                                            enabled: !root.busy;
+                                            clicked => { root.edit-remote(remote.name); }
+                                        }
+                                        Button {
+                                            text: "Remove";
+                                            enabled: !root.busy;
+                                            clicked => { root.remove-remote(remote.name); }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -280,7 +552,7 @@ export component AppWindow inherits Window {
                 }
             }
 
-            // Draggable divider between file list and side panel.
+            // Draggable divider between main area and side panel.
             Rectangle {
                 width: 7px;
                 background: Palette.background;
@@ -308,148 +580,193 @@ export component AppWindow inherits Window {
                 width: root.sidebar-width;
                 background: Palette.background.darker(0.03);
 
-                ScrollView {
+                side-scroll := ScrollView {
                     mouse-drag-pan-enabled: true;
+                    // Wrapped text must measure itself against the panel's
+                    // real width, not the unwrapped one.
+                    viewport-width: self.visible-width;
                     VerticalLayout {
+                        width: side-scroll.visible-width;
                         padding: 14px;
+                    // Content keeps its preferred height; when it is shorter
+                    // than the panel, the filler below takes the rest.
+                    VerticalLayout {
+                        vertical-stretch: 0;
                         spacing: 14px;
-                        alignment: start;
 
-                        // ── Selected file details ──
-                        if root.has-selection: VerticalLayout {
+                        // ════ Blobs tab: the selection ════
+                        if root.active-tab == 0 && root.selected-count == 0: VerticalLayout {
+                            spacing: 6px;
+                            SectionTitle { text: "NOTHING SELECTED"; }
+                            Hint {
+                                text: "Click a file to select it. Ctrl+click (⌘+click) adds or removes one, Shift+click selects a range, dragging across rows selects them, Ctrl+A selects everything and Esc clears the selection.\n\nThe selected blobs can then be uploaded to a remote, checked on a remote, or downloaded.";
+                            }
+                        }
+
+                        // ── one file: full details ──
+                        if root.active-tab == 0 && root.selected-count == 1 && root.has-detail: VerticalLayout {
                             spacing: 6px;
 
                             Text {
-                                text: root.files[root.selected-index].path;
+                                text: root.files[root.detail-index].path;
                                 font-size: 15px;
                                 font-weight: 700;
                                 wrap: word-wrap;
+width: Side.text-width;
                             }
-                            DetailLine { label: "hash"; value: root.files[root.selected-index].hash; }
-                            DetailLine { label: "size"; value: root.files[root.selected-index].size; }
-                            DetailLine { label: "added"; value: root.files[root.selected-index].added; }
+                            DetailLine { label: "hash"; value: root.files[root.detail-index].hash; }
+                            DetailLine { label: "size"; value: root.files[root.detail-index].size; }
+                            DetailLine { label: "added"; value: root.files[root.detail-index].added; }
                             DetailLine {
                                 label: "local";
-                                value: root.files[root.selected-index].present ? "present" : "missing (fetch to restore)";
+                                value: root.files[root.detail-index].present ? "present" : "missing (download to restore)";
                             }
                             DetailLine {
                                 label: "remotes";
-                                value: root.files[root.selected-index].remotes == ""
-                                    ? "not stored on any remote" : root.files[root.selected-index].remotes;
+                                value: root.files[root.detail-index].remotes == ""
+                                    ? "not stored on any remote" : root.files[root.detail-index].remotes;
                             }
-                            if root.files[root.selected-index].other-names != "": DetailLine {
+                            if root.files[root.detail-index].other-names != "": DetailLine {
                                 label: "also as";
-                                value: root.files[root.selected-index].other-names;
+                                value: root.files[root.detail-index].other-names;
                             }
-                            if root.files[root.selected-index].past-names != "": DetailLine {
+                            if root.files[root.detail-index].past-names != "": DetailLine {
                                 label: "was";
-                                value: root.files[root.selected-index].past-names;
+                                value: root.files[root.detail-index].past-names;
                             }
-                            if root.files[root.selected-index].versions != "": VerticalLayout {
+                            if root.files[root.detail-index].versions != "": VerticalLayout {
                                 spacing: 4px;
                                 SectionTitle { text: "PREVIOUS VERSIONS"; }
                                 Text {
-                                    text: root.files[root.selected-index].versions;
+                                    text: root.files[root.detail-index].versions;
                                     font-size: 11px;
                                     wrap: word-wrap;
+width: Side.text-width;
                                     color: Palette.foreground.transparentize(25%);
+                                }
+                            }
+                        }
+
+                        // ── several files: a summary ──
+                        if root.active-tab == 0 && root.selected-count > 1: VerticalLayout {
+                            spacing: 6px;
+                            Text {
+                                text: root.selected-count + " files selected";
+                                font-size: 15px;
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: root.selection-summary;
+                                font-size: 12px;
+                                wrap: word-wrap;
+width: Side.text-width;
+                                color: Palette.foreground.transparentize(25%);
+                            }
+                        }
+
+                        // ── actions on the selection ──
+                        if root.active-tab == 0 && root.selected-count > 0: VerticalLayout {
+                            spacing: 8px;
+                            alignment: start;
+                            Rectangle { height: 1px; background: Palette.border; }
+                            SectionTitle {
+                                text: root.selected-count == 1 ? "THIS BLOB" : "THE SELECTED BLOBS";
+                            }
+
+                            if root.remote-names.length == 0: Hint {
+                                text: "No remotes configured; add one in the Remotes tab.";
+                            }
+                            if root.remote-names.length > 0: HorizontalLayout {
+                                spacing: 6px;
+                                Text {
+                                    text: "Remote";
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                }
+                                ComboBox {
+                                    // Reports a far too tall preferred height in sidebar layouts.
+                                    max-height: self.min-height;
+                                    model: root.remote-names;
+                                    current-index <=> root.action-remote-index;
+                                    horizontal-stretch: 1;
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Button {
+                                    text: "Upload";
+                                    enabled: !root.busy
+                                        && root.remote-names.length > 0
+                                        && root.selection-local > 0;
+                                    clicked => { root.upload-selected(root.action-remote); }
+                                }
+                                Button {
+                                    text: "Check remote";
+                                    enabled: !root.busy && root.remote-names.length > 0;
+                                    clicked => { root.check-selected(root.action-remote); }
+                                }
+                                Button {
+                                    text: root.selection-missing > 0
+                                        ? "Download (" + root.selection-missing + ")" : "Download";
+                                    enabled: !root.busy && root.selection-missing > 0;
+                                    clicked => {
+                                        root.download-selected(
+                                            root.action-remote);
+                                    }
+                                }
+                            }
+                            Hint {
+                                text: "Upload sends the blobs present here to the remote. Check remote asks the remote whether it holds each blob and updates the records. Download fetches the blobs missing here, trying the chosen remote first, then any other remote recorded as holding them.";
+                            }
+                        }
+
+                        // ════ Remotes tab: edit a remote ════
+                        if root.active-tab == 1 && root.editing: VerticalLayout {
+                            spacing: 8px;
+                            SectionTitle { text: "EDIT REMOTE “" + root.edit-original + "”"; }
+
+                            Text { text: "Name"; font-size: 12px; font-weight: 600; }
+                            LineEdit {
+                                text <=> root.edit-name;
+                                enabled: !root.busy;
+                            }
+                            Text { text: "Target"; font-size: 12px; font-weight: 600; }
+                            Hint { text: "The rclone location where blobs live, e.g. backup:bucket/mbr. Changing it does not move any blobs; scan the remote afterwards."; }
+                            LineEdit {
+                                text <=> root.edit-target;
+                                enabled: !root.busy;
+                            }
+                            if root.edit-note != "": Hint { text: root.edit-note; }
+
+                            if root.edit-fields.length > 0: VerticalLayout {
+                                spacing: 8px;
+                                SectionTitle { text: "RCLONE SETTINGS OF “" + root.edit-section + "”"; }
+                                Hint { text: "Secrets are never shown; leave them blank to keep them. Emptied fields keep their current value."; }
+                                BackendForm {
+                                    fields: root.edit-fields;
+                                    values <=> root.edit-values;
+                                    enabled: !root.busy;
                                 }
                             }
 
                             HorizontalLayout {
                                 spacing: 6px;
-                                padding-top: 4px;
-
-                                push-target := ComboBox {
-                                    model: root.remote-names;
-                                    current-index: 0;
-                                    horizontal-stretch: 1;
-                                    enabled: root.remote-names.length > 0;
+                                Button {
+                                    text: "Save";
+                                    primary: true;
+                                    enabled: !root.busy && root.edit-name != "" && root.edit-target != "";
+                                    clicked => { root.save-remote-edit(); }
                                 }
                                 Button {
-                                    text: "Push";
-                                    enabled: !root.busy
-                                        && root.remote-names.length > 0
-                                        && root.files[root.selected-index].present;
-                                    clicked => {
-                                        root.push-file(root.files[root.selected-index].hash, push-target.current-value);
-                                    }
-                                }
-                                Button {
-                                    text: "Fetch";
-                                    enabled: !root.busy && !root.files[root.selected-index].present;
-                                    clicked => { root.fetch-file(root.files[root.selected-index].hash); }
+                                    text: "Cancel";
+                                    clicked => { root.cancel-remote-edit(); }
                                 }
                             }
                         }
 
-                        if root.has-selection: Rectangle { height: 1px; background: Palette.border; }
-
-                        // ── Remotes ──
-                        VerticalLayout {
-                            spacing: 8px;
-
-                            SectionTitle { text: "RCLONE REMOTES"; }
-
-                            if root.remotes.length == 0: Text {
-                                text: "No remotes configured.";
-                                font-size: 12px;
-                                color: Palette.foreground.transparentize(45%);
-                            }
-
-                            for remote in root.remotes: Rectangle {
-                                border-width: 1px;
-                                border-color: Palette.border;
-                                border-radius: 6px;
-                                background: Palette.background;
-                                height: remote-layout.preferred-height + 20px;
-
-                                remote-layout := VerticalLayout {
-                                    padding: 10px;
-                                    spacing: 6px;
-
-                                    HorizontalLayout {
-                                        spacing: 6px;
-                                        Text {
-                                            text: remote.name;
-                                            font-weight: 700;
-                                            font-size: 13px;
-                                            vertical-alignment: center;
-                                            horizontal-stretch: 1;
-                                        }
-                                        Text {
-                                            text: remote.blobs;
-                                            font-size: 11px;
-                                            vertical-alignment: center;
-                                            color: Palette.foreground.transparentize(40%);
-                                        }
-                                    }
-                                    Text {
-                                        text: remote.target;
-                                        font-size: 11px;
-                                        color: Palette.foreground.transparentize(35%);
-                                        overflow: elide;
-                                    }
-                                    HorizontalLayout {
-                                        spacing: 6px;
-                                        Button {
-                                            text: "Check";
-                                            enabled: !root.busy;
-                                            clicked => { root.check-remote(remote.name); }
-                                        }
-                                        Button {
-                                            text: "Push all";
-                                            enabled: !root.busy;
-                                            clicked => { root.push-all(remote.name); }
-                                        }
-                                        Button {
-                                            text: "Remove";
-                                            enabled: !root.busy;
-                                            clicked => { root.remove-remote(remote.name); }
-                                        }
-                                    }
-                                }
-                            }
+                        // ════ Remotes tab: add a remote ════
+                        if root.active-tab == 1 && !root.editing: VerticalLayout {
+                            spacing: 14px;
 
                             // ── add an existing target directly ──
                             VerticalLayout {
@@ -492,6 +809,8 @@ export component AppWindow inherits Window {
                                         horizontal-stretch: 1;
                                     }
                                     ComboBox {
+                                        // Reports a far too tall preferred height in sidebar layouts.
+                                        max-height: self.min-height;
                                         model: root.backend-titles;
                                         current-index: 0;
                                         horizontal-stretch: 2;
@@ -504,43 +823,10 @@ export component AppWindow inherits Window {
                                 if root.setup-active && root.setup-state == "": VerticalLayout {
                                     spacing: 8px;
 
-                                    for field[i] in root.form-fields: VerticalLayout {
-                                        spacing: 2px;
-                                        HorizontalLayout {
-                                            spacing: 6px;
-                                            alignment: start;
-                                            Text {
-                                                text: field.required ? field.label + " *" : field.label;
-                                                font-size: 12px;
-                                                font-weight: 600;
-                                                vertical-alignment: center;
-                                            }
-                                            if field.required: Text {
-                                                text: "required";
-                                                font-size: 9px;
-                                                color: #e0a94f;
-                                                vertical-alignment: center;
-                                            }
-                                        }
-                                        if field.help != "": Text {
-                                            text: field.help;
-                                            font-size: 10px;
-                                            wrap: word-wrap;
-                                            color: Palette.foreground.transparentize(40%);
-                                        }
-                                        if field.kind == 2: ComboBox {
-                                            model: field.labels;
-                                            current-index: field.default-index;
-                                            enabled: !root.busy;
-                                            selected => { root.form-values[i] = field.examples[self.current-index]; }
-                                        }
-                                        if field.kind != 2: LineEdit {
-                                            text: root.form-values[i];
-                                            input-type: field.kind == 1 ? InputType.password : InputType.text;
-                                            enabled: !root.busy;
-                                            placeholder-text: field.default;
-                                            edited(t) => { root.form-values[i] = t; }
-                                        }
+                                    BackendForm {
+                                        fields: root.form-fields;
+                                        values <=> root.form-values;
+                                        enabled: !root.busy;
                                     }
 
                                     HorizontalLayout {
@@ -580,17 +866,20 @@ export component AppWindow inherits Window {
                                             font-size: 12px;
                                             font-weight: 600;
                                             wrap: word-wrap;
+width: Side.text-width - 20px;
                                         }
                                         Text {
                                             text: root.setup-help;
                                             font-size: 11px;
                                             wrap: word-wrap;
+width: Side.text-width - 20px;
                                             color: Palette.foreground.transparentize(25%);
                                         }
                                         if root.setup-url != "": Text {
                                             text: root.setup-url;
                                             font-size: 11px;
                                             wrap: word-wrap;
+width: Side.text-width - 20px;
                                             color: Palette.accent-background;
                                         }
                                         LineEdit {
@@ -620,6 +909,8 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
+                    }
+                    Rectangle { vertical-stretch: 1; }
                     }
                 }
             }

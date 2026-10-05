@@ -190,6 +190,12 @@ impl Db {
             .map_err(|e| e.to_string())
     }
 
+    pub fn has_blob(&mut self, hash: &str) -> Result<bool, String> {
+        let sql = format!("SELECT 1 FROM blobs WHERE hash = {}", quote(hash));
+        let r = self.conn.query(&sql).map_err(|e| e.to_string())?;
+        Ok(!r.rows.is_empty())
+    }
+
     pub fn list_blobs(&mut self) -> Result<Vec<BlobRecord>, String> {
         let r = self
             .conn
@@ -204,6 +210,16 @@ impl Db {
                 })
             })
             .collect())
+    }
+
+    /// Every hash the database knows of: stored blobs and blobs any path
+    /// (current or past) ever pointed at.
+    pub fn known_hashes(&mut self) -> Result<Vec<String>, String> {
+        let r = self
+            .conn
+            .query("SELECT hash FROM blobs UNION SELECT hash FROM paths")
+            .map_err(|e| e.to_string())?;
+        Ok(r.rows.iter().filter_map(|row| as_text(&row[0])).collect())
     }
 
     // ── remotes ──
@@ -225,6 +241,26 @@ impl Db {
                  DELETE FROM remotes WHERE name = {q}"
             ))
             .map_err(|e| e.to_string())
+    }
+
+    /// Rename and/or retarget the remote `old`, carrying its blob records
+    /// over to the new name.
+    pub fn update_remote(&mut self, old: &str, name: &str, target: &str) -> Result<(), String> {
+        if name != old && self.remote(name)?.is_some() {
+            return Err(format!("remote '{name}' already exists"));
+        }
+        if self.remote(old)?.is_none() {
+            return Err(format!("no remote named '{old}'"));
+        }
+        let (old, name, target) = (quote(old), quote(name), quote(target));
+        self.transaction(|db| {
+            db.conn
+                .execute(&format!(
+                    "UPDATE remotes SET name = {name}, target = {target} WHERE name = {old};
+                     UPDATE blob_remotes SET remote = {name} WHERE remote = {old}"
+                ))
+                .map_err(|e| e.to_string())
+        })
     }
 
     pub fn list_remotes(&mut self) -> Result<Vec<Remote>, String> {
@@ -343,6 +379,33 @@ mod tests {
         assert!(db.remote("r").unwrap().is_none());
         db.transaction(|db| db.add_remote("r", "x:")).unwrap();
         assert_eq!(db.remote("r").unwrap().unwrap().target, "x:");
+    }
+
+    #[test]
+    fn renaming_a_remote_keeps_its_blobs() {
+        let mut db = db();
+        db.add_remote("a", "x:").unwrap();
+        db.add_remote("taken", "y:").unwrap();
+        db.set_blob_on_remote("h", "a").unwrap();
+        assert!(db.update_remote("a", "taken", "x:").is_err());
+        assert!(db.update_remote("nope", "b", "x:").is_err());
+        db.update_remote("a", "b", "z:").unwrap();
+        assert!(db.remote("a").unwrap().is_none());
+        assert_eq!(db.remote("b").unwrap().unwrap().target, "z:");
+        assert_eq!(db.remotes_for_blob("h").unwrap(), ["b"]);
+        // Retargeting alone keeps the name.
+        db.update_remote("b", "b", "w:").unwrap();
+        assert_eq!(db.remote("b").unwrap().unwrap().target, "w:");
+    }
+
+    #[test]
+    fn known_hashes_include_path_only_blobs() {
+        let mut db = db();
+        db.upsert_blob("stored", 1).unwrap();
+        db.insert_path("p", "named", 0).unwrap();
+        let mut known = db.known_hashes().unwrap();
+        known.sort();
+        assert_eq!(known, ["named", "stored"]);
     }
 
     #[test]

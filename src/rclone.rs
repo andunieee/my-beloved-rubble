@@ -310,6 +310,16 @@ pub fn display_value_for_ui(value: &Value) -> String {
     }
 }
 
+/// The rclone remote (config section) an mbr target refers to: `name` in
+/// `name:path`. Plain local paths and on-the-fly `:backend:` targets have
+/// none.
+pub fn target_section(target: &str) -> Option<&str> {
+    let (section, _) = target.split_once(':')?;
+    // A Windows drive letter (`C:\…`) is a path, not a remote.
+    let drive = cfg!(windows) && section.len() == 1;
+    (!section.is_empty() && !drive && !section.contains(['/', '\\'])).then_some(section)
+}
+
 /// Remote path of a blob under `target`.
 pub fn blob_path(hash: &str) -> String {
     format!("{}/{}/{hash}", &hash[..2], &hash[2..4])
@@ -343,11 +353,25 @@ pub fn fetch_blob(target: &str, hash: &str, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// List all blob hashes stored under `target`.
+/// One blob found on a remote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteBlob {
+    pub hash: String,
+    /// Size as reported by the remote (0 if it doesn't say).
+    pub size: u64,
+}
+
+fn item_size(item: &Value) -> u64 {
+    item.get("Size")
+        .and_then(Value::as_i64)
+        .map_or(0, |size| size.max(0) as u64)
+}
+
+/// List all blobs stored under `target`.
 ///
 /// Errors when the remote is unreachable, which doubles as the
 /// accessibility check. An empty or missing directory is fine (no blobs).
-pub fn list_blobs(target: &str) -> Result<Vec<String>, String> {
+pub fn list_blobs(target: &str) -> Result<Vec<RemoteBlob>, String> {
     let result = match call(
         "operations/list",
         json!({
@@ -373,9 +397,97 @@ pub fn list_blobs(target: &str) -> Result<Vec<String>, String> {
         .ok_or_else(|| "rclone list response has no list array".to_owned())?;
     Ok(list
         .iter()
-        .filter_map(|item| item.get("Path").and_then(Value::as_str))
-        .filter_map(|path| path.rsplit('/').next())
-        .filter(|name| is_hash(name))
-        .map(str::to_owned)
+        .filter_map(|item| {
+            let path = item.get("Path").and_then(Value::as_str)?;
+            let name = path.rsplit('/').next()?;
+            // mbr only ever writes lowercase names; anything else would
+            // not be found again under its hash.
+            let ours = is_hash(name) && !name.bytes().any(|b| b.is_ascii_uppercase());
+            ours.then(|| RemoteBlob {
+                hash: name.to_owned(),
+                size: item_size(item),
+            })
+        })
         .collect())
+}
+
+/// Whether one blob is stored under `target`: its size if so.
+pub fn stat_blob(target: &str, hash: &str) -> Result<Option<u64>, String> {
+    let result = match call(
+        "operations/stat",
+        json!({
+            "fs": target,
+            "remote": blob_path(hash),
+            "opt": {
+                "filesOnly": true,
+                "noModTime": true,
+                "noMimeType": true,
+            },
+        }),
+    ) {
+        Ok(result) => result,
+        // The shard directories of a never-pushed blob may not exist.
+        Err(e) if e.contains("directory not found") || e.contains("object not found") => {
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    Ok(result
+        .get("item")
+        .filter(|item| item.is_object())
+        .map(item_size))
+}
+
+/// The stored settings of remote `name` in the selected config (including
+/// its `type`), or `None` if there is no such remote. Secrets come back
+/// obscured.
+pub fn remote_config(name: &str) -> Result<Option<serde_json::Map<String, Value>>, String> {
+    if !remote_exists(name)? {
+        return Ok(None);
+    }
+    match call("config/get", json!({"name": name}))? {
+        Value::Object(map) => Ok(Some(map)),
+        other => Err(format!("unexpected config/get response: {other}")),
+    }
+}
+
+/// Change settings of the existing remote `name`. `parameters` are passed
+/// in the clear (rclone obscures secrets); keys not mentioned are kept.
+///
+/// Any follow-up question rclone asks afterwards (e.g. "refresh the OAuth
+/// token?") is left unanswered: the new values are already saved by then,
+/// and declining keeps the existing sign-in.
+pub fn update_remote(name: &str, parameters: Value) -> Result<(), String> {
+    if !remote_exists(name)? {
+        return Err(format!("rclone remote '{name}' does not exist"));
+    }
+    let response = call(
+        "config/update",
+        json!({
+            "name": name,
+            "parameters": parameters,
+            "opt": {
+                "nonInteractive": true,
+                "obscure": true,
+            },
+        }),
+    )?;
+    match response.get("Error").and_then(Value::as_str) {
+        Some(error) if !error.is_empty() => Err(error.to_owned()),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_sections() {
+        assert_eq!(target_section("backup:bucket/mbr"), Some("backup"));
+        assert_eq!(target_section("disk:/mnt/x"), Some("disk"));
+        assert_eq!(target_section("/mnt/plain"), None);
+        assert_eq!(target_section("/mnt/odd:name"), None);
+        assert_eq!(target_section(":local:/tmp"), None);
+    }
 }
