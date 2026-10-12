@@ -1,6 +1,6 @@
 //! Keeping data safe: read-only blobs, verification, dropping local copies
 //! under the minimum-copies rule, garbage collection, and encrypted
-//! metadata backups restored into a fresh folder. Remotes are plain local
+//! metadata backups restored into a fresh folder or merged into one in use. Remotes are plain local
 //! directories driven through the embedded rclone.
 
 #![cfg(unix)]
@@ -203,8 +203,9 @@ fn metadata_backup_restores_a_lost_folder() {
     let (db, conf) = metadata::unseal(&sealed, "correct horse").unwrap();
     let report = repo.restore_metadata(&db, &conf).unwrap();
     assert_eq!(report.files, 2, "{:?}", report.skipped);
-    // Both the backed-up remote and the one used to restore are known.
-    assert_eq!(report.remotes, 2);
+    // The backed-up remote joins the one used to restore.
+    assert_eq!(report.remotes, 1);
+    assert_eq!(repo.db.list_remotes().unwrap().len(), 2);
     assert_eq!(repo.db.metadata_remotes().unwrap()[0].name, "disk");
 
     let status = repo.status().unwrap();
@@ -219,7 +220,112 @@ fn metadata_backup_restores_a_lost_folder() {
     }
     assert_eq!(fs::read_to_string(fresh.join("photos/cat.jpg")).unwrap(), "meow");
 
-    // A folder with files is never overwritten.
-    let err = repo.restore_metadata(&db, &conf).unwrap_err();
-    assert!(err.contains("tracks no files"), "{err}");
+    // Restoring again changes nothing.
+    let again = repo.restore_metadata(&db, &conf).unwrap();
+    assert_eq!((again.files, again.history, again.remotes), (0, 0, 0));
+}
+
+#[test]
+fn metadata_backup_merges_into_a_folder_in_use() {
+    let tmp = TempDir::new("merge");
+    let folder = tmp.sub("folder");
+    let store = tmp.sub("store");
+    fs::write(folder.join("a.txt"), "one").unwrap();
+    fs::write(folder.join("b.txt"), "bee").unwrap();
+
+    let mut repo = Repo::init(&folder).unwrap();
+    repo.scan().unwrap();
+    // A second version of a.txt, so the backup has history.
+    fs::remove_file(folder.join("a.txt")).unwrap();
+    fs::write(folder.join("a.txt"), "two").unwrap();
+    assert_eq!(repo.scan().unwrap().replaced, ["a.txt"]);
+    let remote = add_disk(&mut repo, "disk", &store);
+    for hash in repo.blobs_missing_on_remote("disk").unwrap() {
+        repo.push_blob(&remote, &hash).unwrap();
+    }
+    repo.set_min_copies(3).unwrap();
+    let a_added = repo.db.active_path("a.txt").unwrap().unwrap().added_at;
+    let snapshot = repo.metadata_snapshot().unwrap();
+    drop(repo);
+
+    // The database is lost; b.txt is gone too, and c.txt is new. A fresh
+    // database adopts what is left, with the remote set up again.
+    fs::remove_file(folder.join(".mbr/mbr.db")).unwrap();
+    fs::remove_file(folder.join("b.txt")).unwrap();
+    fs::write(folder.join("c.txt"), "sea").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let mut repo = Repo::init(&folder).unwrap();
+    repo.scan().unwrap();
+    add_disk(&mut repo, "disk", &store);
+
+    let report = repo
+        .restore_metadata(&snapshot.db, &snapshot.rclone_conf)
+        .unwrap();
+    assert_eq!(report.files, 1, "{:?}", report.skipped);
+    assert_eq!(report.history, 1);
+    assert_eq!(report.remotes, 0);
+    assert!(report.conflicts.is_empty());
+    assert!(folder.join(metadata::BEFORE_RESTORE_FILE).is_file());
+
+    let status = repo.status().unwrap();
+    let paths: Vec<&str> = status.iter().map(|s| s.path.as_str()).collect();
+    assert_eq!(paths, ["a.txt", "b.txt", "c.txt"]);
+    assert_eq!(status[0].remotes, ["disk"]);
+    assert_eq!(status[1].remotes, ["disk"]);
+    assert!(status[2].remotes.is_empty());
+    assert!(status.iter().all(|s| s.present_locally));
+    assert_eq!(fs::read_to_string(folder.join("b.txt")).unwrap(), "bee");
+    assert_eq!(
+        repo.db.active_path("a.txt").unwrap().unwrap().added_at,
+        a_added
+    );
+    assert_eq!(repo.min_copies().unwrap(), 3);
+    assert!(repo.scan().unwrap().is_empty(), "merged links match the db");
+
+    // Merging again changes nothing.
+    let again = repo
+        .restore_metadata(&snapshot.db, &snapshot.rclone_conf)
+        .unwrap();
+    assert_eq!((again.files, again.history, again.remotes), (0, 0, 0));
+
+    // A remote whose target differs here keeps ours.
+    let elsewhere = tmp.sub("elsewhere").display().to_string();
+    repo.db.update_remote("disk", "disk", &elsewhere).unwrap();
+    let report = repo
+        .restore_metadata(&snapshot.db, &snapshot.rclone_conf)
+        .unwrap();
+    assert_eq!(report.conflicts, ["disk"]);
+    assert_eq!(repo.db.remote("disk").unwrap().unwrap().target, elsewhere);
+}
+
+#[test]
+fn metadata_merge_keeps_newer_local_versions() {
+    let tmp = TempDir::new("merge-newer");
+    let folder = tmp.sub("folder");
+    fs::write(folder.join("a.txt"), "one").unwrap();
+    let mut repo = Repo::init(&folder).unwrap();
+    repo.scan().unwrap();
+    let snapshot = repo.metadata_snapshot().unwrap();
+
+    // a.txt changes after the backup was made.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    fs::remove_file(folder.join("a.txt")).unwrap();
+    fs::write(folder.join("a.txt"), "two").unwrap();
+    repo.scan().unwrap();
+    let report = repo
+        .restore_metadata(&snapshot.db, &snapshot.rclone_conf)
+        .unwrap();
+    assert_eq!((report.files, report.history), (0, 0), "already known");
+
+    // With the history lost, the backup's version still loses to ours.
+    drop(repo);
+    fs::remove_file(folder.join(".mbr/mbr.db")).unwrap();
+    let mut repo = Repo::init(&folder).unwrap();
+    repo.scan().unwrap();
+    let report = repo
+        .restore_metadata(&snapshot.db, &snapshot.rclone_conf)
+        .unwrap();
+    assert_eq!((report.files, report.history), (0, 1));
+    assert_eq!(fs::read_to_string(folder.join("a.txt")).unwrap(), "two");
+    assert!(repo.scan().unwrap().is_empty());
 }

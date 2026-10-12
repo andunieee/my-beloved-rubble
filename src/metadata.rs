@@ -19,11 +19,11 @@
 //! Each new backup replaces the previous one. When each remote was last
 //! backed up to is local state ([`crate::state`]), not part of the backup.
 
-use crate::db::Db;
+use crate::db::{BlobRecord, Db, PathRecord, Remote};
 use crate::repo::{self, Repo};
 use crate::{rclone, util};
 use age::secrecy::SecretString;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path};
 
 /// Folder on each remote that holds the backup.
@@ -48,14 +48,23 @@ pub struct Sealed {
     pub rclone_conf: Vec<u8>,
 }
 
+/// Where [`Repo::restore_metadata`] keeps the database as it was before,
+/// so a restore can be undone by putting it back as `mbr.db`.
+pub const BEFORE_RESTORE_FILE: &str = ".mbr/mbr.db.before-restore";
+
 /// What [`Repo::restore_metadata`] did.
 #[derive(Debug, Default)]
 pub struct RestoreReport {
-    /// Active files whose names (symlinks) were recreated.
+    /// Files only the backup knew, whose names (symlinks) were recreated.
     pub files: usize,
-    /// Remotes known after the restore.
+    /// Older versions and removed files added to the history.
+    pub history: usize,
+    /// Remotes only the backup knew, now added.
     pub remotes: usize,
-    /// Active paths that could not be recreated, with the reason.
+    /// Remotes named in both but with different targets: ours was kept,
+    /// and the backup's records of what it stores were ignored.
+    pub conflicts: Vec<String>,
+    /// Files that could not be recreated, with the reason.
     pub skipped: Vec<(String, String)>,
 }
 
@@ -208,76 +217,91 @@ impl Repo {
         })
     }
 
-    /// Whether this folder holds no files and no blobs yet, so restoring a
-    /// backup into it can't lose anything.
+    /// Whether this folder holds no files and no blobs yet.
     pub fn is_empty_folder(&mut self) -> Result<bool, String> {
         Ok(self.db.list_paths()?.is_empty() && self.db.list_blobs()?.is_empty())
     }
 
-    /// Replace this (empty) folder's metadata with a decrypted backup, and
-    /// recreate every active file as a symlink into the blob store —
-    /// dangling until its blob is downloaded.
+    /// Merge a decrypted backup into this folder's metadata, adding what
+    /// only the backup knows: files and their history, blobs, remotes and
+    /// what they store, metadata backup targets, settings and rclone
+    /// sections. Where the two disagree, this folder wins:
     ///
-    /// Remotes configured here before the restore (typically the one the
-    /// backup was fetched from) are kept when the backup doesn't know them,
-    /// and so are their rclone settings.
+    /// - a remote named in both but with different targets keeps ours, and
+    ///   the backup's records of what that remote stores are ignored;
+    /// - a file the backup has but this folder doesn't comes back as a
+    ///   symlink into the blob store (dangling until its blob is
+    ///   downloaded), unless we know of something newer at that path —
+    ///   then the backup's version only joins the path's history.
+    ///
+    /// Into an empty folder, this restores the backup whole. The database
+    /// as it was before is kept in [`BEFORE_RESTORE_FILE`].
     pub fn restore_metadata(
         &mut self,
         db_bytes: &[u8],
         rclone_conf: &[u8],
     ) -> Result<RestoreReport, String> {
-        if !self.is_empty_folder()? {
-            return Err(
-                "metadata can only be restored into a folder that tracks no files yet".to_owned(),
-            );
-        }
         let rclone_conf = std::str::from_utf8(rclone_conf)
             .map_err(|_| "the backed-up rclone config is not text".to_owned())?;
-        let before = self.db.list_remotes()?;
+        let backup = self.read_backup(db_bytes)?;
 
-        // Check the backup really is an mbr database before replacing ours.
-        let dir = self.scratch_dir();
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-        let staged = dir.join("restore.db");
-        std::fs::write(&staged, db_bytes)
-            .map_err(|e| format!("cannot write {}: {e}", staged.display()))?;
-        if let Err(e) = Db::open(&staged).and_then(|mut db| db.list_paths()) {
-            std::fs::remove_file(&staged).ok();
-            return Err(format!("the backup is not a usable mbr database: {e}"));
-        }
-
-        let db_path = self.root.join(repo::DB_FILE);
-        self.db = Db::open_in_memory()?;
-        let swapped = std::fs::rename(&staged, &db_path)
-            .map_err(|e| format!("cannot replace {}: {e}", repo::DB_FILE));
-        // Reopen whichever database is now in place, even after a failure.
-        self.db = Db::open(&db_path)?;
-        swapped?;
-
+        // Credentials first: adding rclone sections can't break anything.
         let current = std::fs::read_to_string(self.rclone_config_path()).unwrap_or_default();
-        let merged = merge_rclone_configs(rclone_conf, &current);
+        let merged = merge_rclone_configs(&current, rclone_conf);
         std::fs::write(self.rclone_config_path(), merged)
             .map_err(|e| format!("cannot write {}: {e}", repo::RCLONE_CONFIG_FILE))?;
         repo::ensure_rclone_config(&self.rclone_config_path())?;
 
-        for remote in before {
-            if self.db.remote(&remote.name)?.is_none() {
-                self.db.add_remote(&remote.name, &remote.target)?;
-            }
-        }
+        let before = self.root.join(BEFORE_RESTORE_FILE);
+        std::fs::remove_file(&before).ok();
+        self.db
+            .snapshot_to(&before)
+            .map_err(|e| format!("cannot save {BEFORE_RESTORE_FILE}: {e}"))?;
 
-        let mut report = RestoreReport {
-            remotes: self.db.list_remotes()?.len(),
-            ..RestoreReport::default()
-        };
-        for record in self.db.list_paths()?.into_iter().filter(|p| p.is_active()) {
+        let now = util::now();
+        let mut report = RestoreReport::default();
+        let relink = self
+            .db
+            .transaction(|db| merge_backup(db, &backup, now, &mut report))?;
+
+        for path in relink {
+            let Some(record) = self.db.active_path(&path)? else {
+                continue;
+            };
             match self.recreate_link(&record.path, &record.hash) {
                 Ok(()) => report.files += 1,
-                Err(e) => report.skipped.push((record.path, e)),
+                Err(e) => {
+                    // Keep the database true to the folder.
+                    self.db.mark_path_removed(record.id, now)?;
+                    report.skipped.push((path, e));
+                }
             }
         }
         Ok(report)
+    }
+
+    /// Everything in a decrypted backup database, checking on the way that
+    /// it really is an mbr database.
+    fn read_backup(&self, db_bytes: &[u8]) -> Result<BackupContents, String> {
+        let dir = self.scratch_dir();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        let staged = dir.join("restore.db");
+        std::fs::remove_file(&staged).ok();
+        std::fs::write(&staged, db_bytes)
+            .map_err(|e| format!("cannot write {}: {e}", staged.display()))?;
+        let contents = Db::open(&staged).and_then(|mut db| {
+            Ok(BackupContents {
+                paths: db.list_paths()?,
+                blobs: db.list_blobs()?,
+                remotes: db.list_remotes()?,
+                blob_remotes: db.list_blob_remotes()?,
+                metadata_remotes: db.metadata_remotes()?.into_iter().map(|r| r.name).collect(),
+                settings: db.list_settings()?,
+            })
+        });
+        std::fs::remove_file(&staged).ok();
+        contents.map_err(|e| format!("the backup is not a usable mbr database: {e}"))
     }
 
     /// Create the symlink for an active path, unless something is there.
@@ -301,12 +325,122 @@ impl Repo {
     }
 }
 
-/// `backup` with every section of `current` it lacks appended: the backup
-/// wins where both define a remote.
-fn merge_rclone_configs(backup: &str, current: &str) -> String {
-    let known: HashSet<&str> = sections(backup).map(|(name, _)| name).collect();
-    let mut merged = backup.trim_end().to_owned();
-    for (name, text) in sections(current) {
+/// The tables of a backed-up database.
+struct BackupContents {
+    paths: Vec<PathRecord>,
+    blobs: Vec<BlobRecord>,
+    remotes: Vec<Remote>,
+    blob_remotes: Vec<(String, String)>,
+    metadata_remotes: Vec<String>,
+    settings: Vec<(String, String)>,
+}
+
+/// The database half of [`Repo::restore_metadata`], run in one transaction.
+/// Returns the paths made active, whose symlinks are still to be created.
+fn merge_backup(
+    db: &mut Db,
+    backup: &BackupContents,
+    now: i64,
+    report: &mut RestoreReport,
+) -> Result<Vec<String>, String> {
+    let mut conflicts: HashSet<&str> = HashSet::new();
+    for remote in &backup.remotes {
+        match db.remote(&remote.name)? {
+            None => {
+                db.add_remote(&remote.name, &remote.target)?;
+                report.remotes += 1;
+            }
+            Some(ours) if ours.target != remote.target => {
+                conflicts.insert(&remote.name);
+                report.conflicts.push(remote.name.clone());
+            }
+            Some(_) => {}
+        }
+    }
+    let trusted: HashSet<&str> = backup
+        .remotes
+        .iter()
+        .map(|r| r.name.as_str())
+        .filter(|name| !conflicts.contains(name))
+        .collect();
+
+    for blob in &backup.blobs {
+        if !db.has_blob(&blob.hash)? {
+            db.upsert_blob(&blob.hash, blob.size)?;
+        }
+    }
+    for (hash, remote) in &backup.blob_remotes {
+        if trusted.contains(remote.as_str()) {
+            db.set_blob_on_remote(hash, remote)?;
+        }
+    }
+    for name in &backup.metadata_remotes {
+        if trusted.contains(name.as_str()) {
+            db.set_metadata_remote(name, true)?;
+        }
+    }
+    let settings: HashSet<String> = db.list_settings()?.into_iter().map(|(k, _)| k).collect();
+    for (key, value) in &backup.settings {
+        if !settings.contains(key) {
+            db.set_setting(key, value)?;
+        }
+    }
+
+    let ours = db.list_paths()?;
+    let known: HashSet<(&str, &str, i64)> = ours
+        .iter()
+        .map(|r| (r.path.as_str(), r.hash.as_str(), r.added_at))
+        .collect();
+    let active: HashMap<&str, &PathRecord> = ours
+        .iter()
+        .filter(|r| r.is_active())
+        .map(|r| (r.path.as_str(), r))
+        .collect();
+    // The latest time anything happened at each path, as far as we know.
+    let mut latest: HashMap<&str, i64> = HashMap::new();
+    for r in &ours {
+        let t = r.removed_at.unwrap_or(r.added_at).max(r.added_at);
+        let entry = latest.entry(r.path.as_str()).or_insert(t);
+        *entry = (*entry).max(t);
+    }
+
+    let mut relink = Vec::new();
+    for record in &backup.paths {
+        let (path, hash) = (record.path.as_str(), record.hash.as_str());
+        if known.contains(&(path, hash, record.added_at)) {
+            continue;
+        }
+        if record.removed_at.is_some() {
+            db.insert_path_record(path, hash, record.added_at, record.removed_at)?;
+            report.history += 1;
+            continue;
+        }
+        if let Some(current) = active.get(path).filter(|c| c.hash == record.hash) {
+            // The same file: remember when it was first added.
+            if record.added_at < current.added_at {
+                db.set_path_added_at(current.id, record.added_at)?;
+            }
+            continue;
+        }
+        let newer = latest.get(path).copied().filter(|&t| t >= record.added_at);
+        if newer.is_none() && !active.contains_key(path) {
+            db.insert_path_record(path, hash, record.added_at, None)?;
+            relink.push(record.path.clone());
+        } else {
+            // This folder has moved on: the backup's version is history.
+            db.insert_path_record(path, hash, record.added_at, Some(newer.unwrap_or(now)))?;
+            report.history += 1;
+        }
+    }
+    Ok(relink)
+}
+
+/// `preferred` with every section of `other` it lacks appended:
+/// `preferred` wins where both define a remote.
+fn merge_rclone_configs(preferred: &str, other: &str) -> String {
+    let known: HashSet<&str> = sections(preferred).map(|(name, _)| name).collect();
+    let mut merged = preferred.trim_end().to_owned();
+    for (name, text) in sections(other) {
         if !known.contains(name) {
             if !merged.is_empty() {
                 merged.push_str("\n\n");
@@ -365,13 +499,13 @@ mod tests {
     }
 
     #[test]
-    fn merging_configs_keeps_local_only_remotes() {
-        let backup = "[drive]\ntype = drive\ntoken = old\n\n[s3]\ntype = s3\n";
+    fn merging_configs_keeps_ours_and_adds_the_rest() {
         let current = "[drive]\ntype = drive\ntoken = new\n[usb]\ntype = local\n";
-        let merged = merge_rclone_configs(backup, current);
+        let backup = "[drive]\ntype = drive\ntoken = old\n\n[s3]\ntype = s3\n";
+        let merged = merge_rclone_configs(current, backup);
         assert_eq!(
             merged,
-            "[drive]\ntype = drive\ntoken = old\n\n[s3]\ntype = s3\n\n[usb]\ntype = local\n"
+            "[drive]\ntype = drive\ntoken = new\n[usb]\ntype = local\n\n[s3]\ntype = s3\n"
         );
         assert_eq!(merge_rclone_configs("", current), current.replace("new\n[", "new\n\n["));
     }

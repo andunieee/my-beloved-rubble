@@ -136,6 +136,11 @@ and restore from it (`mbr metadata restore <remote>`, or the Metadata backup
 tab). Every file reappears as a dangling symlink, the other remotes come back
 with their settings, and the content can then be downloaded.
 
+Restoring into a folder already in use merges the backup in: whatever only
+the backup knows (files, older versions, remotes and what they store,
+settings) is added, and where the two disagree the folder wins. The database
+as it was before is kept in `.mbr/mbr.db.before-restore`.
+
 ### Local state
 
 When each remote last received a backup is per-machine state, never synced:
@@ -178,7 +183,7 @@ mbr metadata status               where metadata is backed up, and when
 mbr metadata add|rm <remote>...   choose the remotes for metadata backups
 mbr metadata password             set or change the master password
 mbr metadata backup               encrypt and upload the metadata
-mbr metadata restore <remote>     restore metadata into an empty folder
+mbr metadata restore <remote>     merge the backup on a remote into this folder
 ```
 
 Every command except `init` works from anywhere inside an attached folder.
@@ -214,8 +219,8 @@ changes its rclone settings (secrets stay hidden; blank keeps them).
 shows when each was last backed up and whether that is up to date. The
 sidebar sets the master password, unlocks it for the session (it is kept
 in memory until locked, the folder changes, or the app quits), backs up,
-and changes the password. In an empty folder it also restores from a
-backup.
+and changes the password. It also restores a backup from a remote: first
+thing in an empty folder, merged in otherwise.
 
 Scans and rclone operations run in the background, backed by the
 repository-local `.mbr/rclone.conf`. The last opened folder is reopened

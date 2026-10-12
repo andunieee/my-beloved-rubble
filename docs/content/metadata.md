@@ -46,7 +46,24 @@ Every file reappears with its name, history and records of where it is stored; t
 their settings. The files' content is still on the remotes: download it from the **Remotes** tab with **Download
 all**, or only the files you need.
 
-Restoring only works into a folder that tracks no files yet, so it can never overwrite one in use.
+## Merging in a backup
+
+A folder already in use can take in a backup too, for instance after its database was damaged and rebuilt by a scan,
+or to bring back the history of its files. Under **Merge in a backup**, pick the remote and click **Restore**; once
+unlocked, the password field can stay empty if the backup uses the current password.
+
+Merging only ever adds what the backup knows and the folder doesn't:
+
+- files the folder lost track of reappear, ready to download if their content isn't here;
+- older versions and deleted files join the history;
+- remotes, records of what each remote stores, and settings come back.
+
+Where the two disagree, the folder wins. A file the folder knows changed or was deleted since the backup stays as it is, and
+the backup's version only joins its history. A remote with the same name but a different target keeps this folder's
+target.
+
+The database as it was before is kept in `.mbr/mbr.db.before-restore`: to undo a merge, put it back as `.mbr/mbr.db`
+while the app is closed.
 
 ## Changing the password
 

@@ -1101,26 +1101,30 @@ impl App {
     }
 
     /// Download and decrypt the backup on `remote_name` in the background;
-    /// it is restored when it arrives (see [`Msg::MetadataFetched`]).
+    /// it is merged in when it arrives (see [`Msg::MetadataFetched`]). An
+    /// empty `password` means the one this folder is unlocked with.
     fn restore_metadata(&self, remote_name: &str, password: &str) {
         let Some(remote) = self.remote(remote_name) else { return };
-        let (root, scratch) = {
-            let mut repo = self.repo.borrow_mut();
-            let Some(repo) = repo.as_mut() else { return };
-            match repo.is_empty_folder() {
-                Ok(true) => (repo.root.clone(), repo.scratch_dir()),
-                Ok(false) => {
-                    self.status("Metadata can only be restored into a folder that tracks no files yet");
-                    return;
-                }
-                Err(e) => {
-                    self.status(format!("Error: {e}"));
+        let Some((root, scratch)) = self
+            .repo
+            .borrow()
+            .as_ref()
+            .map(|repo| (repo.root.clone(), repo.scratch_dir()))
+        else {
+            return;
+        };
+        let Some(config_path) = self.config_path() else { return };
+        let password = if password.is_empty() {
+            match self.password.borrow().clone() {
+                Some(unlocked) => unlocked,
+                None => {
+                    self.status("Enter the backup's master password");
                     return;
                 }
             }
+        } else {
+            SecretString::from(password.to_owned())
         };
-        let Some(config_path) = self.config_path() else { return };
-        let password = SecretString::from(password.to_owned());
         self.status(format!("Fetching the metadata backup from '{remote_name}'…"));
         self.spawn(move |tx| {
             let result = mbr::rclone::with_config(&config_path, || {
@@ -1854,20 +1858,43 @@ impl App {
                     let report = repo.restore_metadata(&db, &conf)?;
                     restored = true;
                     let mut text = format!(
-                        "Restored {} file(s) and {} remote(s); download the files from the Remotes tab",
-                        report.files, report.remotes
+                        "Restored {} file(s) and {} remote(s), {} older version(s)",
+                        report.files, report.remotes, report.history
                     );
+                    if report.files > 0 {
+                        text += "; download the files from the Remotes tab";
+                    }
+                    if !report.conflicts.is_empty() {
+                        text += &format!(
+                            "; kept this folder's target for {}",
+                            report.conflicts.join(", ")
+                        );
+                    }
                     if !report.skipped.is_empty() {
                         text += &format!("; {} skipped", report.skipped.len());
                     }
                     Ok(text)
                 });
                 if restored {
-                    if let Ok(check) = metadata::password_check(password.expose_secret()) {
-                        self.state.borrow_mut().repo_mut(&root).password_check = Some(check);
-                        self.save_state();
+                    // A folder without a password adopts the backup's; one
+                    // with its own keeps it (the backup may predate a change).
+                    let check = self.state.borrow().repo(&root).password_check;
+                    match check {
+                        None => {
+                            if let Ok(check) = metadata::password_check(password.expose_secret()) {
+                                self.state.borrow_mut().repo_mut(&root).password_check =
+                                    Some(check);
+                                self.save_state();
+                                *self.password.borrow_mut() = Some(password);
+                            }
+                        }
+                        Some(check)
+                            if metadata::password_matches(&check, password.expose_secret()) =>
+                        {
+                            *self.password.borrow_mut() = Some(password);
+                        }
+                        Some(_) => {}
                     }
-                    *self.password.borrow_mut() = Some(password);
                     self.window.set_pw_restore(SharedString::default());
                 }
             }
