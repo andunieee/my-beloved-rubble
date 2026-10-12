@@ -20,7 +20,8 @@ export struct FileRow {
 
 export struct RemoteRow {
     name: string,
-    target: string,
+    // How it stores: "encrypted", "NOT encrypted", or an old-style target.
+    storage: string,
     blobs: string,
     // Blobs recorded on this remote that are not present locally.
     missing-locally: int,
@@ -29,7 +30,7 @@ export struct RemoteRow {
 // A remote as a metadata backup destination.
 export struct MetadataRow {
     name: string,
-    target: string,
+    storage: string,
     // Chosen to receive metadata backups.
     enabled: bool,
     // "up to date · …", "out of date · …", "never backed up".
@@ -334,7 +335,7 @@ export component AppWindow inherits Window {
     in-out property <[string]> remote-names: [];
     in-out property <string> status-text: "Open a folder to get started";
     in-out property <bool> busy: false;
-    // 0 = Blobs, 1 = Remotes, 2 = Metadata backup.
+    // 0 = Blobs, 1 = Remotes, 2 = Settings.
     in-out property <int> active-tab: 0;
     // Copies of every file to keep (local + remotes).
     in-out property <int> min-copies: 2;
@@ -344,12 +345,15 @@ export component AppWindow inherits Window {
     in-out property <int> old-local-count: 0;
     in-out property <string> old-local-size: "";
 
-    // ── metadata backup ──
+    // ── settings: master password, metadata backup ──
     in-out property <[MetadataRow]> metadata-rows: [];
     in-out property <int> metadata-chosen: 0;
     in-out property <string> metadata-summary: "";
     in-out property <bool> password-set: false;
+    // The master password is known (saved on this computer).
     in-out property <bool> unlocked: false;
+    // Some remote is encrypted with the master password, so it can't change.
+    in-out property <bool> has-encrypted-remotes: false;
     // The folder tracks nothing yet: restoring a backup comes first.
     in-out property <bool> folder-empty: false;
     in-out property <string> pw-new: "";
@@ -371,9 +375,8 @@ export component AppWindow inherits Window {
 
     // Name for the guided remote setup.
     in-out property <string> new-remote-name: "";
-    // "Add existing target" inputs.
-    in-out property <string> existing-remote-name: "";
-    in-out property <string> new-remote-target: "";
+    // Set up the new remote without encryption.
+    in-out property <bool> new-remote-plain: false;
 
     // ── guided remote setup ──
     in-out property <[string]> backend-titles: [];
@@ -393,8 +396,8 @@ export component AppWindow inherits Window {
     in-out property <bool> editing: false;
     in-out property <string> edit-original: "";
     in-out property <string> edit-name: "";
-    in-out property <string> edit-target: "";
-    in-out property <string> edit-section: "";
+    // How it stores: "encrypted", "NOT encrypted", …
+    in-out property <string> edit-description: "";
     in-out property <string> edit-note: "";
     in-out property <[FormField]> edit-fields: [];
     in-out property <[string]> edit-values: [];
@@ -427,10 +430,9 @@ export component AppWindow inherits Window {
     callback save-remote-edit();
     callback cancel-remote-edit();
     callback remove-remote(name: string);
-    callback add-remote(name: string, target: string);
     callback select-backend(name: string);
-    callback submit-form(name: string, backend: string, values: [string]);
-    callback submit-remote-setup(name: string, backend: string, state: string, answer: string);
+    callback submit-form(name: string, backend: string, values: [string], plain: bool);
+    callback submit-remote-setup(backend: string, state: string, answer: string);
     callback cancel-remote-setup();
     // keeping copies safe
     callback drop-selected();
@@ -443,7 +445,6 @@ export component AppWindow inherits Window {
     callback toggle-metadata-remote(name: string, enabled: bool);
     callback set-password(password: string, repeat: string);
     callback unlock(password: string);
-    callback lock();
     callback backup-metadata();
     callback restore-metadata(remote: string, password: string);
 
@@ -483,7 +484,7 @@ export component AppWindow inherits Window {
                         clicked => { root.active-tab = 1; }
                     }
                     TabButton {
-                        text: "Metadata backup";
+                        text: "Settings";
                         active: root.active-tab == 2;
                         clicked => { root.active-tab = 2; }
                     }
@@ -749,7 +750,7 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                     Text {
-                                        text: remote.target;
+                                        text: remote.storage;
                                         font-size: 11px;
                                         color: Palette.foreground.transparentize(35%);
                                         overflow: elide;
@@ -788,7 +789,7 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    // ── Metadata backup tab: where metadata goes ──
+                    // ── Settings tab: where metadata backups go ──
                     if root.folder != "" && root.active-tab == 2: HorizontalLayout {
                         spacing: 8px;
                         Text {
@@ -831,7 +832,7 @@ export component AppWindow inherits Window {
                                         toggled => { root.toggle-metadata-remote(row.name, self.checked); }
                                     }
                                     Text {
-                                        text: row.target;
+                                        text: row.storage;
                                         font-size: 11px;
                                         vertical-alignment: center;
                                         overflow: elide;
@@ -1067,24 +1068,13 @@ width: Side.text-width;
                             }
                         }
 
-                        // ════ Metadata backup tab ════
-                        if root.active-tab == 2 && root.folder != "" && root.folder-empty: VerticalLayout {
-                            spacing: 6px;
-                            SectionTitle { text: "RESTORE FROM A BACKUP"; help: "metadata/#restoring-a-lost-folder"; }
-                            RestoreForm {
-                                remote-names: root.remote-names;
-                                busy: root.busy;
-                                unlocked: root.unlocked;
-                                remote-index <=> root.restore-remote-index;
-                                password <=> root.pw-restore;
-                                restore(remote, password) => { root.restore-metadata(remote, password); }
-                            }
-                            Rectangle { height: 1px; background: Palette.border; }
-                        }
-
+                        // ════ Settings tab ════
                         if root.active-tab == 2 && root.folder != "" && !root.password-set: VerticalLayout {
                             spacing: 6px;
-                            SectionTitle { text: "SET A MASTER PASSWORD"; help: "metadata/#the-master-password"; }
+                            SectionTitle { text: "SET A MASTER PASSWORD"; help: "settings/#the-master-password"; }
+                            Hint {
+                                text: "Remotes and metadata backups are encrypted with it. Write it down: it can't be recovered.";
+                            }
                             LineEdit {
                                 input-type: InputType.password;
                                 placeholder-text: "master password";
@@ -1105,11 +1095,13 @@ width: Side.text-width;
                                     clicked => { root.set-password(root.pw-new, root.pw-repeat); }
                                 }
                             }
+                            Rectangle { height: 1px; background: Palette.border; }
                         }
 
                         if root.active-tab == 2 && root.folder != "" && root.password-set && !root.unlocked: VerticalLayout {
                             spacing: 6px;
-                            SectionTitle { text: "UNLOCK"; help: "metadata/#unlocking"; }
+                            SectionTitle { text: "UNLOCK"; help: "settings/#the-master-password"; }
+                            Hint { text: "Enter the master password once; it is then saved on this computer."; }
                             LineEdit {
                                 input-type: InputType.password;
                                 placeholder-text: "master password";
@@ -1125,47 +1117,36 @@ width: Side.text-width;
                                     clicked => { root.unlock(root.pw-entry); }
                                 }
                             }
+                            Rectangle { height: 1px; background: Palette.border; }
+                        }
+
+                        if root.active-tab == 2 && root.folder != "" && root.folder-empty: VerticalLayout {
+                            spacing: 6px;
+                            SectionTitle { text: "RESTORE FROM A BACKUP"; help: "metadata/#restoring-a-lost-folder"; }
+                            RestoreForm {
+                                remote-names: root.remote-names;
+                                busy: root.busy;
+                                unlocked: root.unlocked;
+                                remote-index <=> root.restore-remote-index;
+                                password <=> root.pw-restore;
+                                restore(remote, password) => { root.restore-metadata(remote, password); }
+                            }
+                            Rectangle { height: 1px; background: Palette.border; }
                         }
 
                         if root.active-tab == 2 && root.folder != "" && root.unlocked: VerticalLayout {
                             spacing: 6px;
-                            SectionTitle { text: "BACK UP"; help: "metadata/#backing-up"; }
+                            SectionTitle { text: "BACK UP METADATA"; help: "metadata/#backing-up"; }
                             if root.metadata-chosen == 0: Hint {
                                 text: "Tick at least one remote on the left to back up to.";
                             }
                             HorizontalLayout {
-                                spacing: 6px;
                                 alignment: start;
                                 Button {
                                     text: "Back up now";
                                     primary: true;
                                     enabled: !root.busy && root.metadata-chosen > 0;
                                     clicked => { root.backup-metadata(); }
-                                }
-                                Button {
-                                    text: "Lock";
-                                    clicked => { root.lock(); }
-                                }
-                            }
-
-                            Rectangle { height: 1px; background: Palette.border; }
-                            SectionTitle { text: "CHANGE THE MASTER PASSWORD"; help: "metadata/#changing-the-password"; }
-                            LineEdit {
-                                input-type: InputType.password;
-                                placeholder-text: "new master password";
-                                text <=> root.pw-new;
-                            }
-                            LineEdit {
-                                input-type: InputType.password;
-                                placeholder-text: "repeat it";
-                                text <=> root.pw-repeat;
-                            }
-                            HorizontalLayout {
-                                alignment: start;
-                                Button {
-                                    text: "Change password";
-                                    enabled: !root.busy && root.pw-new != "" && root.pw-repeat != "";
-                                    clicked => { root.set-password(root.pw-new, root.pw-repeat); }
                                 }
                             }
                         }
@@ -1184,6 +1165,36 @@ width: Side.text-width;
                             }
                         }
 
+                        if root.active-tab == 2 && root.folder != "" && root.unlocked: VerticalLayout {
+                            spacing: 6px;
+                            Rectangle { height: 1px; background: Palette.border; }
+                            SectionTitle { text: "CHANGE THE MASTER PASSWORD"; help: "settings/#changing-the-password"; }
+                            if root.has-encrypted-remotes: Hint {
+                                text: "It can't change while remotes are encrypted with it.";
+                            }
+                            if !root.has-encrypted-remotes: VerticalLayout {
+                                spacing: 6px;
+                                LineEdit {
+                                    input-type: InputType.password;
+                                    placeholder-text: "new master password";
+                                    text <=> root.pw-new;
+                                }
+                                LineEdit {
+                                    input-type: InputType.password;
+                                    placeholder-text: "repeat it";
+                                    text <=> root.pw-repeat;
+                                }
+                                HorizontalLayout {
+                                    alignment: start;
+                                    Button {
+                                        text: "Change password";
+                                        enabled: !root.busy && root.pw-new != "" && root.pw-repeat != "";
+                                        clicked => { root.set-password(root.pw-new, root.pw-repeat); }
+                                    }
+                                }
+                            }
+                        }
+
                         // ════ Remotes tab: edit a remote ════
                         if root.active-tab == 1 && root.editing: VerticalLayout {
                             spacing: 8px;
@@ -1194,16 +1205,12 @@ width: Side.text-width;
                                 text <=> root.edit-name;
                                 enabled: !root.busy;
                             }
-                            Text { text: "Target"; font-size: 12px; font-weight: 600; }
-                            LineEdit {
-                                text <=> root.edit-target;
-                                enabled: !root.busy;
-                            }
+                            Hint { text: "Storage: " + root.edit-description; }
                             if root.edit-note != "": Hint { text: root.edit-note; }
 
                             if root.edit-fields.length > 0: VerticalLayout {
                                 spacing: 8px;
-                                SectionTitle { text: "RCLONE SETTINGS OF “" + root.edit-section + "”"; }
+                                SectionTitle { text: "SETTINGS"; }
                                 BackendForm {
                                     fields: root.edit-fields;
                                     values <=> root.edit-values;
@@ -1216,7 +1223,7 @@ width: Side.text-width;
                                 Button {
                                     text: "Save";
                                     primary: true;
-                                    enabled: !root.busy && root.edit-name != "" && root.edit-target != "";
+                                    enabled: !root.busy && root.edit-name != "";
                                     clicked => { root.save-remote-edit(); }
                                 }
                                 Button {
@@ -1230,36 +1237,24 @@ width: Side.text-width;
                         if root.active-tab == 1 && !root.editing: VerticalLayout {
                             spacing: 14px;
 
-                            // ── add an existing target directly ──
-                            VerticalLayout {
-                                spacing: 4px;
-                                SectionTitle { text: "ADD EXISTING TARGET"; help: "remotes/#adding-an-existing-target"; }
+                            // ── guided setup for a new remote ──
+                            if !root.unlocked: VerticalLayout {
+                                spacing: 6px;
+                                SectionTitle { text: "SET UP A NEW REMOTE"; help: "remotes/#setting-up-a-new-remote"; }
+                                Hint {
+                                    text: root.password-set
+                                        ? "Unlock the master password in the Settings tab first: remotes are encrypted with it."
+                                        : "Set a master password in the Settings tab first: remotes are encrypted with it.";
+                                }
                                 HorizontalLayout {
-                                    spacing: 6px;
-                                    LineEdit {
-                                        placeholder-text: "name (e.g. backup)";
-                                        text <=> root.existing-remote-name;
-                                        horizontal-stretch: 1;
-                                    }
-                                    LineEdit {
-                                        placeholder-text: "target (s3:bucket/mbr)";
-                                        text <=> root.new-remote-target;
-                                        horizontal-stretch: 2;
-                                    }
+                                    alignment: start;
                                     Button {
-                                        text: "Add";
-                                        enabled: root.folder != ""
-                                            && root.existing-remote-name != ""
-                                            && root.new-remote-target != "";
-                                        clicked => {
-                                            root.add-remote(root.existing-remote-name, root.new-remote-target);
-                                        }
+                                        text: "Go to Settings";
+                                        clicked => { root.active-tab = 2; }
                                     }
                                 }
                             }
-
-                            // ── guided setup for a new remote ──
-                            VerticalLayout {
+                            if root.unlocked: VerticalLayout {
                                 spacing: 6px;
                                 SectionTitle { text: "SET UP A NEW REMOTE"; help: "remotes/#setting-up-a-new-remote"; }
 
@@ -1291,6 +1286,12 @@ width: Side.text-width;
                                         enabled: !root.busy;
                                     }
 
+                                    CheckBox {
+                                        text: "Don't encrypt (anyone with access to the remote can read your files)";
+                                        checked <=> root.new-remote-plain;
+                                        enabled: !root.busy;
+                                    }
+
                                     HorizontalLayout {
                                         spacing: 6px;
                                         Button {
@@ -1301,7 +1302,7 @@ width: Side.text-width;
                                                 && root.new-remote-name != ""
                                                 && root.setup-backend != "";
                                             clicked => {
-                                                root.submit-form(root.new-remote-name, root.setup-backend, root.form-values);
+                                                root.submit-form(root.new-remote-name, root.setup-backend, root.form-values, root.new-remote-plain);
                                             }
                                         }
                                         Button {
@@ -1354,7 +1355,6 @@ width: Side.text-width - 20px;
                                                 enabled: root.setup-state != "" && !root.busy;
                                                 clicked => {
                                                     root.submit-remote-setup(
-                                                        root.new-remote-name,
                                                         root.setup-backend,
                                                         root.setup-state,
                                                         root.setup-answer == "" ? root.setup-default : root.setup-answer

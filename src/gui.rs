@@ -65,6 +65,7 @@ enum Msg {
     Done,
     /// A remote configuration step returned from librclone.
     Setup {
+        /// The mbr remote's name.
         name: String,
         /// mbr target to record once configuration completes.
         target: String,
@@ -108,7 +109,6 @@ enum Msg {
     /// The rclone settings of the remote being edited were read.
     RemoteConfig {
         remote: String,
-        section: String,
         result: Result<Option<serde_json::Map<String, serde_json::Value>>, String>,
     },
     /// The rclone half of saving a remote edit finished; on success,
@@ -211,7 +211,9 @@ fn range_of(rows: &[String], a: usize, b: usize) -> BTreeSet<String> {
 struct EditState {
     /// Name of the remote when editing started.
     original: String,
-    /// The rclone remote the target refers to, if configured here.
+    /// Its target, which editing never changes.
+    target: String,
+    /// The rclone section holding its backend settings, if any.
     section: Option<String>,
     /// Its backend, when mbr has a form for it.
     backend: Option<&'static Backend>,
@@ -235,8 +237,21 @@ struct App {
     edit: RefCell<Option<EditState>>,
     /// Local app state (`state.json`), loaded on start.
     state: RefCell<AppState>,
-    /// The open folder's master password, once unlocked this session.
+    /// The open folder's master password, saved on this machine.
     password: RefCell<Option<SecretString>>,
+    /// The remote being set up, while rclone still asks questions.
+    setup: RefCell<Option<PendingSetup>>,
+}
+
+/// A remote in the middle of its setup.
+#[derive(Clone)]
+struct PendingSetup {
+    layout: mbr::remotes::Layout,
+    /// Where in the backend it stores, and the resulting mbr target.
+    location: String,
+    target: String,
+    /// The master password, to key the crypt layer with.
+    password: SecretString,
 }
 
 /// The user guide, built from `docs/` and published to GitHub Pages.
@@ -276,6 +291,7 @@ fn main() -> Result<(), slint::PlatformError> {
         edit: RefCell::new(None),
         state: RefCell::new(AppState::load()),
         password: RefCell::new(None),
+        setup: RefCell::new(None),
     });
 
     // ── message pump for background tasks ──
@@ -398,16 +414,7 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let app = app.clone();
-        w.on_remove_remote(move |name| {
-            app.with_repo("remove remote", |repo| {
-                repo.db.remove_remote(&name)?;
-                Ok(format!("Removed remote {name}"))
-            });
-            if app.window.get_edit_original() == name {
-                app.close_editor();
-            }
-            app.refresh();
-        });
+        w.on_remove_remote(move |name| app.remove_remote(&name));
     }
     {
         let app = app.clone();
@@ -423,34 +430,19 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let app = app.clone();
-        w.on_add_remote(move |name, target| {
-            app.with_repo("add remote", |repo| {
-                if repo.db.remote(&name)?.is_some() {
-                    return Err(format!("remote '{name}' already exists"));
-                }
-                repo.db.add_remote(&name, &target)?;
-                Ok(format!("Added remote {name} -> {target}"))
-            });
-            app.window.set_existing_remote_name(SharedString::default());
-            app.window.set_new_remote_target(SharedString::default());
-            app.refresh();
-        });
-    }
-    {
-        let app = app.clone();
         w.on_select_backend(move |name| app.select_backend(&name));
     }
     {
         let app = app.clone();
-        w.on_submit_form(move |name, backend, values| {
+        w.on_submit_form(move |name, backend, values, plain| {
             let values: Vec<SharedString> = values.iter().collect();
-            app.submit_form(&name, &backend, &values);
+            app.submit_form(&name, &backend, &values, plain);
         });
     }
     {
         let app = app.clone();
-        w.on_submit_remote_setup(move |name, backend, state, answer| {
-            app.submit_remote_setup(&name, &backend, &state, &answer);
+        w.on_submit_remote_setup(move |backend, state, answer| {
+            app.submit_remote_setup(&backend, &state, &answer);
         });
     }
     {
@@ -558,14 +550,6 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let app = app.clone();
-        w.on_lock(move || {
-            *app.password.borrow_mut() = None;
-            app.status("Locked: the master password was forgotten");
-            app.refresh();
-        });
-    }
-    {
-        let app = app.clone();
         w.on_backup_metadata(move || app.backup_metadata());
     }
     {
@@ -574,13 +558,12 @@ fn main() -> Result<(), slint::PlatformError> {
     }
 
     // ── backend picker + initial form ──
-    let titles: Vec<SharedString> = backends::BACKENDS
-        .iter()
+    let titles: Vec<SharedString> = backends::offered()
         .map(|b| SharedString::from(b.title))
         .collect();
     app.window
         .set_backend_titles(ModelRc::new(VecModel::from(titles)));
-    if let Some(first) = backends::BACKENDS.first() {
+    if let Some(first) = backends::offered().next() {
         app.select_backend(first.title);
     }
 
@@ -641,7 +624,9 @@ impl App {
             Ok(repo) => {
                 self.state.borrow_mut().last_folder = Some(repo.root.clone());
                 self.save_state();
-                *self.password.borrow_mut() = None;
+                let saved = self.state.borrow().repo(&repo.root).password;
+                *self.password.borrow_mut() = saved.map(SecretString::from);
+                *self.setup.borrow_mut() = None;
                 *self.repo.borrow_mut() = Some(repo);
                 *self.selection.borrow_mut() = Selection::default();
                 self.close_editor();
@@ -987,6 +972,28 @@ impl App {
             self.status("Unlock with the current master password first");
             return;
         }
+        if had_one {
+            let encrypted = self
+                .repo
+                .borrow_mut()
+                .as_mut()
+                .map(|repo| repo.encrypted_remotes())
+                .unwrap_or(Ok(Vec::new()));
+            match encrypted {
+                Ok(names) if !names.is_empty() => {
+                    self.status(format!(
+                        "The master password can't change: remotes {} are encrypted with it",
+                        names.join(", ")
+                    ));
+                    return;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    self.status(format!("Error: {e}"));
+                    return;
+                }
+            }
+        }
         if let Err(e) = metadata::check_new_password(password) {
             self.status(format!("Error: {e}"));
             return;
@@ -995,17 +1002,14 @@ impl App {
             self.status("Error: the passwords differ");
             return;
         }
-        let check = match metadata::password_check(password) {
-            Ok(check) => check,
-            Err(e) => {
-                self.status(format!("Error: {e}"));
-                return;
-            }
-        };
         {
             let mut state = self.state.borrow_mut();
             let repo_state = state.repo_mut(&root);
-            repo_state.password_check = Some(check);
+            if let Err(e) = repo_state.set_password(password) {
+                drop(state);
+                self.status(format!("Error: {e}"));
+                return;
+            }
             // Backups made so far are encrypted with the old password.
             repo_state.metadata_backups.clear();
         }
@@ -1030,9 +1034,11 @@ impl App {
             self.status("Wrong master password");
             return;
         }
+        self.state.borrow_mut().repo_mut(&root).password = Some(password.to_owned());
+        self.save_state();
         *self.password.borrow_mut() = Some(SecretString::from(password.to_owned()));
         self.window.set_pw_entry(SharedString::default());
-        self.status("Unlocked");
+        self.status("Unlocked; the master password is saved on this computer");
         self.refresh();
     }
 
@@ -1040,7 +1046,7 @@ impl App {
     /// chosen remote in the background.
     fn backup_metadata(&self) {
         let Some(password) = self.password.borrow().clone() else {
-            self.status("Unlock with the master password first");
+            self.status("Set or unlock the master password in the Settings tab first");
             return;
         };
         let (remotes, snapshot, root, scratch) = {
@@ -1321,14 +1327,44 @@ impl App {
         });
     }
 
+    /// Forget a remote, then delete the rclone settings mbr made for it in
+    /// the background. What it stores stays where it is.
+    fn remove_remote(&self, name: &str) {
+        let (Some(remote), Some(config_path)) = (self.remote(name), self.config_path()) else {
+            return;
+        };
+        let mut removed = false;
+        self.with_repo("remove remote", |repo| {
+            repo.db.remove_remote(name)?;
+            removed = true;
+            Ok(format!("Removed remote {name}"))
+        });
+        if self.window.get_edit_original() == name {
+            self.close_editor();
+        }
+        self.refresh();
+        if removed {
+            self.spawn(move |tx| {
+                let deleted = mbr::rclone::with_config(&config_path, || {
+                    mbr::remotes::delete_sections(&remote.target)
+                });
+                if let Err(e) = deleted {
+                    let text = format!("Removed remote {}; its rclone settings stay: {e}", remote.name);
+                    tx.send(Msg::Status(text)).ok();
+                }
+            });
+        }
+    }
+
     // ── editing a remote ──
 
     /// Open the editor for remote `name` and read its rclone settings.
     fn edit_remote(&self, name: &str) {
         let Some(remote) = self.remote(name) else { return };
-        let section = mbr::rclone::target_section(&remote.target).map(str::to_owned);
+        let section = mbr::remotes::settings_section(&remote.target);
         *self.edit.borrow_mut() = Some(EditState {
             original: remote.name.clone(),
+            target: remote.target.clone(),
             section: section.clone(),
             backend: None,
             fields: Vec::new(),
@@ -1337,14 +1373,13 @@ impl App {
         let w = &self.window;
         w.set_edit_original(remote.name.as_str().into());
         w.set_edit_name(remote.name.as_str().into());
-        w.set_edit_target(remote.target.as_str().into());
-        w.set_edit_section(section.as_deref().unwrap_or_default().into());
+        w.set_edit_description(mbr::remotes::describe(&remote.target).into());
         w.set_edit_fields(ModelRc::default());
         w.set_edit_values(ModelRc::default());
         w.set_editing(true);
 
         let (Some(section), Some(config_path)) = (section, self.config_path()) else {
-            w.set_edit_note("The target is a plain path, so there are no rclone settings.".into());
+            w.set_edit_note("This remote has no rclone settings.".into());
             return;
         };
         w.set_edit_note("Reading rclone settings…".into());
@@ -1354,7 +1389,6 @@ impl App {
             });
             tx.send(Msg::RemoteConfig {
                 remote: remote.name,
-                section,
                 result,
             })
             .ok();
@@ -1364,7 +1398,6 @@ impl App {
     /// Show the settings read for the remote being edited.
     fn show_remote_config(
         &self,
-        section: &str,
         config: Option<serde_json::Map<String, serde_json::Value>>,
     ) {
         let mut edit = self.edit.borrow_mut();
@@ -1372,11 +1405,9 @@ impl App {
         let w = &self.window;
         let Some(config) = config else {
             w.set_edit_note(
-                format!(
-                    "There is no rclone remote '{section}' in this folder's rclone.conf; \
-                     only the name and target can be changed."
-                )
-                .into(),
+                "Its settings are missing from this folder's rclone.conf; only the name can \
+                 be changed."
+                    .into(),
             );
             return;
         };
@@ -1387,8 +1418,8 @@ impl App {
         let Some(backend) = backends::backend(kind) else {
             w.set_edit_note(
                 format!(
-                    "rclone remote '{section}' uses the '{kind}' backend, which has no form \
-                     here; change its settings with `mbr remote edit --set`."
+                    "It uses the '{kind}' backend, which has no form here; change its \
+                     settings with `mbr remote edit --set`."
                 )
                 .into(),
             );
@@ -1424,9 +1455,7 @@ impl App {
                 form_field(backend, f, value, placeholder)
             })
             .collect();
-        w.set_edit_note(
-            format!("rclone remote '{section}' ({}).", backend.title).into(),
-        );
+        w.set_edit_note(format!("{} settings.", backend.title).into());
         w.set_edit_fields(ModelRc::new(VecModel::from(rows)));
         w.set_edit_values(ModelRc::new(VecModel::from(
             initial
@@ -1442,13 +1471,13 @@ impl App {
     fn save_remote_edit(&self) {
         let w = &self.window;
         let name = w.get_edit_name().trim().to_owned();
-        let target = w.get_edit_target().trim().to_owned();
-        if name.is_empty() || target.is_empty() {
-            self.status("Error: the name and target must not be empty");
+        let renamed = self.edit.borrow().as_ref().is_some_and(|e| e.original != name);
+        if renamed && let Err(e) = mbr::remotes::check_name(&name) {
+            self.status(format!("Error: {e}"));
             return;
         }
         let values: Vec<SharedString> = w.get_edit_values().iter().collect();
-        let (old, section, parameters) = {
+        let (old, target, section, parameters) = {
             let edit = self.edit.borrow();
             let Some(edit) = edit.as_ref() else { return };
             // Send only what changed; empty answers can't be told apart
@@ -1460,13 +1489,13 @@ impl App {
                     parameters.insert(field.name.to_owned(), value.into());
                 }
             }
-            (edit.original.clone(), edit.section.clone(), parameters)
+            (edit.original.clone(), edit.target.clone(), edit.section.clone(), parameters)
         };
 
         match section {
             Some(section) if !parameters.is_empty() => {
                 let Some(config_path) = self.config_path() else { return };
-                self.status(format!("Saving rclone settings of '{section}'…"));
+                self.status(format!("Saving the settings of '{old}'…"));
                 self.spawn(move |tx| {
                     let result = mbr::rclone::with_config(&config_path, || {
                         mbr::rclone::update_remote(
@@ -1493,7 +1522,7 @@ impl App {
         self.with_repo("save remote", |repo| {
             repo.db.update_remote(old, name, target)?;
             ok = true;
-            Ok(format!("Saved remote {name} -> {target}"))
+            Ok(format!("Saved remote {name}"))
         });
         if ok {
             self.close_editor();
@@ -1514,7 +1543,7 @@ impl App {
 
     /// Show the hardcoded form for the backend picked by `title`.
     fn select_backend(&self, title: &str) {
-        let Some(backend) = backends::BACKENDS.iter().find(|b| b.title == title) else {
+        let Some(backend) = backends::offered().find(|b| b.title == title) else {
             return;
         };
         self.window
@@ -1549,9 +1578,21 @@ impl App {
         self.window.set_setup_active(true);
     }
 
-    /// Submit the filled form: hand every answer to rclone in one call.
-    fn submit_form(&self, name: &str, backend_name: &str, values: &[SharedString]) {
-        let Some(backend) = backends::backend(backend_name) else {
+    /// Submit the filled form: hand every answer to rclone in one call,
+    /// then wrap the backend in a crypt layer (unless `plain`).
+    fn submit_form(&self, name: &str, backend_name: &str, values: &[SharedString], plain: bool) {
+        let Some(password) = self.password.borrow().clone() else {
+            self.status("Set a master password in the Settings tab first");
+            return;
+        };
+        let layout = match mbr::remotes::Layout::new(name.trim(), !plain) {
+            Ok(layout) => layout,
+            Err(e) => {
+                self.status(format!("Error: {e}"));
+                return;
+            }
+        };
+        let Some(backend) = backends::offered().find(|b| b.name == backend_name) else {
             self.status(format!("Unknown backend '{backend_name}'"));
             return;
         };
@@ -1566,18 +1607,41 @@ impl App {
             self.status(format!("Error: {e}"));
             return;
         }
+        let folder_id = match self.repo.borrow_mut().as_mut().map(Repo::folder_id) {
+            Some(Ok(id)) => id,
+            Some(Err(e)) => {
+                self.status(format!("Error: {e}"));
+                return;
+            }
+            None => return,
+        };
+        let location = mbr::remotes::location(&spec, &folder_id);
+        let pending = PendingSetup {
+            target: layout.target(&location),
+            layout,
+            location,
+            password,
+        };
+        *self.setup.borrow_mut() = Some(pending.clone());
         let parameters = backends::form_parameters(backend, values);
-        let target = backends::target_for(name, backend, &spec);
-        let backend_name = backend_name.to_owned();
-        self.run_setup_step(name, |tx, name, config_path| {
-            let parameters = parameters.clone();
-            let target = target.clone();
+        let backend_name = backend.name;
+        let name = pending.layout.name.clone();
+        self.run_setup_step(&name, |tx, config_path| {
             Box::new(move || {
+                let PendingSetup {
+                    layout,
+                    location,
+                    target,
+                    password,
+                } = pending;
                 let result = mbr::rclone::with_config(&config_path, || {
-                    mbr::rclone::begin_setup(&name, &backend_name, parameters)
+                    layout.check_unused()?;
+                    let begun =
+                        mbr::rclone::begin_setup(&layout.backend_section(), backend_name, parameters);
+                    layout.finish(begun, &location, password.expose_secret())
                 });
                 tx.send(Msg::Setup {
-                    name,
+                    name: layout.name,
                     target,
                     result,
                 })
@@ -1587,39 +1651,39 @@ impl App {
     }
 
     /// Continue after answering a fallback question.
-    fn submit_remote_setup(&self, name: &str, backend_name: &str, state: &str, answer: &str) {
+    fn submit_remote_setup(&self, backend_name: &str, state: &str, answer: &str) {
+        let Some(pending) = self.setup.borrow().clone() else { return };
         let values: Vec<SharedString> = self.window.get_form_values().iter().collect();
-        let backend = backends::backend(backend_name);
-        let parameters = match backend {
+        let parameters = match backends::backend(backend_name) {
             Some(b) => backends::form_parameters(b, &values),
             None => serde_json::json!({}),
         };
-        let target = match backend {
-            Some(b) => backends::target_for(name, b, &backends::target_spec(b, &values)),
-            None => format!("{name}:{}", backends::DEFAULT_PATH),
-        };
         let state = state.to_owned();
         let answer = answer.to_owned();
-        self.run_setup_step(name, |tx, name, config_path| {
-            let parameters = parameters.clone();
-            let state = state.clone();
-            let answer = answer.clone();
-            let target = target.clone();
+        let name = pending.layout.name.clone();
+        self.run_setup_step(&name, |tx, config_path| {
             Box::new(move || {
                 let mut on_url = |url| {
                     let _ = tx.send(Msg::OAuthUrl(url));
                 };
+                let PendingSetup {
+                    layout,
+                    location,
+                    target,
+                    password,
+                } = pending;
                 let result = mbr::rclone::with_config(&config_path, || {
-                    mbr::rclone::continue_setup_watching(
-                        &name,
+                    let step = mbr::rclone::continue_setup_watching(
+                        &layout.backend_section(),
                         &state,
                         &answer,
                         parameters,
                         &mut on_url,
-                    )
+                    );
+                    layout.finish(step, &location, password.expose_secret())
                 });
                 tx.send(Msg::Setup {
-                    name,
+                    name: layout.name,
                     target,
                     result,
                 })
@@ -1628,11 +1692,11 @@ impl App {
         });
     }
 
-    /// Run one config-protocol step on a background thread.
+    /// Run one config-protocol step for remote `name` on a background thread.
     fn run_setup_step(
         &self,
         name: &str,
-        step: impl FnOnce(mpsc::Sender<Msg>, String, PathBuf) -> Box<dyn FnOnce() + Send>,
+        step: impl FnOnce(mpsc::Sender<Msg>, PathBuf) -> Box<dyn FnOnce() + Send>,
     ) {
         let config_path = {
             let mut repo = self.repo.borrow_mut();
@@ -1649,8 +1713,7 @@ impl App {
         self.begin_task();
         self.status("Talking to rclone…");
         let tx = self.tx.clone();
-        let name = name.to_owned();
-        let step = step(tx.clone(), name.clone(), config_path);
+        let step = step(tx.clone(), config_path);
         std::thread::spawn(move || {
             step();
             tx.send(Msg::Done).ok();
@@ -1659,15 +1722,15 @@ impl App {
 
     fn cancel_remote_setup(&self) {
         let state = self.window.get_setup_state().to_string();
-        let name = self.window.get_new_remote_name().to_string();
+        let section = self.setup.borrow().as_ref().map(|p| p.layout.backend_section());
         let config_path = self.repo.borrow().as_ref().map(Repo::rclone_config_path);
         self.reset_setup_ui();
-        if let (false, Some(config_path)) = (state.is_empty(), config_path) {
+        if let (false, Some(section), Some(config_path)) = (state.is_empty(), section, config_path) {
             self.begin_task();
             let tx = self.tx.clone();
             std::thread::spawn(move || {
                 let result = mbr::rclone::with_config(&config_path, || {
-                    mbr::rclone::cancel_setup(&name, &state)
+                    mbr::rclone::cancel_setup(&section, &state)
                 });
                 tx.send(Msg::Cancelled { result }).ok();
                 tx.send(Msg::Done).ok();
@@ -1677,6 +1740,7 @@ impl App {
 
     /// Clear the form and question panels.
     fn reset_setup_ui(&self) {
+        *self.setup.borrow_mut() = None;
         self.window.set_setup_active(false);
         self.window.set_setup_state(SharedString::default());
         self.window.set_setup_question(SharedString::default());
@@ -1687,6 +1751,7 @@ impl App {
         self.window.set_form_fields(ModelRc::default());
         self.window.set_form_values(ModelRc::default());
         self.window.set_new_remote_name(SharedString::default());
+        self.window.set_new_remote_plain(false);
         // Offer a fresh form for the backend still selected in the picker.
         let backend = self.window.get_setup_backend();
         if !backend.is_empty() {
@@ -1756,7 +1821,6 @@ impl App {
             },
             Msg::RemoteConfig {
                 remote,
-                section,
                 result,
             } => {
                 let current = self.edit.borrow().as_ref().map(|e| e.original.clone());
@@ -1764,7 +1828,7 @@ impl App {
                     return; // the editor was closed or moved on meanwhile
                 }
                 match result {
-                    Ok(config) => self.show_remote_config(&section, config),
+                    Ok(config) => self.show_remote_config(config),
                     Err(e) => self
                         .window
                         .set_edit_note(format!("Could not read rclone settings: {e}").into()),
@@ -1793,7 +1857,10 @@ impl App {
                 Ok(mbr::rclone::SetupOutcome::Done) => {
                     self.with_repo("save remote", |repo| {
                         repo.db.add_remote(&name, &target)?;
-                        Ok(format!("Added remote {name} -> {target}"))
+                        Ok(format!(
+                            "Added remote {name} ({})",
+                            mbr::remotes::describe(&target)
+                        ))
                     });
                     self.reset_setup_ui();
                     self.refresh();
@@ -1866,7 +1933,7 @@ impl App {
                     }
                     if !report.conflicts.is_empty() {
                         text += &format!(
-                            "; kept this folder's target for {}",
+                            "; kept this folder's settings for {}",
                             report.conflicts.join(", ")
                         );
                     }
@@ -1879,21 +1946,20 @@ impl App {
                     // A folder without a password adopts the backup's; one
                     // with its own keeps it (the backup may predate a change).
                     let check = self.state.borrow().repo(&root).password_check;
-                    match check {
-                        None => {
-                            if let Ok(check) = metadata::password_check(password.expose_secret()) {
-                                self.state.borrow_mut().repo_mut(&root).password_check =
-                                    Some(check);
-                                self.save_state();
-                                *self.password.borrow_mut() = Some(password);
-                            }
-                        }
-                        Some(check)
-                            if metadata::password_matches(&check, password.expose_secret()) =>
-                        {
-                            *self.password.borrow_mut() = Some(password);
-                        }
-                        Some(_) => {}
+                    let adopt = match check {
+                        None => true,
+                        Some(check) => metadata::password_matches(&check, password.expose_secret()),
+                    };
+                    if adopt
+                        && self
+                            .state
+                            .borrow_mut()
+                            .repo_mut(&root)
+                            .set_password(password.expose_secret())
+                            .is_ok()
+                    {
+                        self.save_state();
+                        *self.password.borrow_mut() = Some(password);
                     }
                     self.window.set_pw_restore(SharedString::default());
                 }
@@ -2022,7 +2088,7 @@ impl App {
                     .iter()
                     .map(|r| RemoteRow {
                         name: r.name.as_str().into(),
-                        target: r.target.as_str().into(),
+                        storage: mbr::remotes::describe(&r.target).into(),
                         blobs: format!(
                             "{} blob(s) recorded",
                             repo.db
@@ -2059,12 +2125,15 @@ impl App {
         self.show_selection();
     }
 
-    /// Rebuild the Metadata backup tab.
+    /// Rebuild the Settings tab.
     fn refresh_metadata(&self, repo: &mut Repo) {
         let w = &self.window;
         let state = self.state.borrow().repo(&repo.root);
         w.set_password_set(state.password_check.is_some());
         w.set_unlocked(self.password.borrow().is_some());
+        w.set_has_encrypted_remotes(
+            repo.encrypted_remotes().is_ok_and(|names| !names.is_empty()),
+        );
         w.set_folder_empty(repo.is_empty_folder().unwrap_or(false));
 
         let (remotes, chosen) = match repo.db.list_remotes().and_then(|all| {
@@ -2091,7 +2160,7 @@ impl App {
                 };
                 MetadataRow {
                     name: r.name.as_str().into(),
-                    target: r.target.as_str().into(),
+                    storage: mbr::remotes::describe(&r.target).into(),
                     enabled: chosen.contains(&r.name),
                     status: status.into(),
                     up_to_date,

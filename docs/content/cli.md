@@ -1,6 +1,6 @@
 +++
 title = "Command line"
-weight = 5
+weight = 6
 [extra]
 nav = "command line"
 +++
@@ -14,13 +14,13 @@ mbr init [dir]                    attach mbr to a folder
 mbr scan                          take in new files, record removals
 mbr ls                            list tracked files
 mbr info <path|hash>              full details of one file
-mbr remote add <name> <target>    add an existing rclone target
 mbr remote types                  list the kinds of storage mbr can set up
-mbr remote setup <name> <type>    set up a new remote, asking for each field
+mbr remote setup <name> <type> [--unencrypted]
+                                  set up a new remote, asking for each field
 mbr remote ls                     list remotes
-mbr remote show <name>            target and rclone settings (secrets hidden)
-mbr remote edit <name> [--rename NEW] [--target T] [--set KEY=VALUE...]
-                                  rename, retarget or change rclone settings
+mbr remote show <name>            a remote's settings (secrets hidden)
+mbr remote edit <name> [--rename NEW] [--set KEY=VALUE...]
+                                  rename or change settings
 mbr remote scan [name...]         list remotes fully, record what they hold
 mbr remote rm <name>              forget a remote
 mbr push <remote> [path|hash...]  upload (default: everything not there yet)
@@ -36,12 +36,11 @@ mbr gc [--purge [--older-than DAYS] [--yes]]
                                   free up (or delete everywhere) old versions
                                   and deleted files
 mbr config min-copies [N]         show or set how many copies to keep
+mbr config password               set the master password (before any remote)
 mbr metadata status               where metadata is backed up, and when
 mbr metadata add|rm <remote>...   choose the remotes for metadata backups
-mbr metadata password             set or change the master password
 mbr metadata backup               encrypt and upload the metadata
 mbr metadata restore <remote>     merge the backup on a remote into this folder
 ```
 
 `mbr gc --purge` deletes old versions and deleted files everywhere, remotes included, after asking you to confirm.
-Remotes shared with other folders lose them too, so only purge what no other folder uses.

@@ -10,24 +10,30 @@ account. The app talks to all of them through [rclone](https://rclone.org), whic
 to be installed.
 
 Files are stored on a remote under their content hash only, without names. The names live in the folder's database,
-which has its own [backup](../metadata/). To keep what is stored on a remote private from whoever runs it, point the app
-at an rclone [crypt](https://rclone.org/crypt/) remote.
+which has its own [backup](../metadata/).
 
-## Adding an existing target
+Every remote is encrypted with the folder's [master password](../settings/), so one must be set before adding a
+remote. The app wraps the storage in an rclone [crypt](https://rclone.org/crypt/) remote: whoever runs it sees only
+scrambled file names and content.
 
-If you already know the rclone location, give it a name and type it in, for example `/media/disk/rubble` for a folder on
-an external disk, or `backup:bucket/rubble` for a remote already configured with the `rclone` program.
+Each folder stores in its own directory on a remote, `mbr-` followed by a random code (for example
+`mbr-3f9a0c1b2e4d`), so several folders can share one storage account.
 
 ## Setting up a new remote
 
 Give the remote a name, pick the kind of storage, and fill in the form. Fields marked **required** must be filled;
-the others can usually be left alone. The **?** next to each field opens rclone's documentation for it.
+the others can usually be left alone. The **?** next to each field opens rclone's documentation for it. Storage that
+holds buckets or shares asks which one to use; a local disk asks for the folder.
+
+**Don't encrypt** stores files as they are, readable by anyone with access to the remote. It is meant for disks you
+keep yourself, and is off unless you tick it.
 
 Services that sign in through the browser (Google Drive, Dropbox, OneDrive, …) open a browser window once you save.
 If one doesn't open, the link is shown in the app. If rclone needs anything else, it asks in a box below the form.
 
 Each folder keeps its own rclone settings in `.mbr/rclone.conf`, separate from any other rclone configuration on the
-computer.
+computer. The remotes there have names starting with `_plain-mbr-`, `_autocrypt-mbr-` or `_dangerouslyplain-mbr-`;
+the app only ever shows the name you chose.
 
 ## How many copies
 
@@ -46,8 +52,7 @@ this for every remote.
 
 ## Editing a remote
 
-**Edit** changes a remote's name, its target, and, for the kinds of storage the app has a form for, its rclone
-settings. Changing the target doesn't move anything: scan the remote afterwards so the records match what is at the
-new location. Passwords and keys already set are not shown; leave those fields blank to keep them.
+**Edit** changes a remote's name and, for the kinds of storage the app has a form for, its settings (an expired
+key, a new server address, …). Passwords and keys already set are not shown; leave those fields blank to keep them.
 
-**Remove** forgets a remote and its records. Nothing stored on it is deleted.
+**Remove** forgets a remote, its records and its settings. Nothing stored on it is deleted.

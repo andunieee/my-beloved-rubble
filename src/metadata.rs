@@ -21,7 +21,7 @@
 
 use crate::db::{BlobRecord, Db, PathRecord, Remote};
 use crate::repo::{self, Repo};
-use crate::{rclone, util};
+use crate::{rclone, remotes, util};
 use age::secrecy::SecretString;
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path};
@@ -61,7 +61,7 @@ pub struct RestoreReport {
     pub history: usize,
     /// Remotes only the backup knew, now added.
     pub remotes: usize,
-    /// Remotes named in both but with different targets: ours was kept,
+    /// Remotes named in both but storing in different places: ours was kept,
     /// and the backup's records of what it stores were ignored.
     pub conflicts: Vec<String>,
     /// Files that could not be recreated, with the reason.
@@ -157,28 +157,97 @@ pub fn upload(target: &str, sealed: &Sealed, scratch: &Path) -> Result<(), Strin
     Ok(())
 }
 
-/// Download the sealed backup stored under `target`.
+/// Download the sealed backup a remote holds. Run with the folder's rclone
+/// config selected.
+///
+/// A remote set up in a new folder points at that folder's own directory
+/// (see [`crate::remotes`]), while the backup of the lost folder sits in
+/// the lost folder's directory next to it. So when there is none at
+/// `target`, the other folder directories beside it are tried too.
 pub fn download(target: &str, scratch: &Path) -> Result<Sealed, String> {
+    if let Some(sealed) = download_at(target, scratch)? {
+        return Ok(sealed);
+    }
+    for sibling in sibling_targets(target)? {
+        if let Ok(Some(sealed)) = download_at(&sibling, scratch) {
+            return Ok(sealed);
+        }
+    }
+    Err("there is no metadata backup on this remote".to_owned())
+}
+
+/// The sealed backup under `target`, if there is one.
+fn download_at(target: &str, scratch: &Path) -> Result<Option<Sealed>, String> {
     std::fs::create_dir_all(scratch)
         .map_err(|e| format!("cannot create {}: {e}", scratch.display()))?;
-    let fetch = |name: &str| -> Result<Vec<u8>, String> {
+    let fetch = |name: &str| -> Result<Option<Vec<u8>>, String> {
         let file = scratch.join(name);
         let result = match rclone::download_file(target, &object_path(name), &file) {
-            Err(e) if rclone::is_not_found(&e) => {
-                Err(format!("there is no metadata backup at {target}"))
-            }
-            other => other,
-        }
-        .and_then(|()| {
-            std::fs::read(&file).map_err(|e| format!("cannot read {}: {e}", file.display()))
-        });
+            Err(e) if rclone::is_not_found(&e) => Ok(None),
+            Err(e) => Err(e),
+            Ok(()) => std::fs::read(&file)
+                .map(Some)
+                .map_err(|e| format!("cannot read {}: {e}", file.display())),
+        };
         std::fs::remove_file(&file).ok();
         result
     };
-    Ok(Sealed {
-        db: fetch(DB_OBJECT)?,
-        rclone_conf: fetch(CONFIG_OBJECT)?,
-    })
+    let Some(db) = fetch(DB_OBJECT)? else {
+        return Ok(None);
+    };
+    let rclone_conf = fetch(CONFIG_OBJECT)?
+        .ok_or_else(|| "the metadata backup lacks its rclone config".to_owned())?;
+    Ok(Some(Sealed { db, rclone_conf }))
+}
+
+/// Targets for the other folders' directories next to the one `target`
+/// stores in (only for remotes mbr set up).
+fn sibling_targets(target: &str) -> Result<Vec<String>, String> {
+    // Where the folder directory sits, and for an encrypted remote the
+    // crypt settings to reach a sibling with, on the fly.
+    let (location, crypt_options) = match remotes::protection(target) {
+        remotes::Protection::Plain => (target.to_owned(), None),
+        remotes::Protection::Encrypted => {
+            let section = rclone::target_section(target).unwrap_or_default();
+            let Some(config) = rclone::remote_config(section)? else {
+                return Ok(Vec::new());
+            };
+            let location = config
+                .get("remote")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            let options: String = config
+                .iter()
+                .filter(|(key, _)| !matches!(key.as_str(), "type" | "remote"))
+                .map(|(key, value)| {
+                    let value = rclone::display_value_for_ui(value);
+                    format!(",{key}={}", rclone::quote_param(&value))
+                })
+                .collect();
+            (location, Some(options))
+        }
+        remotes::Protection::Unknown => return Ok(Vec::new()),
+    };
+    // `section:dir`, `section:bucket/dir` or `section:/path/dir`.
+    let Some(cut) = location.rfind(['/', ':']) else {
+        return Ok(Vec::new());
+    };
+    let (parent, own) = (&location[..=cut], &location[cut + 1..]);
+    if remotes::parse_folder_dir(own).is_none() {
+        return Ok(Vec::new());
+    }
+    let mut siblings = Vec::new();
+    for dir in rclone::list_dirs(parent)? {
+        if dir != own && remotes::parse_folder_dir(&dir).is_some() {
+            let sibling = format!("{parent}{dir}");
+            siblings.push(match &crypt_options {
+                Some(options) => format!(":crypt,remote={}{options}:", rclone::quote_param(&sibling)),
+                None => sibling,
+            });
+        }
+    }
+    Ok(siblings)
 }
 
 // ── the repository side ──
@@ -245,12 +314,38 @@ impl Repo {
             .map_err(|_| "the backed-up rclone config is not text".to_owned())?;
         let backup = self.read_backup(db_bytes)?;
 
+        // A new folder takes on the lost one's id, so the remotes set up
+        // here reach what the lost folder stored.
+        if self.is_empty_folder()?
+            && let Some((_, id)) = backup
+                .settings
+                .iter()
+                .find(|(key, _)| key == remotes::FOLDER_ID_SETTING)
+        {
+            self.adopt_folder_id(id)?;
+        }
+
         // Credentials first: adding rclone sections can't break anything.
         let current = std::fs::read_to_string(self.rclone_config_path()).unwrap_or_default();
+        // A crypt layer of the same name over a different place is a
+        // different remote, even with the same target.
+        let mut moved: HashSet<String> = HashSet::new();
+        for remote in &backup.remotes {
+            if let Some(section) = rclone::target_section(&remote.target)
+                && let (Some(ours), Some(theirs)) = (
+                    section_value(&current, section, "remote"),
+                    section_value(rclone_conf, section, "remote"),
+                )
+                && ours != theirs
+            {
+                moved.insert(remote.name.clone());
+            }
+        }
         let merged = merge_rclone_configs(&current, rclone_conf);
         std::fs::write(self.rclone_config_path(), merged)
             .map_err(|e| format!("cannot write {}: {e}", repo::RCLONE_CONFIG_FILE))?;
         repo::ensure_rclone_config(&self.rclone_config_path())?;
+        rclone::forget_cached_remotes()?;
 
         let before = self.root.join(BEFORE_RESTORE_FILE);
         std::fs::remove_file(&before).ok();
@@ -262,7 +357,7 @@ impl Repo {
         let mut report = RestoreReport::default();
         let relink = self
             .db
-            .transaction(|db| merge_backup(db, &backup, now, &mut report))?;
+            .transaction(|db| merge_backup(db, &backup, &moved, now, &mut report))?;
 
         for path in relink {
             let Some(record) = self.db.active_path(&path)? else {
@@ -340,6 +435,7 @@ struct BackupContents {
 fn merge_backup(
     db: &mut Db,
     backup: &BackupContents,
+    moved: &HashSet<String>,
     now: i64,
     report: &mut RestoreReport,
 ) -> Result<Vec<String>, String> {
@@ -350,7 +446,7 @@ fn merge_backup(
                 db.add_remote(&remote.name, &remote.target)?;
                 report.remotes += 1;
             }
-            Some(ours) if ours.target != remote.target => {
+            Some(ours) if ours.target != remote.target || moved.contains(&remote.name) => {
                 conflicts.insert(&remote.name);
                 report.conflicts.push(remote.name.clone());
             }
@@ -450,6 +546,15 @@ fn merge_rclone_configs(preferred: &str, other: &str) -> String {
     }
     merged.push('\n');
     merged
+}
+
+/// The value of `key` in section `[section]` of an rclone config.
+fn section_value<'a>(config: &'a str, section: &str, key: &str) -> Option<&'a str> {
+    let (_, text) = sections(config).find(|(name, _)| *name == section)?;
+    text.lines().skip(1).find_map(|line| {
+        let (k, v) = line.split_once('=')?;
+        (k.trim() == key).then(|| v.trim())
+    })
 }
 
 /// The `[name]` sections of an rclone config, with their full text.

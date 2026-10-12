@@ -6,8 +6,8 @@
 //! config keys (see the per-backend pages at https://rclone.org/#providers).
 //!
 //! The only mbr-specific additions are the [`Field::to_target`] fields:
-//! their answer names the bucket or folder in the mbr target (`name:bucket`,
-//! `name:bucket/path`, `name:share/folder`) and is never sent to rclone.
+//! their answer names the bucket, container or local folder mbr stores
+//! under (see [`crate::remotes::location`]) and is never sent to rclone.
 //!
 //! Backends whose setup needs an interactive browser flow (OAuth) still
 //! appear here; `rclone` handles their extra prompts through the question
@@ -53,32 +53,27 @@ pub struct Backend {
     pub title: &'static str,
     /// One-line description of what the backend connects to.
     pub description: &'static str,
-    /// Whether an empty folder/bucket answer falls back to [`DEFAULT_PATH`].
-    pub needs_path: bool,
     /// Form fields, in the order they are asked.
     pub fields: &'static [Field],
 }
 
 // All backends mbr can configure with a form, in picker order.
 pub const BACKENDS: &[Backend] = &[
-    Backend { name: "local", title: "Local disk or directory", description: "Another folder on this machine or a mounted disk", needs_path: true, fields: &[
+    Backend { name: "local", title: "Local disk or directory", description: "Another folder on this machine or a mounted disk", fields: &[
         Field { name: "path", label: "Folder", help: "absolute path of the folder where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "", examples: &[], required: true, to_target: true },
     ] },
-    Backend { name: "fichier", title: "1Fichier", description: "1Fichier", needs_path: true, fields: &[
+    Backend { name: "fichier", title: "1Fichier", description: "1Fichier", fields: &[
         Field { name: "api_key", label: "API Key", help: "Your API Key, get it from https://1fichier.com/console/params.pl.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "netstorage", title: "Akamai NetStorage", description: "Akamai NetStorage", needs_path: true, fields: &[
+    Backend { name: "netstorage", title: "Akamai NetStorage", description: "Akamai NetStorage", fields: &[
         Field { name: "host", label: "Host", help: "Domain+path of NetStorage host to connect to. Format should be `<domain>/<internal folders>`", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "account", label: "Account", help: "Set the NetStorage account name", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "secret", label: "Secret", help: "Set the NetStorage account secret/G2O key for authentication. Please choose the 'y' option to set your own password then enter your secret.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "alias", title: "Alias", description: "Alias for an existing remote", needs_path: true, fields: &[
+    Backend { name: "alias", title: "Alias", description: "Alias for an existing remote", fields: &[
         Field { name: "remote", label: "Remote", help: "Remote or path to alias. Can be \"myremote:path/to/dir\", \"myremote:bucket\", \"myremote:\" or \"/local/path\".", kind: Kind::Text, default: "", examples: &[], required: true, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "s3", title: "Amazon S3", description: "AWS S3 buckets and S3-compatible object stores", needs_path: false, fields: &[
+    Backend { name: "s3", title: "Amazon S3", description: "AWS S3 buckets and S3-compatible object stores", fields: &[
         Field { name: "provider", label: "Provider", help: "Choose your S3 provider.", kind: Kind::Choice, default: "", examples: &["AWS", "Alibaba", "ArvanCloud", "Ceph", "ChinaMobile", "Cloudflare", "DigitalOcean", "Dreamhost", "GCS", "HuaweiOBS", "IBMCOS", "IDrive", "IONOS", "LyveCloud", "Leviia", "Liara", "Linode", "Magalu", "Minio", "Netease", "Outscale", "Petabox", "RackCorp", "Rclone", "Scaleway", "SeaweedFS", "Selectel", "StackPath", "Storj", "Synology", "TencentCOS", "Wasabi", "Qiniu", "Other"], required: false, to_target: false },
         Field { name: "env_auth", label: "Env Auth", help: "Get AWS credentials from runtime (environment variables or EC2/ECS meta data if no env vars). Only applies if access_key_id and secret_access_key is blank.", kind: Kind::Choice, default: "false", examples: &["false", "true"], required: false, to_target: false },
         Field { name: "access_key_id", label: "Access Key ID", help: "AWS Access Key ID. Leave blank for anonymous access or runtime credentials.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
@@ -92,88 +87,76 @@ pub const BACKENDS: &[Backend] = &[
         Field { name: "storage_class", label: "Storage Class", help: "The storage class to use when storing new objects in S3.", kind: Kind::Text, default: "", examples: &["", "STANDARD", "REDUCED_REDUNDANCY", "STANDARD_IA", "ONEZONE_IA", "GLACIER", "DEEP_ARCHIVE", "INTELLIGENT_TIERING", "GLACIER_IR"], required: false, to_target: false },
         Field { name: "bucket", label: "Bucket", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: true, to_target: true },
     ] },
-    Backend { name: "b2", title: "Backblaze B2", description: "Backblaze B2 buckets", needs_path: false, fields: &[
+    Backend { name: "b2", title: "Backblaze B2", description: "Backblaze B2 buckets", fields: &[
         Field { name: "account", label: "Account", help: "Account ID or Application Key ID.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "key", label: "Key", help: "Application Key.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "hard_delete", label: "Hard Delete", help: "Permanently delete files on remote removal, otherwise hide files.", kind: Kind::Text, default: "false", examples: &[], required: false, to_target: false },
         Field { name: "bucket", label: "Bucket", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: true, to_target: true },
     ] },
-    Backend { name: "box", title: "Box", description: "Box", needs_path: true, fields: &[
+    Backend { name: "box", title: "Box", description: "Box", fields: &[
         Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "box_config_file", label: "Box Config File", help: "Box App config.json location Leave blank normally. Leading `~` will be expanded in the file name as will environment variables such as `${RCLONE_CONFIG_DIR}`.", kind: Kind::Text, default: "", examples: &[], required: false, to_target: false },
         Field { name: "access_token", label: "Access Token", help: "Box App Primary Access Token Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "box_sub_type", label: "Box Sub Type", help: "Box Sub Type", kind: Kind::Choice, default: "user", examples: &["user", "enterprise"], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "chunker", title: "Chunker", description: "Transparently chunk/split large files", needs_path: true, fields: &[
+    Backend { name: "chunker", title: "Chunker", description: "Transparently chunk/split large files", fields: &[
         Field { name: "remote", label: "Remote", help: "Remote to chunk/unchunk. Normally should contain a ':' and a path, e.g. \"myremote:path/to/dir\", \"myremote:bucket\" or maybe \"myremote:\" (not recommended).", kind: Kind::Text, default: "", examples: &[], required: true, to_target: false },
         Field { name: "chunk_size", label: "Chunk Size", help: "Files larger than chunk size will be split in chunks.", kind: Kind::Text, default: "2Gi", examples: &[], required: false, to_target: false },
         Field { name: "hash_type", label: "Hash Type", help: "Choose how chunker handles hash sums. All modes but \"none\" require metadata.", kind: Kind::Choice, default: "md5", examples: &["none", "md5", "sha1", "md5all", "sha1all", "md5quick", "sha1quick"], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "sharefile", title: "Citrix ShareFile", description: "Citrix Sharefile", needs_path: true, fields: &[
+    Backend { name: "sharefile", title: "Citrix ShareFile", description: "Citrix Sharefile", fields: &[
         Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "root_folder_id", label: "Root Folder ID", help: "ID of the root folder. Leave blank to access \"Personal Folders\". You can use one of the standard values here or any folder ID (long hex number ID).", kind: Kind::Secret, default: "", examples: &["", "favorites", "allshared", "connectors", "top"], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "cloudinary", title: "Cloudinary", description: "Cloudinary", needs_path: true, fields: &[
+    Backend { name: "cloudinary", title: "Cloudinary", description: "Cloudinary", fields: &[
         Field { name: "cloud_name", label: "Cloud Name", help: "Cloudinary Environment Name", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "api_key", label: "API Key", help: "Cloudinary API Key", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "api_secret", label: "API Secret", help: "Cloudinary API Secret", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "upload_prefix", label: "Upload Prefix", help: "Specify the API endpoint for environments out of the US", kind: Kind::Text, default: "", examples: &[], required: false, to_target: false },
         Field { name: "upload_preset", label: "Upload Preset", help: "Upload Preset to select asset manipulation on upload", kind: Kind::Text, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "combine", title: "Combine", description: "Combine several remotes into one", needs_path: true, fields: &[
+    Backend { name: "combine", title: "Combine", description: "Combine several remotes into one", fields: &[
         Field { name: "upstreams", label: "Upstreams", help: "Upstreams for combining These should be in the form dir=remote:path dir2=remote2:path Where before the = is specified the root directory and after is the remote to put there. Embedded spaces can be added using quotes \"dir=remote:path with space\" \"dir2=remote2:path with space\"", kind: Kind::Text, default: "", examples: &[], required: true, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "compress", title: "Compress", description: "Compress a remote", needs_path: true, fields: &[
+    Backend { name: "compress", title: "Compress", description: "Compress a remote", fields: &[
         Field { name: "remote", label: "Remote", help: "Remote to compress.", kind: Kind::Text, default: "", examples: &[], required: true, to_target: false },
         Field { name: "mode", label: "Mode", help: "Compression mode.", kind: Kind::Text, default: "gzip", examples: &["gzip"], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "crypt", title: "Crypt", description: "Encrypt/Decrypt a remote", needs_path: true, fields: &[
+    Backend { name: "crypt", title: "Crypt", description: "Encrypt/Decrypt a remote", fields: &[
         Field { name: "remote", label: "Remote", help: "Remote to encrypt/decrypt. Normally should contain a ':' and a path, e.g. \"myremote:path/to/dir\", \"myremote:bucket\" or maybe \"myremote:\" (not recommended).", kind: Kind::Text, default: "", examples: &[], required: true, to_target: false },
         Field { name: "filename_encryption", label: "Filename Encryption", help: "How to encrypt the filenames.", kind: Kind::Choice, default: "standard", examples: &["standard", "obfuscate", "off"], required: false, to_target: false },
         Field { name: "directory_name_encryption", label: "Directory Name Encryption", help: "Option to either encrypt directory names or leave them intact. NB If filename_encryption is \"off\" then this option will do nothing.", kind: Kind::Choice, default: "true", examples: &["true", "false"], required: false, to_target: false },
         Field { name: "password", label: "Password", help: "Password or pass phrase for encryption.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "password2", label: "Password2", help: "Password or pass phrase for salt. Optional but recommended. Should be different to the previous password.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "dropbox", title: "Dropbox", description: "Dropbox", needs_path: true, fields: &[
+    Backend { name: "dropbox", title: "Dropbox", description: "Dropbox", fields: &[
         Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "filefabric", title: "Enterprise File Fabric", description: "Enterprise File Fabric", needs_path: true, fields: &[
+    Backend { name: "filefabric", title: "Enterprise File Fabric", description: "Enterprise File Fabric", fields: &[
         Field { name: "url", label: "URL", help: "URL of the Enterprise File Fabric to connect to.", kind: Kind::Choice, default: "", examples: &["https://storagemadeeasy.com", "https://eu.storagemadeeasy.com", "https://yourfabric.smestorage.com"], required: true, to_target: false },
         Field { name: "root_folder_id", label: "Root Folder ID", help: "ID of the root folder. Leave blank normally. Fill in to make rclone start with directory of a given ID.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "permanent_token", label: "Permanent Token", help: "Permanent Authentication Token. A Permanent Authentication Token can be created in the Enterprise File Fabric, on the users Dashboard under Security, there is an entry you'll see called \"My Authentication Tokens\". Click the Manage button to create one. These tokens are normally valid for several yea…", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "ftp", title: "FTP", description: "FTP", needs_path: true, fields: &[
+    Backend { name: "ftp", title: "FTP", description: "FTP", fields: &[
         Field { name: "host", label: "Host", help: "FTP host to connect to. E.g. \"ftp.example.com\".", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "user", label: "User", help: "FTP username.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "port", label: "Port", help: "FTP port number.", kind: Kind::Text, default: "21", examples: &[], required: false, to_target: false },
         Field { name: "pass", label: "Pass", help: "FTP password.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "tls", label: "TLS", help: "Use Implicit FTPS (FTP over TLS). When using implicit FTP over TLS the client connects using TLS right from the start which breaks compatibility with non-TLS-aware servers. This is usually served over port 990 rather than port 21. Cannot be used in combination with explicit FTPS.", kind: Kind::Text, default: "false", examples: &[], required: false, to_target: false },
         Field { name: "explicit_tls", label: "Explicit TLS", help: "Use Explicit FTPS (FTP over TLS). When using explicit FTP over TLS the client explicitly requests security from the server in order to upgrade a plain text connection to an encrypted one. Cannot be used in combination with implicit FTPS.", kind: Kind::Text, default: "false", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "filescom", title: "Files.com", description: "Files.com", needs_path: true, fields: &[
+    Backend { name: "filescom", title: "Files.com", description: "Files.com", fields: &[
         Field { name: "site", label: "Site", help: "Your site subdomain (e.g. mysite) or custom domain (e.g. myfiles.customdomain.com).", kind: Kind::Text, default: "", examples: &[], required: false, to_target: false },
         Field { name: "username", label: "Username", help: "The username used to authenticate with Files.com.", kind: Kind::Text, default: "", examples: &[], required: false, to_target: false },
         Field { name: "password", label: "Password", help: "The password used to authenticate with Files.com.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "gofile", title: "Gofile", description: "Gofile", needs_path: true, fields: &[
+    Backend { name: "gofile", title: "Gofile", description: "Gofile", fields: &[
         Field { name: "access_token", label: "Access Token", help: "API Access token You can get this from the web control panel.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "gcs", title: "Google Cloud Storage", description: "GCS buckets (uses the embedded rclone's OAuth client)", needs_path: false, fields: &[
+    Backend { name: "gcs", title: "Google Cloud Storage", description: "GCS buckets (uses the embedded rclone's OAuth client)", fields: &[
         Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "project_number", label: "Project Number", help: "Project number. Optional - needed only for list/create/delete buckets - see your developer console.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
@@ -188,81 +171,70 @@ pub const BACKENDS: &[Backend] = &[
         Field { name: "env_auth", label: "Env Auth", help: "Get GCP IAM credentials from runtime (environment variables or instance meta data if no env vars). Only applies if service_account_file and service_account_credentials is blank.", kind: Kind::Choice, default: "false", examples: &["false", "true"], required: false, to_target: false },
         Field { name: "bucket", label: "Bucket", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: true, to_target: true },
     ] },
-    Backend { name: "drive", title: "Google Drive", description: "Google Drive", needs_path: true, fields: &[
+    Backend { name: "drive", title: "Google Drive", description: "Google Drive", fields: &[
         Field { name: "client_id", label: "Client ID", help: "Google Application Client Id Setting your own is recommended. See https://rclone.org/drive/#making-your-own-client-id for how to create your own. If you leave this blank, it will use an internal key which is low performance.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "scope", label: "Scope", help: "Comma separated list of scopes that rclone should use when requesting access from drive.", kind: Kind::Choice, default: "", examples: &["drive", "drive.readonly", "drive.file", "drive.appfolder", "drive.metadata.readonly"], required: false, to_target: false },
         Field { name: "service_account_file", label: "Service Account File", help: "Service Account Credentials JSON file path. Leave blank normally. Needed only if you want use SA instead of interactive login. Leading `~` will be expanded in the file name as will environment variables such as `${RCLONE_CONFIG_DIR}`.", kind: Kind::Text, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "gphotos", title: "Google Photos", description: "Google Photos", needs_path: true, fields: &[
+    Backend { name: "gphotos", title: "Google Photos", description: "Google Photos", fields: &[
         Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "read_only", label: "Read Only", help: "Set to make the Google Photos backend read only. If you choose read only then rclone will only request read only access to your photos, otherwise rclone will request full access.", kind: Kind::Text, default: "false", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "hdfs", title: "HDFS", description: "Hadoop distributed file system", needs_path: true, fields: &[
+    Backend { name: "hdfs", title: "HDFS", description: "Hadoop distributed file system", fields: &[
         Field { name: "namenode", label: "Namenode", help: "Hadoop name nodes and ports. E.g. \"namenode-1:8020,namenode-2:8020,...\" to connect to host namenodes at port 8020.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "username", label: "Username", help: "Hadoop user name.", kind: Kind::Secret, default: "", examples: &["root"], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "http", title: "HTTP", description: "HTTP", needs_path: false, fields: &[
+    Backend { name: "http", title: "HTTP", description: "HTTP", fields: &[
         Field { name: "url", label: "URL", help: "URL of HTTP host to connect to. E.g. \"https://example.com\", or \"https://user:pass@example.com\" to use a username and password.", kind: Kind::Text, default: "", examples: &[], required: true, to_target: false },
         Field { name: "no_escape", label: "No Escape", help: "Do not escape URL metacharacters in path names.", kind: Kind::Text, default: "false", examples: &[], required: false, to_target: false },
     ] },
-    Backend { name: "hasher", title: "Hasher", description: "Better checksums for other remotes", needs_path: true, fields: &[
+    Backend { name: "hasher", title: "Hasher", description: "Better checksums for other remotes", fields: &[
         Field { name: "remote", label: "Remote", help: "Remote to cache checksums for (e.g. myRemote:path).", kind: Kind::Text, default: "", examples: &[], required: true, to_target: false },
         Field { name: "hashes", label: "Hashes", help: "Comma separated list of supported checksum types.", kind: Kind::Text, default: "md5,sha1", examples: &[], required: false, to_target: false },
         Field { name: "max_age", label: "Max Age", help: "Maximum time to keep checksums in cache (0 = no cache, off = cache forever).", kind: Kind::Text, default: "off", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "hidrive", title: "HiDrive", description: "HiDrive", needs_path: true, fields: &[
+    Backend { name: "hidrive", title: "HiDrive", description: "HiDrive", fields: &[
         Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "scope_access", label: "Scope Access", help: "Access permissions that rclone should use when requesting access from HiDrive.", kind: Kind::Choice, default: "rw", examples: &["rw", "ro"], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "imagekit", title: "ImageKit", description: "ImageKit.io", needs_path: true, fields: &[
+    Backend { name: "imagekit", title: "ImageKit", description: "ImageKit.io", fields: &[
         Field { name: "endpoint", label: "Endpoint", help: "You can find your ImageKit.io URL endpoint in your [dashboard](https://imagekit.io/dashboard/developer/api-keys)", kind: Kind::Text, default: "", examples: &[], required: true, to_target: false },
         Field { name: "public_key", label: "Public Key", help: "You can find your ImageKit.io public key in your [dashboard](https://imagekit.io/dashboard/developer/api-keys)", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "private_key", label: "Private Key", help: "You can find your ImageKit.io private key in your [dashboard](https://imagekit.io/dashboard/developer/api-keys)", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "internetarchive", title: "Internet Archive", description: "Internet Archive", needs_path: false, fields: &[
+    Backend { name: "internetarchive", title: "Internet Archive", description: "Internet Archive", fields: &[
         Field { name: "access_key_id", label: "Access Key ID", help: "IAS3 Access Key. Leave blank for anonymous access. You can find one here: https://archive.org/account/s3.php", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "secret_access_key", label: "Secret Access Key", help: "IAS3 Secret Key (password). Leave blank for anonymous access.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "bucket", label: "Bucket", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "jottacloud", title: "Jottacloud", description: "Jottacloud", needs_path: true, fields: &[
+    Backend { name: "jottacloud", title: "Jottacloud", description: "Jottacloud", fields: &[
         Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "koofr", title: "Koofr", description: "Koofr, Digi Storage and other Koofr-compatible storage providers", needs_path: true, fields: &[
+    Backend { name: "koofr", title: "Koofr", description: "Koofr, Digi Storage and other Koofr-compatible storage providers", fields: &[
         Field { name: "provider", label: "Provider", help: "Choose your storage provider.", kind: Kind::Choice, default: "", examples: &["koofr", "digistorage", "other"], required: false, to_target: false },
         Field { name: "endpoint", label: "Endpoint", help: "The Koofr API endpoint to use.", kind: Kind::Text, default: "", examples: &[], required: true, to_target: false },
         Field { name: "user", label: "User", help: "Your user name.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "password", label: "Password", help: "Your password for rclone generate one at https://app.koofr.net/app/admin/preferences/password.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "linkbox", title: "Linkbox", description: "Linkbox", needs_path: true, fields: &[
+    Backend { name: "linkbox", title: "Linkbox", description: "Linkbox", fields: &[
         Field { name: "token", label: "Token", help: "Token from https://www.linkbox.to/admin/account", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "mailru", title: "Mail.ru Cloud", description: "Mail.ru Cloud", needs_path: true, fields: &[
+    Backend { name: "mailru", title: "Mail.ru Cloud", description: "Mail.ru Cloud", fields: &[
         Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "user", label: "User", help: "User name (usually email).", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "pass", label: "Pass", help: "Password. This must be an app password - rclone will not work with your normal password. See the Configuration section in the docs for how to make an app password.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "speedup_enable", label: "Speedup Enable", help: "Skip full upload if there is another file with same data hash. This feature is called \"speedup\" or \"put by hash\". It is especially efficient in case of generally available files like popular books, video or audio clips, because files are searched by hash in all accounts of all mailru users. It is me…", kind: Kind::Choice, default: "true", examples: &["true", "false"], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "mega", title: "Mega", description: "Mega", needs_path: true, fields: &[
+    Backend { name: "mega", title: "Mega", description: "Mega", fields: &[
         Field { name: "user", label: "User", help: "User name.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "pass", label: "Pass", help: "Password.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "azureblob", title: "Microsoft Azure Blob Storage", description: "Azure containers", needs_path: false, fields: &[
+    Backend { name: "azureblob", title: "Microsoft Azure Blob Storage", description: "Azure containers", fields: &[
         Field { name: "account", label: "Account", help: "Azure Storage Account Name. Set this to the Azure Storage Account Name in use. Leave blank to use SAS URL or Emulator, otherwise it needs to be set. If this is blank and if env_auth is set it will be read from the environment variable `AZURE_STORAGE_ACCOUNT_NAME` if possible.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "env_auth", label: "Env Auth", help: "Read credentials from runtime (environment variables, CLI or MSI). See the [authentication docs](/azureblob#authentication) for full info.", kind: Kind::Text, default: "false", examples: &[], required: false, to_target: false },
         Field { name: "key", label: "Key", help: "Storage Account Shared Key. Leave blank to use SAS URL or Emulator.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
@@ -274,7 +246,7 @@ pub const BACKENDS: &[Backend] = &[
         Field { name: "client_certificate_password", label: "Client Certificate Password", help: "Password for the certificate file (optional). Optionally set this if using - Service principal with certificate And the certificate has a password.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "container", label: "Container", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "azurefiles", title: "Microsoft Azure Files", description: "Microsoft Azure Files", needs_path: true, fields: &[
+    Backend { name: "azurefiles", title: "Microsoft Azure Files", description: "Microsoft Azure Files", fields: &[
         Field { name: "account", label: "Account", help: "Azure Storage Account Name. Set this to the Azure Storage Account Name in use. Leave blank to use SAS URL or connection string, otherwise it needs to be set. If this is blank and if env_auth is set it will be read from the environment variable `AZURE_STORAGE_ACCOUNT_NAME` if possible.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "share_name", label: "Share Name", help: "Azure Files Share Name. This is required and is the name of the share to access.", kind: Kind::Text, default: "", examples: &[], required: false, to_target: false },
         Field { name: "env_auth", label: "Env Auth", help: "Read credentials from runtime (environment variables, CLI or MSI). See the [authentication docs](/azurefiles#authentication) for full info.", kind: Kind::Text, default: "false", examples: &[], required: false, to_target: false },
@@ -286,21 +258,18 @@ pub const BACKENDS: &[Backend] = &[
         Field { name: "client_secret", label: "Client Secret", help: "One of the service principal's client secrets Set this if using - Service principal with client secret", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "client_certificate_path", label: "Client Certificate Path", help: "Path to a PEM or PKCS12 certificate file including the private key. Set this if using - Service principal with certificate", kind: Kind::Text, default: "", examples: &[], required: false, to_target: false },
         Field { name: "client_certificate_password", label: "Client Certificate Password", help: "Password for the certificate file (optional). Optionally set this if using - Service principal with certificate And the certificate has a password.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "onedrive", title: "Microsoft OneDrive", description: "Microsoft OneDrive", needs_path: true, fields: &[
+    Backend { name: "onedrive", title: "Microsoft OneDrive", description: "Microsoft OneDrive", fields: &[
         Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "region", label: "Region", help: "Choose national cloud region for OneDrive.", kind: Kind::Choice, default: "global", examples: &["global", "us", "de", "cn"], required: false, to_target: false },
         Field { name: "tenant", label: "Tenant", help: "ID of the service principal's tenant. Also called its directory ID. Set this if using - Client Credential flow", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "opendrive", title: "OpenDrive", description: "OpenDrive", needs_path: true, fields: &[
+    Backend { name: "opendrive", title: "OpenDrive", description: "OpenDrive", fields: &[
         Field { name: "username", label: "Username", help: "Username.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "password", label: "Password", help: "Password.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "swift", title: "OpenStack Swift", description: "OpenStack and compatible object stores", needs_path: false, fields: &[
+    Backend { name: "swift", title: "OpenStack Swift", description: "OpenStack and compatible object stores", fields: &[
         Field { name: "env_auth", label: "Env Auth", help: "Get swift credentials from environment variables in standard OpenStack form.", kind: Kind::Choice, default: "false", examples: &["false", "true"], required: false, to_target: false },
         Field { name: "user", label: "User", help: "User name to log in (OS_USERNAME).", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "key", label: "Key", help: "API key or password (OS_PASSWORD).", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
@@ -321,7 +290,7 @@ pub const BACKENDS: &[Backend] = &[
         Field { name: "storage_policy", label: "Storage Policy", help: "The storage policy to use when creating a new container. This applies the specified storage policy when creating a new container. The policy cannot be changed afterwards. The allowed configuration values and their meaning depend on your Swift storage provider.", kind: Kind::Choice, default: "", examples: &["", "pcs", "pca"], required: false, to_target: false },
         Field { name: "container", label: "Container", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "oos", title: "Oracle Object Storage", description: "Oracle Cloud Infrastructure Object Storage", needs_path: false, fields: &[
+    Backend { name: "oos", title: "Oracle Object Storage", description: "Oracle Cloud Infrastructure Object Storage", fields: &[
         Field { name: "provider", label: "Provider", help: "Choose your Auth Provider", kind: Kind::Choice, default: "env_auth", examples: &["env_auth", "user_principal_auth", "instance_principal_auth", "workload_identity_auth", "resource_principal_auth", "no_auth"], required: true, to_target: false },
         Field { name: "namespace", label: "Namespace", help: "Object storage namespace", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "compartment", label: "Compartment", help: "Specify compartment OCID, if you need to list buckets. List objects works without compartment OCID.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
@@ -331,23 +300,20 @@ pub const BACKENDS: &[Backend] = &[
         Field { name: "config_profile", label: "Config Profile", help: "Profile name inside the oci config file", kind: Kind::Text, default: "Default", examples: &["Default"], required: false, to_target: false },
         Field { name: "bucket", label: "Bucket", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "pikpak", title: "PikPak", description: "PikPak", needs_path: true, fields: &[
+    Backend { name: "pikpak", title: "PikPak", description: "PikPak", fields: &[
         Field { name: "user", label: "User", help: "Pikpak username.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "pass", label: "Pass", help: "Pikpak password.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "pixeldrain", title: "Pixeldrain", description: "Pixeldrain Filesystem", needs_path: true, fields: &[
+    Backend { name: "pixeldrain", title: "Pixeldrain", description: "Pixeldrain Filesystem", fields: &[
         Field { name: "api_key", label: "API Key", help: "API key for your pixeldrain account. Found on https://pixeldrain.com/user/api_keys.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "root_folder_id", label: "Root Folder ID", help: "Root of the filesystem to use. Set to 'me' to use your personal filesystem. Set to a shared directory ID to use a shared directory.", kind: Kind::Text, default: "me", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "protondrive", title: "Proton Drive", description: "Proton Drive", needs_path: true, fields: &[
+    Backend { name: "protondrive", title: "Proton Drive", description: "Proton Drive", fields: &[
         Field { name: "username", label: "Username", help: "The username of your proton account", kind: Kind::Text, default: "", examples: &[], required: true, to_target: false },
         Field { name: "password", label: "Password", help: "The password of your proton account.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "2fa", label: "2fa", help: "The 2FA code The value can also be provided with --protondrive-2fa=000000 The 2FA code of your proton drive account if the account is set up with two-factor authentication", kind: Kind::Text, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "qingstor", title: "QingStor", description: "QingCloud Object Storage", needs_path: false, fields: &[
+    Backend { name: "qingstor", title: "QingStor", description: "QingCloud Object Storage", fields: &[
         Field { name: "env_auth", label: "Env Auth", help: "Get QingStor credentials from runtime. Only applies if access_key_id and secret_access_key is blank.", kind: Kind::Choice, default: "false", examples: &["false", "true"], required: false, to_target: false },
         Field { name: "access_key_id", label: "Access Key ID", help: "QingStor Access Key ID. Leave blank for anonymous access or runtime credentials.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "secret_access_key", label: "Secret Access Key", help: "QingStor Secret Access Key (password). Leave blank for anonymous access or runtime credentials.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
@@ -355,12 +321,11 @@ pub const BACKENDS: &[Backend] = &[
         Field { name: "zone", label: "Zone", help: "Zone to connect to. Default is \"pek3a\".", kind: Kind::Choice, default: "", examples: &["pek3a", "sh1a", "gd2a"], required: false, to_target: false },
         Field { name: "bucket", label: "Bucket", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "quatrix", title: "Quatrix", description: "Quatrix by Maytech", needs_path: true, fields: &[
+    Backend { name: "quatrix", title: "Quatrix", description: "Quatrix by Maytech", fields: &[
         Field { name: "api_key", label: "API Key", help: "API key for accessing Quatrix account", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "host", label: "Host", help: "Host name of Quatrix account", kind: Kind::Text, default: "", examples: &[], required: true, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "sftp", title: "SFTP (SSH)", description: "Connect over SSH to another machine", needs_path: true, fields: &[
+    Backend { name: "sftp", title: "SFTP (SSH)", description: "Connect over SSH to another machine", fields: &[
         Field { name: "host", label: "Host", help: "SSH host to connect to. E.g. \"example.com\".", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "user", label: "User", help: "SSH username.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "port", label: "Port", help: "SSH port number.", kind: Kind::Text, default: "22", examples: &[], required: false, to_target: false },
@@ -374,32 +339,29 @@ pub const BACKENDS: &[Backend] = &[
         Field { name: "use_insecure_cipher", label: "Use Insecure Cipher", help: "Enable the use of insecure ciphers and key exchange methods. This enables the use of the following insecure ciphers and key exchange methods: - aes128-cbc - aes192-cbc - aes256-cbc - 3des-cbc - diffie-hellman-group-exchange-sha256 - diffie-hellman-group-exchange-sha1 Those algorithms are insecure an…", kind: Kind::Choice, default: "false", examples: &["false", "true"], required: false, to_target: false },
         Field { name: "disable_hashcheck", label: "Disable Hashcheck", help: "Disable the execution of SSH commands to determine if remote file hashing is available. Leave blank or set to false to enable hashing (recommended), set to true to disable hashing.", kind: Kind::Text, default: "false", examples: &[], required: false, to_target: false },
         Field { name: "ssh", label: "SSH", help: "Path and arguments to external ssh binary. Normally rclone will use its internal ssh library to connect to the SFTP server. However it does not implement all possible ssh options so it may be desirable to use an external ssh binary. Rclone ignores all the internal config if you use this option and e…", kind: Kind::Text, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder on the server", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "smb", title: "SMB / CIFS", description: "Windows shares and Samba servers", needs_path: true, fields: &[
+    Backend { name: "smb", title: "SMB / CIFS", description: "Windows shares and Samba servers", fields: &[
         Field { name: "host", label: "Host", help: "SMB server hostname to connect to. E.g. \"example.com\".", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "user", label: "User", help: "SMB username.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "port", label: "Port", help: "SMB port number.", kind: Kind::Text, default: "445", examples: &[], required: false, to_target: false },
         Field { name: "pass", label: "Pass", help: "SMB password.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "domain", label: "Domain", help: "Domain name for NTLM authentication.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "spn", label: "Spn", help: "Service principal name. Rclone presents this name to the server. Some servers use this as further authentication, and it often needs to be set for clusters. For example: cifs/remotehost:1020 Leave blank if not sure.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Share and folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
+        Field { name: "share", label: "Share", help: "the share mbr stores blobs in", kind: Kind::Text, default: "", examples: &[], required: true, to_target: true },
     ] },
-    Backend { name: "seafile", title: "Seafile", description: "seafile", needs_path: true, fields: &[
+    Backend { name: "seafile", title: "Seafile", description: "seafile", fields: &[
         Field { name: "url", label: "URL", help: "URL of seafile host to connect to.", kind: Kind::Secret, default: "", examples: &["https://cloud.seafile.com/"], required: true, to_target: false },
         Field { name: "user", label: "User", help: "User name (usually email address).", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "pass", label: "Pass", help: "Password.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "2fa", label: "2fa", help: "Two-factor authentication ('true' if the account has 2FA enabled).", kind: Kind::Text, default: "false", examples: &[], required: false, to_target: false },
         Field { name: "library", label: "Library", help: "Name of the library. Leave blank to access all non-encrypted libraries.", kind: Kind::Text, default: "", examples: &[], required: false, to_target: false },
         Field { name: "library_key", label: "Library Key", help: "Library password (for encrypted libraries only). Leave blank if you pass it through the command line.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "sia", title: "Sia", description: "Sia Decentralized Cloud", needs_path: true, fields: &[
+    Backend { name: "sia", title: "Sia", description: "Sia Decentralized Cloud", fields: &[
         Field { name: "api_url", label: "API URL", help: "Sia daemon API URL, like http://sia.daemon.host:9980. Note that siad must run with --disable-api-security to open API port for other hosts (not recommended). Keep default if Sia daemon runs on localhost.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "api_password", label: "API Password", help: "Sia Daemon API Password. Can be found in the apipassword file located in HOME/.sia/ or in the daemon directory.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "storj", title: "Storj", description: "Storj Decentralized Cloud Storage", needs_path: false, fields: &[
+    Backend { name: "storj", title: "Storj", description: "Storj Decentralized Cloud Storage", fields: &[
         Field { name: "provider", label: "Provider", help: "Choose an authentication method.", kind: Kind::Choice, default: "existing", examples: &["existing", "new"], required: false, to_target: false },
         Field { name: "access_grant", label: "Access Grant", help: "Access grant.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "satellite_address", label: "Satellite Address", help: "Satellite address. Custom satellite address should match the format: `<nodeid>@<address>:<port>`.", kind: Kind::Text, default: "us1.storj.io", examples: &["us1.storj.io", "eu1.storj.io", "ap1.storj.io"], required: false, to_target: false },
@@ -407,69 +369,58 @@ pub const BACKENDS: &[Backend] = &[
         Field { name: "passphrase", label: "Passphrase", help: "Encryption passphrase. To access existing objects enter passphrase used for uploading.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "bucket", label: "Bucket", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "sugarsync", title: "SugarSync", description: "Sugarsync", needs_path: true, fields: &[
+    Backend { name: "sugarsync", title: "SugarSync", description: "Sugarsync", fields: &[
         Field { name: "app_id", label: "App ID", help: "Sugarsync App ID. Leave blank to use rclone's.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "access_key_id", label: "Access Key ID", help: "Sugarsync Access Key ID. Leave blank to use rclone's.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "private_access_key", label: "Private Access Key", help: "Sugarsync Private Access Key. Leave blank to use rclone's.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "hard_delete", label: "Hard Delete", help: "Permanently delete files if true otherwise put them in the deleted files.", kind: Kind::Text, default: "false", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "ulozto", title: "Uloz.to", description: "Uloz.to", needs_path: true, fields: &[
+    Backend { name: "ulozto", title: "Uloz.to", description: "Uloz.to", fields: &[
         Field { name: "app_token", label: "App Token", help: "The application token identifying the app. An app API key can be either found in the API doc https://uloz.to/upload-resumable-api-beta or obtained from customer service.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "username", label: "Username", help: "The username of the principal to operate as.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "password", label: "Password", help: "The password for the user.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "union", title: "Union", description: "Union merges the contents of several upstream fs", needs_path: true, fields: &[
+    Backend { name: "union", title: "Union", description: "Union merges the contents of several upstream fs", fields: &[
         Field { name: "upstreams", label: "Upstreams", help: "List of space separated upstreams. Can be 'upstreama:test/dir upstreamb:', '\"upstreama:test/space:ro dir\" upstreamb:', etc.", kind: Kind::Text, default: "", examples: &[], required: true, to_target: false },
         Field { name: "action_policy", label: "Action Policy", help: "Policy to choose upstream on ACTION category.", kind: Kind::Text, default: "epall", examples: &[], required: false, to_target: false },
         Field { name: "create_policy", label: "Create Policy", help: "Policy to choose upstream on CREATE category.", kind: Kind::Text, default: "epmfs", examples: &[], required: false, to_target: false },
         Field { name: "search_policy", label: "Search Policy", help: "Policy to choose upstream on SEARCH category.", kind: Kind::Text, default: "ff", examples: &[], required: false, to_target: false },
         Field { name: "cache_time", label: "Cache Time", help: "Cache time of usage and free space (in seconds). This option is only useful when a path preserving policy is used.", kind: Kind::Text, default: "120", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "uptobox", title: "Uptobox", description: "Uptobox", needs_path: true, fields: &[
+    Backend { name: "uptobox", title: "Uptobox", description: "Uptobox", fields: &[
         Field { name: "access_token", label: "Access Token", help: "Your access token. Get it from https://uptobox.com/my_account.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "webdav", title: "WebDAV", description: "Nextcloud, ownCloud, Sharepoint and other WebDAV servers", needs_path: true, fields: &[
+    Backend { name: "webdav", title: "WebDAV", description: "Nextcloud, ownCloud, Sharepoint and other WebDAV servers", fields: &[
         Field { name: "url", label: "URL", help: "URL of http host to connect to. E.g. https://example.com.", kind: Kind::Text, default: "", examples: &[], required: true, to_target: false },
         Field { name: "vendor", label: "Vendor", help: "Name of the WebDAV site/service/software you are using.", kind: Kind::Choice, default: "", examples: &["fastmail", "nextcloud", "owncloud", "sharepoint", "sharepoint-ntlm", "rclone", "other"], required: false, to_target: false },
         Field { name: "user", label: "User", help: "User name. In case NTLM authentication is used, the username should be in the format 'Domain\\User'.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "pass", label: "Pass", help: "Password.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "bearer_token", label: "Bearer Token", help: "Bearer token instead of user/pass (e.g. a Macaroon).", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder on the server", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "yandex", title: "Yandex Disk", description: "Yandex Disk", needs_path: true, fields: &[
+    Backend { name: "yandex", title: "Yandex Disk", description: "Yandex Disk", fields: &[
         Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "zoho", title: "Zoho WorkDrive", description: "Zoho", needs_path: true, fields: &[
+    Backend { name: "zoho", title: "Zoho WorkDrive", description: "Zoho", fields: &[
         Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "region", label: "Region", help: "Zoho region to connect to. You'll have to use the region your organization is registered in. If not sure use the same top level domain as you connect to in your browser.", kind: Kind::Choice, default: "", examples: &["com", "eu", "in", "jp", "com.cn", "com.au"], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "iclouddrive", title: "iCloud Drive", description: "iCloud Drive", needs_path: true, fields: &[
+    Backend { name: "iclouddrive", title: "iCloud Drive", description: "iCloud Drive", fields: &[
         Field { name: "apple_id", label: "Apple ID", help: "Apple ID.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
         Field { name: "password", label: "Password", help: "Password.", kind: Kind::Secret, default: "", examples: &[], required: true, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "pcloud", title: "pCloud", description: "pCloud account: sign in via rclone's browser flow after saving", needs_path: true, fields: &[
+    Backend { name: "pcloud", title: "pCloud", description: "pCloud account: sign in via rclone's browser flow after saving", fields: &[
         Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "premiumizeme", title: "premiumize.me", description: "premiumize.me", needs_path: true, fields: &[
+    Backend { name: "premiumizeme", title: "premiumize.me", description: "premiumize.me", fields: &[
         Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
-    Backend { name: "putio", title: "put.io", description: "Put.io", needs_path: true, fields: &[
+    Backend { name: "putio", title: "put.io", description: "Put.io", fields: &[
         Field { name: "client_id", label: "Client ID", help: "OAuth Client Id. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
         Field { name: "client_secret", label: "Client Secret", help: "OAuth Client Secret. Leave blank normally.", kind: Kind::Secret, default: "", examples: &[], required: false, to_target: false },
-        Field { name: "path", label: "Folder", help: "where mbr stores blobs (created on push if missing)", kind: Kind::Text, default: "mbr", examples: &[], required: false, to_target: true },
     ] },
 ];
 
@@ -489,9 +440,19 @@ pub fn choice_values(field: &Field) -> Vec<&'static str> {
     values
 }
 
-/// Backend names for pickers and `mbr remote types`.
+/// Backend names, offered or not.
 pub fn backend_names() -> Vec<&'static str> {
     BACKENDS.iter().map(|b| b.name).collect()
+}
+
+/// Backends that only wrap another rclone remote. mbr creates its own
+/// `crypt` layer (see [`crate::remotes`]), and the remotes it creates are
+/// never named to the user, so none of these are offered.
+pub const WRAPPERS: &[&str] = &["alias", "chunker", "combine", "compress", "crypt", "hasher", "union"];
+
+/// The backends offered when setting up a remote, in picker order.
+pub fn offered() -> impl Iterator<Item = &'static Backend> {
+    BACKENDS.iter().filter(|b| !WRAPPERS.contains(&b.name))
 }
 
 /// Where rclone documents `field` of `backend`: the option's entry on the
@@ -516,27 +477,6 @@ pub fn rclone_docs_url(backend: &Backend, field: &Field) -> Option<String> {
         backend.name,
         field.name.replace('_', "-")
     ))
-}
-
-/// Default path prefix mbr uses when no user path is supplied.
-pub const DEFAULT_PATH: &str = "mbr";
-
-/// Build the mbr target for the rclone remote `remote_name`. `spec` is the
-/// user's bucket or path answer; empty answers fall back to [`DEFAULT_PATH`].
-pub fn target_for(remote_name: &str, backend: &Backend, spec: &str) -> String {
-    // Only trailing slashes go: a leading one is meaningful (an absolute
-    // local folder, or an absolute path on an SFTP/FTP server).
-    let spec = spec.trim();
-    let spec = match spec.trim_end_matches('/') {
-        "" if spec.starts_with('/') => "/",
-        trimmed => trimmed,
-    };
-    let spec = if spec.is_empty() && backend.needs_path {
-        DEFAULT_PATH
-    } else {
-        spec
-    };
-    format!("{remote_name}:{spec}")
 }
 
 /// Reject bucket/path answers that would point somewhere unintended:
@@ -639,22 +579,6 @@ mod tests {
     }
 
     #[test]
-    fn target_fields_are_named_like_paths() {
-        for b in BACKENDS {
-            for f in b.fields {
-                if f.to_target {
-                    assert!(
-                        matches!(f.name, "bucket" | "container" | "path"),
-                        "{}.{}: unexpected to_target field name",
-                        b.name,
-                        f.name
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
     fn choices_offer_the_default() {
         for b in BACKENDS {
             for f in b.fields.iter().filter(|f| f.kind == Kind::Choice) {
@@ -682,18 +606,26 @@ mod tests {
     }
 
     #[test]
-    fn target_building() {
-        let smb = backend("smb").unwrap();
-        assert_eq!(target_for("nas", smb, "share/sub"), "nas:share/sub");
-        assert_eq!(target_for("nas", smb, ""), "nas:mbr");
-        let s3 = backend("s3").unwrap();
-        assert_eq!(target_for("backup", s3, "mybucket"), "backup:mybucket");
-        assert_eq!(target_for("backup", s3, "mybucket/"), "backup:mybucket");
-        let local = backend("local").unwrap();
-        assert_eq!(target_for("disk", local, "/mnt/x/"), "disk:/mnt/x");
-        assert_eq!(target_for("disk", local, "/"), "disk:/");
-        let sftp = backend("sftp").unwrap();
-        assert_eq!(target_for("srv", sftp, "/srv/mbr"), "srv:/srv/mbr");
+    fn wrappers_are_not_offered() {
+        for name in WRAPPERS {
+            assert!(backend(name).is_some(), "{name}");
+            assert!(offered().all(|b| b.name != *name));
+        }
+        assert!(offered().any(|b| b.name == "drive"));
+    }
+
+    #[test]
+    fn only_buckets_and_local_folders_are_asked() {
+        for b in BACKENDS {
+            for f in b.fields.iter().filter(|f| f.to_target) {
+                assert!(
+                    matches!(f.name, "bucket" | "container" | "share") || b.name == "local",
+                    "{}.{} asks for a subfolder",
+                    b.name,
+                    f.name
+                );
+            }
+        }
     }
 
     #[test]

@@ -2,7 +2,8 @@
 //!
 //! Blobs live on a remote under the same sharded layout as the local
 //! `.mbr/blobs` store: `<target>/aa/bb/<full-hash>`, with no metadata at all.
-//! Encryption is rclone's concern (use an rclone `crypt` remote if wanted).
+//! Encryption is rclone's concern: mbr's remotes are `crypt` remotes (see
+//! [`crate::remotes`]).
 
 use crate::util::is_hash;
 use librclone::{initialize, rpc};
@@ -17,6 +18,8 @@ static RPC_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 /// switched underneath it by another thread.
 static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
+/// The config path last selected, to notice when it changes.
+static SELECTED_CONFIG: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 fn lock() -> &'static Mutex<()> {
     RPC_LOCK.get_or_init(|| Mutex::new(()))
@@ -75,8 +78,25 @@ pub fn call(method: &str, input: Value) -> Result<Value, String> {
 
 /// Point librclone at the config owned by a repository. Prefer
 /// [`with_config`] when other threads may use a different config.
+///
+/// rclone caches remotes by name, so when the config changes, remotes of
+/// the previous one (two folders may both have a `disk`) are forgotten.
 pub fn set_config_path(path: &Path) -> Result<(), String> {
+    let mut selected = SELECTED_CONFIG
+        .lock()
+        .map_err(|_| "rclone config lock poisoned".to_owned())?;
     call("config/setpath", json!({"path": path}))?;
+    if selected.as_deref() != Some(path) {
+        forget_cached_remotes()?;
+        *selected = Some(path.to_owned());
+    }
+    Ok(())
+}
+
+/// Drop rclone's cached remotes, so the next use reads their settings
+/// again: needed after editing a config file behind rclone's back.
+pub fn forget_cached_remotes() -> Result<(), String> {
+    call("fscache/clear", json!({}))?;
     Ok(())
 }
 
@@ -441,6 +461,35 @@ pub fn list_blobs(target: &str) -> Result<Vec<RemoteBlob>, String> {
             })
         })
         .collect())
+}
+
+/// Names of the directories directly under `fs`; none if it doesn't exist.
+pub fn list_dirs(fs: &str) -> Result<Vec<String>, String> {
+    let result = match call(
+        "operations/list",
+        json!({
+            "fs": fs,
+            "remote": "",
+            "opt": {"dirsOnly": true, "noModTime": true, "noMimeType": true},
+        }),
+    ) {
+        Ok(result) => result,
+        Err(e) if e.contains("directory not found") => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let list = result
+        .get("list")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "rclone list response has no list array".to_owned())?;
+    Ok(list
+        .iter()
+        .filter_map(|item| Some(item.get("Name").and_then(Value::as_str)?.to_owned()))
+        .collect())
+}
+
+/// An rclone connection-string value, quoted.
+pub fn quote_param(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 /// Whether one blob is stored under `target`: its size if so.

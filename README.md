@@ -74,8 +74,34 @@ backends — comes back as a single question the frontends relay.
 For OAuth backends (Google Drive, Dropbox, OneDrive, …) the form is
 mostly optional client credentials; the sign-in itself happens in the
 browser, and the auth link is also printed (CLI) or shown inline (GUI) in
-case no browser opens. `mbr remote add` still accepts any pre-existing
-rclone target, e.g. one configured with the `rclone` executable itself.
+case no browser opens.
+
+### Encryption and layout
+
+A master password must be set (`mbr config password`, or the Settings
+tab) before any remote can be added: every remote is encrypted with it.
+A remote named `drive` becomes two rclone sections, which are never shown:
+
+```
+[_plain-mbr-drive]       the backend itself
+[_autocrypt-mbr-drive]   type = crypt, password = the master password
+                         remote = _plain-mbr-drive:<bucket/>mbr-<folder id>
+```
+
+and the mbr remote `drive` targets `_autocrypt-mbr-drive:`, so blobs,
+their names and the metadata backups are all encrypted. `mbr remote setup
+--unencrypted` (or "Don't encrypt" in the GUI) instead makes the single
+section `_dangerouslyplain-mbr-drive`, storing in the clear. Wrapper
+backends (alias, chunker, crypt, union, …) are not offered.
+
+The folder id is 6 random bytes in hex, made once and kept in the
+database, so each folder stores in its own `mbr-<id>` directory and several
+folders can share one storage account. The only location asked is the
+bucket, container or share (or, for `local`, the folder).
+
+Since remotes are encrypted with it, the master password can't change
+once one exists. It is saved, with a check, in the per-machine
+`state.json` (mode 0600), so it is asked for once.
 
 ### Scanning remotes
 
@@ -107,9 +133,7 @@ at risk.
 - **Old versions and deleted files** (`mbr gc`, "Clean up old versions"):
   blobs no current file points at. `gc` drops their local copies under the
   same minimum-copies rule; `gc --purge [--older-than DAYS]` deletes them
-  everywhere, remotes included, after confirmation. Purging also deletes
-  them from remotes shared with other folders, so only purge blobs no other
-  folder uses.
+  everywhere, remotes included, after confirmation.
 
 ## Metadata backups
 
@@ -131,10 +155,14 @@ These are [age](https://age-encryption.org) files encrypted to the password
 mbr.db`. The password can't be recovered: without it the backups are
 unreadable.
 
-To restore, attach a new, empty folder, set up one of the old remotes there,
-and restore from it (`mbr metadata restore <remote>`, or the Metadata backup
-tab). Every file reappears as a dangling symlink, the other remotes come back
-with their settings, and the content can then be downloaded.
+To restore, attach a new, empty folder, set the same master password, set
+up one of the old remotes there, and restore from it (`mbr metadata
+restore <remote>`, or the Settings tab). The new folder has a new id, so
+its remote points next to the old folder's `mbr-<id>` directory: restoring
+looks in the sibling `mbr-<id>` directories too, and the new folder then
+takes on the old id, moving its remotes over. Every file reappears as a
+dangling symlink, the other remotes come back with their settings, and the
+content can then be downloaded.
 
 Restoring into a folder already in use merges the backup in: whatever only
 the backup knows (files, older versions, remotes and what they store,
@@ -157,15 +185,15 @@ mbr init [dir]                    attach mbr to a folder
 mbr scan                          ingest new files, record removals
 mbr ls                            list tracked files with metadata
 mbr info <path|hash>              full detail for one file or blob
-mbr remote add <name> <target>    add an existing rclone target
 mbr remote types                  list the rclone backends mbr can set up
-mbr remote setup <name> <type>    configure an rclone remote interactively
+mbr remote setup <name> <type> [--unencrypted]
+                                  set up an (encrypted) remote interactively
 mbr remote ls                     list remotes
-mbr remote show <name>            target and rclone settings (secrets hidden)
-mbr remote edit <name> [--rename NEW] [--target T] [--set KEY=VALUE...]
-                                  rename, retarget, or change rclone settings
+mbr remote show <name>            a remote's settings (secrets hidden)
+mbr remote edit <name> [--rename NEW] [--set KEY=VALUE...]
+                                  rename, or change its backend settings
 mbr remote scan [name...]         list remotes fully, record what they hold
-mbr remote rm <name>              remove a remote
+mbr remote rm <name>              remove a remote and its rclone settings
 mbr push <remote> [path|hash...]  upload blobs (default: all not yet there)
 mbr pull <remote> [path|hash...]  download from one remote (default: all it
                                   holds that is missing here)
@@ -179,9 +207,9 @@ mbr gc [--purge [--older-than DAYS] [--yes]]
                                   drop (or delete everywhere) old versions
                                   and deleted files
 mbr config min-copies [N]         show or set the copies to keep
+mbr config password               set the master password (before any remote)
 mbr metadata status               where metadata is backed up, and when
 mbr metadata add|rm <remote>...   choose the remotes for metadata backups
-mbr metadata password             set or change the master password
 mbr metadata backup               encrypt and upload the metadata
 mbr metadata restore <remote>     merge the backup on a remote into this folder
 ```
@@ -207,19 +235,18 @@ copy and clean up old versions.
 **Remotes** sets the minimum number of copies, and lists the remotes with
 Scan (and Scan all), Download all
 (everything recorded there that is missing here), Upload all, Edit and
-Remove. The sidebar adds remotes — an existing rclone target, or a
-guided setup: pick a backend and fill in the generated form (choices as
-dropdowns, required fields marked, each field's "?" opening its rclone
-documentation); if rclone still
-needs an answer — usually OAuth — the question is shown inline. Edit
-renames or retargets a remote and, for backends mbr has a form for,
-changes its rclone settings (secrets stay hidden; blank keeps them).
+Remove. Once a master password is set, the sidebar sets up remotes: pick
+a backend and fill in the generated form (choices as dropdowns, required
+fields marked, each field's "?" opening its rclone documentation), with
+"Don't encrypt" unticked by default; if rclone still needs an answer —
+usually OAuth — the question is shown inline. Edit renames a remote and,
+for backends mbr has a form for, changes its settings (secrets stay
+hidden; blank keeps them).
 
-**Metadata backup** chooses which remotes receive metadata backups and
-shows when each was last backed up and whether that is up to date. The
-sidebar sets the master password, unlocks it for the session (it is kept
-in memory until locked, the folder changes, or the app quits), backs up,
-and changes the password. It also restores a backup from a remote: first
+**Settings** holds the master password (set once, then saved on this
+computer) and chooses which remotes receive metadata backups, showing
+when each was last backed up and whether that is up to date. The sidebar
+sets, unlocks or changes the password and backs up. It also restores a backup from a remote: first
 thing in an empty folder, merged in otherwise.
 
 Scans and rclone operations run in the background, backed by the

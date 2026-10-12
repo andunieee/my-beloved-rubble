@@ -116,8 +116,6 @@ enum MetadataCommand {
         #[arg(required = true)]
         remotes: Vec<String>,
     },
-    /// set or change the master password
-    Password,
     /// encrypt the metadata and upload it to every chosen remote
     Backup,
     /// merge the metadata backup on a remote into this folder
@@ -128,32 +126,35 @@ enum MetadataCommand {
 enum ConfigCommand {
     /// copies of each file to keep (local + remotes); shows it without N
     MinCopies { n: Option<u32> },
+    /// set or change the master password (needed before adding remotes)
+    Password,
 }
 
 #[derive(Subcommand)]
 enum RemoteCommand {
-    /// add an existing rclone target
-    Add { name: String, target: String },
     /// list the rclone backends mbr can set up
     Types,
-    /// configure an rclone remote interactively
-    Setup { name: String, backend: String },
+    /// set up a new remote, encrypted with the master password
+    Setup {
+        name: String,
+        backend: String,
+        /// store files unencrypted (whoever runs the remote can read them)
+        #[arg(long)]
+        unencrypted: bool,
+    },
     /// remove a remote
     Rm { name: String },
     /// list remotes
     Ls,
-    /// show a remote's target and rclone settings (secrets hidden)
+    /// show a remote's settings (secrets hidden)
     Show { name: String },
-    /// rename a remote, change its target, or change rclone settings
+    /// rename a remote or change its settings
     Edit {
         name: String,
-        /// new mbr name for the remote
+        /// new name for the remote
         #[arg(long)]
         rename: Option<String>,
-        /// new rclone target (e.g. `backup:otherbucket`)
-        #[arg(long)]
-        target: Option<String>,
-        /// set an rclone config key of the target's remote (repeatable)
+        /// set an rclone config key of the remote's backend (repeatable)
         #[arg(long = "set", value_name = "KEY=VALUE")]
         set: Vec<String>,
     },
@@ -178,18 +179,18 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Ls => ls(&mut open()?),
         Command::Info { spec } => info(&mut open()?, &spec),
         Command::Remote { command } => match command {
-            RemoteCommand::Add { name, target } => remote_add(&mut open()?, &name, &target),
             RemoteCommand::Types => remote_types(),
-            RemoteCommand::Setup { name, backend } => remote_setup(&mut open()?, &name, &backend),
+            RemoteCommand::Setup {
+                name,
+                backend,
+                unencrypted,
+            } => remote_setup(&mut open()?, &name, &backend, !unencrypted),
             RemoteCommand::Rm { name } => remote_rm(&mut open()?, &name),
             RemoteCommand::Ls => remote_ls(&mut open()?),
             RemoteCommand::Show { name } => remote_show(&mut open()?, &name),
-            RemoteCommand::Edit {
-                name,
-                rename,
-                target,
-                set,
-            } => remote_edit(&mut open()?, &name, rename, target, &set),
+            RemoteCommand::Edit { name, rename, set } => {
+                remote_edit(&mut open()?, &name, rename, &set)
+            }
             RemoteCommand::Scan { names } => remote_scan(&mut open()?, &names),
         },
         Command::Push { remote, specs } => push(&mut open()?, &remote, &specs),
@@ -210,12 +211,12 @@ fn run(cli: Cli) -> Result<(), String> {
             MetadataCommand::Status => metadata_status(&mut open()?),
             MetadataCommand::Add { remotes } => metadata_use(&mut open()?, &remotes, true),
             MetadataCommand::Rm { remotes } => metadata_use(&mut open()?, &remotes, false),
-            MetadataCommand::Password => metadata_password(&mut open()?),
             MetadataCommand::Backup => metadata_backup(&mut open()?),
             MetadataCommand::Restore { remote } => metadata_restore(&mut open()?, &remote),
         },
         Command::Config { command } => match command {
             ConfigCommand::MinCopies { n } => config_min_copies(&mut open()?, n),
+            ConfigCommand::Password => config_password(&mut open()?),
         },
     }
 }
@@ -351,18 +352,9 @@ fn info(repo: &mut Repo, spec: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn remote_add(repo: &mut Repo, name: &str, target: &str) -> Result<(), String> {
-    if repo.db.remote(name)?.is_some() {
-        return Err(format!("remote '{name}' already exists"));
-    }
-    repo.db.add_remote(name, target)?;
-    println!("added remote {name} -> {target}");
-    Ok(())
-}
-
 /// List the hardcoded backends with their form fields.
 fn remote_types() -> Result<(), String> {
-    for backend in mbr::backends::BACKENDS {
+    for backend in mbr::backends::offered() {
         println!(
             "{:<12} {} — {}",
             backend.name, backend.title, backend.description
@@ -394,19 +386,26 @@ fn remote_types() -> Result<(), String> {
     Ok(())
 }
 
-fn remote_setup(repo: &mut Repo, name: &str, backend: &str) -> Result<(), String> {
+fn remote_setup(repo: &mut Repo, name: &str, backend: &str, encrypt: bool) -> Result<(), String> {
+    let layout = mbr::remotes::Layout::new(name, encrypt)?;
     if repo.db.remote(name)?.is_some() {
         return Err(format!("remote '{name}' already exists"));
     }
-    repo.configure_rclone()?;
-    let Some(backend) = mbr::backends::backend(backend) else {
+    let Some(backend) = mbr::backends::offered().find(|b| b.name == backend) else {
         return Err(format!(
             "unknown backend '{backend}' (see `mbr remote types`)"
         ));
     };
+    let mut state = AppState::load();
+    let password = master_password(repo, &mut state)?;
+    repo.configure_rclone()?;
+    layout.check_unused()?;
 
-    println!("Configuring rclone remote '{name}' ({})", backend.title);
+    println!("Setting up remote '{name}' ({})", backend.title);
     println!("{}", backend.description);
+    if !encrypt {
+        println!("WARNING: files will be stored unencrypted; whoever runs the remote can read them");
+    }
 
     // Ask the hardcoded form fields, then hand everything to rclone in one go.
     let mut values: Vec<String> = Vec::new();
@@ -429,10 +428,13 @@ fn remote_setup(repo: &mut Repo, name: &str, backend: &str) -> Result<(), String
     }
     let spec = mbr::backends::target_spec(backend, &values);
     mbr::backends::check_target_spec(backend, &spec)?;
-    let target = mbr::backends::target_for(name, backend, &spec);
+    let location = mbr::remotes::location(&spec, &repo.folder_id()?);
+    let target = layout.target(&location);
+    let section = layout.backend_section();
 
     let parameters = mbr::backends::form_parameters(backend, &values);
-    let mut outcome = mbr::rclone::begin_setup(name, backend.name, parameters.clone())?;
+    let begun = mbr::rclone::begin_setup(&section, backend.name, parameters.clone());
+    let mut outcome = layout.finish(begun, &location, &password)?;
     // Anything rclone still asks (OAuth, verification) goes through the
     // generic question protocol.
     while let mbr::rclone::SetupOutcome::Question(question) = outcome {
@@ -445,21 +447,22 @@ fn remote_setup(repo: &mut Repo, name: &str, backend: &str) -> Result<(), String
         let answer = match answer {
             Ok(answer) => answer,
             Err(e) => {
-                mbr::rclone::cancel_setup(name, &question.state).ok();
+                mbr::rclone::cancel_setup(&section, &question.state).ok();
                 return Err(e);
             }
         };
-        outcome = mbr::rclone::continue_setup_watching(
-            name,
+        let step = mbr::rclone::continue_setup_watching(
+            &section,
             &question.state,
             &answer,
             parameters.clone(),
             &mut |url| println!("\nIf your browser didn't open, open this link:\n  {url}\n"),
-        )?;
+        );
+        outcome = layout.finish(step, &location, &password)?;
     }
 
     repo.db.add_remote(name, &target)?;
-    println!("added remote {name} -> {target}");
+    println!("added remote {name} ({})", mbr::remotes::describe(&target));
     Ok(())
 }
 
@@ -486,7 +489,7 @@ fn prompt(label: &str, default: &str) -> Result<String, String> {
 
 fn remote_rm(repo: &mut Repo, name: &str) -> Result<(), String> {
     lookup_remote(repo, name)?;
-    repo.db.remove_remote(name)?;
+    repo.remove_remote(name)?;
     println!("removed remote {name}");
     Ok(())
 }
@@ -506,7 +509,8 @@ fn remote_ls(repo: &mut Repo) -> Result<(), String> {
         } else {
             String::new()
         };
-        println!("{:<16} {}  ({count} blob(s){missing})", r.name, r.target);
+        let protection = mbr::remotes::describe(&r.target);
+        println!("{:<16} {protection}  ({count} blob(s){missing})", r.name);
     }
     Ok(())
 }
@@ -526,14 +530,14 @@ fn is_secret_key(backend: &str, key: &str) -> bool {
 fn remote_show(repo: &mut Repo, name: &str) -> Result<(), String> {
     let remote = lookup_remote(repo, name)?;
     println!("name:    {}", remote.name);
-    println!("target:  {}", remote.target);
+    println!("storage: {}", mbr::remotes::describe(&remote.target));
     println!("blobs:   {} recorded", repo.db.blobs_on_remote(name)?.len());
-    let Some(section) = mbr::rclone::target_section(&remote.target) else {
-        println!("(target is a plain path; no rclone settings)");
+    let Some(section) = mbr::remotes::settings_section(&remote.target) else {
+        println!("(a plain path; no rclone settings)");
         return Ok(());
     };
-    let Some(config) = repo.with_rclone(|| mbr::rclone::remote_config(section))? else {
-        println!("(no rclone remote '{section}' in this folder's rclone.conf)");
+    let Some(config) = repo.with_rclone(|| mbr::rclone::remote_config(&section))? else {
+        println!("(its rclone settings are missing from this folder's rclone.conf)");
         return Ok(());
     };
     let backend = config
@@ -541,7 +545,7 @@ fn remote_show(repo: &mut Repo, name: &str) -> Result<(), String> {
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_owned();
-    println!("rclone remote '{section}' ({backend}):");
+    println!("backend: {backend}");
     for (key, value) in &config {
         if key == "type" {
             continue;
@@ -560,17 +564,15 @@ fn remote_edit(
     repo: &mut Repo,
     name: &str,
     rename: Option<String>,
-    target: Option<String>,
     set: &[String],
 ) -> Result<(), String> {
     let remote = lookup_remote(repo, name)?;
     let new_name = rename.unwrap_or_else(|| remote.name.clone());
-    let new_target = target.unwrap_or_else(|| remote.target.clone());
-    if new_name.trim().is_empty() || new_target.trim().is_empty() {
-        return Err("name and target must not be empty".to_owned());
+    if new_name != remote.name {
+        mbr::remotes::check_name(&new_name)?;
     }
-    if new_name == remote.name && new_target == remote.target && set.is_empty() {
-        return Err("nothing to change (see --rename, --target, --set)".to_owned());
+    if new_name == remote.name && set.is_empty() {
+        return Err("nothing to change (see --rename, --set)".to_owned());
     }
 
     if !set.is_empty() {
@@ -581,17 +583,16 @@ fn remote_edit(
             };
             parameters.insert(key.trim().to_owned(), value.into());
         }
-        let section = mbr::rclone::target_section(&new_target)
-            .ok_or_else(|| format!("target '{new_target}' names no rclone remote to configure"))?
-            .to_owned();
+        let section = mbr::remotes::settings_section(&remote.target)
+            .ok_or_else(|| format!("remote '{name}' has no rclone settings"))?;
         repo.with_rclone(|| {
             mbr::rclone::update_remote(&section, serde_json::Value::Object(parameters))
         })?;
-        println!("updated rclone remote '{section}'");
+        println!("updated the settings of '{name}'");
     }
-    if new_name != remote.name || new_target != remote.target {
-        repo.db.update_remote(&remote.name, &new_name, &new_target)?;
-        println!("remote {new_name} -> {new_target}");
+    if new_name != remote.name {
+        repo.db.update_remote(&remote.name, &new_name, &remote.target)?;
+        println!("renamed remote {name} to {new_name}");
     }
     Ok(())
 }
@@ -615,7 +616,7 @@ fn remote_scan(repo: &mut Repo, names: &[String]) -> Result<(), String> {
             Ok(check) => print_remote_check(remote, &check),
             Err(e) => {
                 failed += 1;
-                println!("remote '{}' ({}): FAILED: {e}", remote.name, remote.target);
+                println!("remote '{}': FAILED: {e}", remote.name);
             }
         }
     }
@@ -626,7 +627,7 @@ fn remote_scan(repo: &mut Repo, names: &[String]) -> Result<(), String> {
 }
 
 fn print_remote_check(remote: &Remote, check: &mbr::repo::RemoteCheck) {
-    println!("remote '{}' ({}) is reachable", remote.name, remote.target);
+    println!("remote '{}' is reachable", remote.name);
     println!("  {} expected blob(s) present", check.present.len());
     for hash in &check.missing {
         println!("  MISSING: {} (was recorded there; record dropped)", hash);
@@ -930,7 +931,7 @@ fn metadata_status(repo: &mut Repo) -> Result<(), String> {
         if state.password_check.is_some() {
             "set"
         } else {
-            "not set (`mbr metadata password`)"
+            "not set (`mbr config password`)"
         }
     );
     let remotes = repo.db.metadata_remotes()?;
@@ -968,8 +969,8 @@ fn metadata_use(repo: &mut Repo, remotes: &[String], enabled: bool) -> Result<()
 /// Ask for a new master password, twice.
 fn prompt_new_password() -> Result<String, String> {
     println!(
-        "The master password encrypts the metadata backups. Without it they can't be read: \
-         there is no way to recover it."
+        "The master password encrypts your remotes and the metadata backups. Without it \
+         they can't be read: there is no way to recover it. Write it down."
     );
     let password =
         rpassword::prompt_password("new master password: ").map_err(|e| e.to_string())?;
@@ -981,44 +982,46 @@ fn prompt_new_password() -> Result<String, String> {
     Ok(password)
 }
 
-/// The master password of this folder: asked and checked, or set now.
+/// The master password of this folder: saved on this machine, or asked
+/// for once (and saved) if only its check is known.
 fn master_password(repo: &Repo, state: &mut AppState) -> Result<String, String> {
-    let saved = state.repo(&repo.root).password_check;
-    match saved {
-        Some(check) => {
-            let password =
-                rpassword::prompt_password("master password: ").map_err(|e| e.to_string())?;
-            if !metadata::password_matches(&check, &password) {
-                return Err("wrong master password".to_owned());
-            }
-            Ok(password)
-        }
-        None => {
-            let password = prompt_new_password()?;
-            state.repo_mut(&repo.root).password_check = Some(metadata::password_check(&password)?);
-            state.save()?;
-            Ok(password)
-        }
+    let saved = state.repo(&repo.root);
+    if let Some(password) = saved.password {
+        return Ok(password);
     }
+    let Some(check) = saved.password_check else {
+        return Err("set a master password first: `mbr config password`".to_owned());
+    };
+    let password = rpassword::prompt_password("master password: ").map_err(|e| e.to_string())?;
+    if !metadata::password_matches(&check, &password) {
+        return Err("wrong master password".to_owned());
+    }
+    state.repo_mut(&repo.root).set_password(&password)?;
+    state.save()?;
+    Ok(password)
 }
 
-fn metadata_password(repo: &mut Repo) -> Result<(), String> {
+fn config_password(repo: &mut Repo) -> Result<(), String> {
     let mut state = AppState::load();
-    if let Some(check) = state.repo(&repo.root).password_check {
-        let current =
-            rpassword::prompt_password("current master password: ").map_err(|e| e.to_string())?;
-        if !metadata::password_matches(&check, &current) {
-            return Err("wrong master password".to_owned());
+    let had_one = state.repo(&repo.root).password_check.is_some();
+    if had_one {
+        let encrypted = repo.encrypted_remotes()?;
+        if !encrypted.is_empty() {
+            return Err(format!(
+                "the master password can't change: remotes {} are encrypted with it",
+                encrypted.join(", ")
+            ));
         }
+        master_password(repo, &mut state)?;
     }
     let password = prompt_new_password()?;
     let repo_state = state.repo_mut(&repo.root);
-    repo_state.password_check = Some(metadata::password_check(&password)?);
+    repo_state.set_password(&password)?;
     // Existing backups still use the old password until replaced.
     let stale = !repo_state.metadata_backups.is_empty();
     repo_state.metadata_backups.clear();
     state.save()?;
-    println!("master password set");
+    println!("master password set and saved on this machine");
     if stale {
         println!("existing backups still use the old one: run `mbr metadata backup`");
     }
@@ -1069,9 +1072,20 @@ fn metadata_restore(repo: &mut Repo, remote_name: &str) -> Result<(), String> {
     let remote = lookup_remote(repo, remote_name)?;
     let scratch = repo.scratch_dir();
     let sealed = repo.with_rclone(|| metadata::download(&remote.target, &scratch))?;
-    let password = rpassword::prompt_password("master password: ").map_err(|e| e.to_string())?;
+    let saved = AppState::load().repo(&repo.root).password;
     println!("decrypting…");
-    let (db, conf) = metadata::unseal(&sealed, &password)?;
+    let unsealed = saved
+        .as_deref()
+        .map(|password| (password.to_owned(), metadata::unseal(&sealed, password)));
+    let (password, (db, conf)) = match unsealed {
+        Some((password, Ok(plain))) => (password, plain),
+        _ => {
+            let password = rpassword::prompt_password("the backup's master password: ")
+                .map_err(|e| e.to_string())?;
+            let plain = metadata::unseal(&sealed, &password)?;
+            (password, plain)
+        }
+    };
     let report = repo.restore_metadata(&db, &conf)?;
 
     // A folder without a password adopts the backup's; one with its own
@@ -1079,7 +1093,7 @@ fn metadata_restore(repo: &mut Repo, remote_name: &str) -> Result<(), String> {
     let mut state = AppState::load();
     let repo_state = state.repo_mut(&repo.root);
     if repo_state.password_check.is_none() {
-        repo_state.password_check = Some(metadata::password_check(&password)?);
+        repo_state.set_password(&password)?;
         state.save()?;
     }
 
@@ -1088,7 +1102,7 @@ fn metadata_restore(repo: &mut Repo, remote_name: &str) -> Result<(), String> {
         report.files, report.remotes, report.history
     );
     for name in &report.conflicts {
-        println!("  kept this folder's target for remote '{name}' (the backup's differs)");
+        println!("  kept this folder's settings for remote '{name}' (the backup's differ)");
     }
     for (path, why) in &report.skipped {
         println!("  skipped {path}: {why}");
