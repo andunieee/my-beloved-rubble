@@ -1,8 +1,10 @@
 //! `my-beloved-rubble` — the Slint GUI.
 //!
-//! Two tabs: **Blobs** (the annotated file listing, with multi-selection
-//! and a sidebar acting on the selected blobs) and **Remotes** (listing,
-//! scanning, downloading from, adding, setting up and editing remotes).
+//! Three tabs: **Blobs** (the annotated file listing, with multi-selection
+//! and a sidebar acting on the selected blobs), **Remotes** (listing,
+//! scanning, downloading from, adding, setting up and editing remotes) and
+//! **Metadata backup** (the master password, which remotes receive the
+//! encrypted database, and restoring a lost folder from one of them).
 //!
 //! Slow work — rclone operations (push / fetch / list / stat / config) and
 //! the filesystem half of a scan (hashing, moving files into the store) —
@@ -10,10 +12,13 @@
 //! drained by a UI timer, so the window stays responsive; database writes
 //! always happen on the UI thread.
 
+use age::secrecy::{ExposeSecret, SecretString};
 use mbr::backends::{self, Backend, Field, Kind};
 use mbr::db::Remote;
+use mbr::metadata;
 use mbr::rclone::RemoteBlob;
-use mbr::repo::{self, Repo};
+use mbr::repo::{self, DropOutcome, LocalHealth, RemoteHealth, Repo};
+use mbr::state::{AppState, BackupRecord};
 use mbr::util;
 use slint::{Model, ModelRc, SharedString, VecModel};
 use std::cell::{Cell, RefCell};
@@ -69,6 +74,37 @@ enum Msg {
     OAuthUrl(String),
     /// The user aborted an in-progress configuration.
     Cancelled { result: Result<(), String> },
+    /// A metadata backup of the folder at `root` was uploaded to `remote`
+    /// (or not); on success, record when, and which database state.
+    MetadataUploaded {
+        root: PathBuf,
+        remote: String,
+        db_hash: String,
+        result: Result<(), String>,
+    },
+    /// A metadata backup was downloaded and decrypted; on success, restore
+    /// it into the folder at `root`.
+    MetadataFetched {
+        root: PathBuf,
+        password: SecretString,
+        result: Result<(Vec<u8>, Vec<u8>), String>,
+    },
+    /// An attempt to drop the local copy of a blob of `size` bytes.
+    Dropped {
+        size: u64,
+        result: Result<DropOutcome, String>,
+    },
+    /// A local copy was re-hashed.
+    VerifiedLocal {
+        hash: String,
+        result: Result<LocalHealth, String>,
+    },
+    /// A remote's copy was downloaded and checked.
+    VerifiedRemote {
+        remote: String,
+        hash: String,
+        result: Result<RemoteHealth, String>,
+    },
     /// The rclone settings of the remote being edited were read.
     RemoteConfig {
         remote: String,
@@ -197,6 +233,10 @@ struct App {
     files: Rc<VecModel<FileRow>>,
     selection: RefCell<Selection>,
     edit: RefCell<Option<EditState>>,
+    /// Local app state (`state.json`), loaded on start.
+    state: RefCell<AppState>,
+    /// The open folder's master password, once unlocked this session.
+    password: RefCell<Option<SecretString>>,
 }
 
 fn main() -> Result<(), slint::PlatformError> {
@@ -216,6 +256,8 @@ fn main() -> Result<(), slint::PlatformError> {
         files,
         selection: RefCell::new(Selection::default()),
         edit: RefCell::new(None),
+        state: RefCell::new(AppState::load()),
+        password: RefCell::new(None),
     });
 
     // ── message pump for background tasks ──
@@ -398,6 +440,121 @@ fn main() -> Result<(), slint::PlatformError> {
         w.on_cancel_remote_setup(move || app.cancel_remote_setup());
     }
 
+    // keeping copies safe
+    {
+        let app = app.clone();
+        w.on_drop_selected(move || {
+            let hashes = app.selected_hashes();
+            app.drop_blobs(hashes);
+        });
+    }
+    {
+        let app = app.clone();
+        w.on_verify_selected(move || {
+            let hashes = app.selected_hashes();
+            app.verify_local(hashes);
+        });
+    }
+    {
+        let app = app.clone();
+        w.on_verify_selected_on(move |remote| {
+            let hashes = app.selected_hashes();
+            app.verify_on_remote(&remote, hashes);
+        });
+    }
+    {
+        let app = app.clone();
+        w.on_verify_all_local(move || {
+            let hashes = {
+                let mut repo = app.repo.borrow_mut();
+                let Some(repo) = repo.as_mut() else { return };
+                match repo.db.list_blobs() {
+                    Ok(blobs) => blobs
+                        .into_iter()
+                        .map(|b| b.hash)
+                        .filter(|h| repo.blob_present(h))
+                        .collect(),
+                    Err(e) => {
+                        app.status(format!("Error: {e}"));
+                        return;
+                    }
+                }
+            };
+            app.verify_local(hashes);
+        });
+    }
+    {
+        let app = app.clone();
+        w.on_clean_up_old(move || {
+            let hashes = {
+                let mut repo = app.repo.borrow_mut();
+                let Some(repo) = repo.as_mut() else { return };
+                match repo.unreferenced_blobs() {
+                    Ok(old) => old
+                        .into_iter()
+                        .filter(|u| u.present_locally)
+                        .map(|u| u.hash)
+                        .collect(),
+                    Err(e) => {
+                        app.status(format!("Error: {e}"));
+                        return;
+                    }
+                }
+            };
+            app.drop_blobs(hashes);
+        });
+    }
+    {
+        let app = app.clone();
+        w.on_set_min_copies(move |n| {
+            app.with_repo("change copies", |repo| {
+                repo.set_min_copies(n.max(1) as u32)?;
+                Ok(format!("Keeping at least {n} copies of every file"))
+            });
+            app.refresh();
+        });
+    }
+
+    // metadata backup
+    {
+        let app = app.clone();
+        w.on_toggle_metadata_remote(move |name, enabled| {
+            app.with_repo("choose remote", |repo| {
+                repo.db.set_metadata_remote(&name, enabled)?;
+                Ok(if enabled {
+                    format!("Metadata will be backed up to {name}")
+                } else {
+                    format!("Metadata will no longer be backed up to {name}")
+                })
+            });
+            app.refresh();
+        });
+    }
+    {
+        let app = app.clone();
+        w.on_set_password(move |password, repeat| app.set_password(&password, &repeat));
+    }
+    {
+        let app = app.clone();
+        w.on_unlock(move |password| app.unlock(&password));
+    }
+    {
+        let app = app.clone();
+        w.on_lock(move || {
+            *app.password.borrow_mut() = None;
+            app.status("Locked: the master password was forgotten");
+            app.refresh();
+        });
+    }
+    {
+        let app = app.clone();
+        w.on_backup_metadata(move || app.backup_metadata());
+    }
+    {
+        let app = app.clone();
+        w.on_restore_metadata(move |remote, password| app.restore_metadata(&remote, &password));
+    }
+
     // ── backend picker + initial form ──
     let titles: Vec<SharedString> = backends::BACKENDS
         .iter()
@@ -410,7 +567,8 @@ fn main() -> Result<(), slint::PlatformError> {
     }
 
     // ── reopen last folder ──
-    if let Some(dir) = load_last_folder() {
+    let last = app.state.borrow().last_folder.clone();
+    if let Some(dir) = last.filter(|dir| dir.join(repo::DB_FILE).is_file()) {
         app.attach(dir);
     }
 
@@ -463,7 +621,9 @@ impl App {
         }
         match Repo::init(&dir) {
             Ok(repo) => {
-                save_last_folder(&repo.root);
+                self.state.borrow_mut().last_folder = Some(repo.root.clone());
+                self.save_state();
+                *self.password.borrow_mut() = None;
                 *self.repo.borrow_mut() = Some(repo);
                 *self.selection.borrow_mut() = Selection::default();
                 self.close_editor();
@@ -648,6 +808,314 @@ impl App {
             return;
         }
         self.fetch_blobs(jobs);
+    }
+
+    // ── keeping copies safe ──
+
+    /// Drop the local copies of `hashes` that enough remotes hold.
+    fn drop_blobs(&self, hashes: Vec<String>) {
+        let (jobs, min_copies, root) = {
+            let mut repo = self.repo.borrow_mut();
+            let Some(repo) = repo.as_mut() else { return };
+            let min_copies = match repo.min_copies() {
+                Ok(n) => n,
+                Err(e) => {
+                    self.status(format!("Error: {e}"));
+                    return;
+                }
+            };
+            let jobs: Vec<(String, Vec<Remote>, u64)> = hashes
+                .into_iter()
+                .filter_map(|h| {
+                    let size = std::fs::metadata(repo.blob_path(&h)).ok()?.len();
+                    Some((h.clone(), repo.holders(&h).unwrap_or_default(), size))
+                })
+                .collect();
+            (jobs, min_copies, repo.root.clone())
+        };
+        let Some(config_path) = self.config_path() else { return };
+        if jobs.is_empty() {
+            self.status("None of these blobs is present locally; nothing to free");
+            return;
+        }
+        self.status(format!(
+            "Checking the remotes of {} blob(s) before freeing space…",
+            jobs.len()
+        ));
+        self.spawn(move |tx| {
+            let total = jobs.len();
+            let (mut dropped, mut freed) = (0, 0);
+            let configured = mbr::rclone::with_config(&config_path, || {
+                for (hash, holders, size) in jobs {
+                    let result = repo::drop_local_blob(&root, &hash, &holders, min_copies);
+                    if result.as_ref().is_ok_and(|o| o.dropped) {
+                        dropped += 1;
+                        freed += size;
+                    }
+                    tx.send(Msg::Dropped { size, result }).ok();
+                }
+                Ok(())
+            });
+            let mut text = format!("Freed {} ({dropped} blob(s))", util::format_size(freed));
+            if dropped < total {
+                text += &format!(
+                    "; kept {} that fewer than {min_copies} remote(s) are confirmed to hold",
+                    total - dropped
+                );
+            }
+            if let Err(e) = configured {
+                text += &format!("; error: {e}");
+            }
+            tx.send(Msg::Status(text)).ok();
+        });
+    }
+
+    /// Re-hash the local copies of `hashes`.
+    fn verify_local(&self, hashes: Vec<String>) {
+        let Some(root) = self.repo.borrow().as_ref().map(|r| r.root.clone()) else {
+            return;
+        };
+        if hashes.is_empty() {
+            self.status("Nothing stored here to verify");
+            return;
+        }
+        self.status(format!("Verifying {} local blob(s)…", hashes.len()));
+        self.spawn(move |tx| {
+            let total = hashes.len();
+            let mut damaged = 0;
+            for hash in hashes {
+                let result = repo::verify_local_blob(&root, &hash);
+                if matches!(result, Ok(LocalHealth::Corrupt { .. })) {
+                    damaged += 1;
+                }
+                tx.send(Msg::VerifiedLocal { hash, result }).ok();
+            }
+            tx.send(Msg::Status(if damaged == 0 {
+                format!("Verified {total} blob(s): all intact")
+            } else {
+                format!(
+                    "Verified {total} blob(s): {damaged} DAMAGED, set aside in {} — download them again",
+                    repo::CORRUPT_DIR
+                )
+            }))
+            .ok();
+        });
+    }
+
+    /// Download the copies of `hashes` on `remote_name` and check them.
+    fn verify_on_remote(&self, remote_name: &str, hashes: Vec<String>) {
+        let (Some(remote), Some(config_path)) = (self.remote(remote_name), self.config_path())
+        else {
+            return;
+        };
+        let Some(root) = self.repo.borrow().as_ref().map(|r| r.root.clone()) else {
+            return;
+        };
+        self.status(format!(
+            "Downloading {} blob(s) from '{remote_name}' to verify them…",
+            hashes.len()
+        ));
+        self.spawn(move |tx| {
+            let (mut ok, mut missing, mut corrupt) = (0, 0, 0);
+            let mut failed = None;
+            let configured = mbr::rclone::with_config(&config_path, || {
+                for hash in hashes {
+                    let result = repo::verify_remote_blob(&root, &remote.target, &hash);
+                    match &result {
+                        Ok(RemoteHealth::Ok) => ok += 1,
+                        Ok(RemoteHealth::Missing) => missing += 1,
+                        Ok(RemoteHealth::Corrupt) => corrupt += 1,
+                        Err(e) => {
+                            failed.get_or_insert_with(|| e.clone());
+                        }
+                    }
+                    tx.send(Msg::VerifiedRemote {
+                        remote: remote.name.clone(),
+                        hash,
+                        result,
+                    })
+                    .ok();
+                }
+                Ok(())
+            });
+            let mut text = format!("'{}': {ok} intact, {missing} missing", remote.name);
+            if corrupt > 0 {
+                text += &format!(", {corrupt} DAMAGED (deleted there; upload them again)");
+            }
+            if let Some(e) = configured.err().or(failed) {
+                text += &format!("; error: {e}");
+            }
+            tx.send(Msg::Status(text)).ok();
+        });
+    }
+
+    // ── metadata backup ──
+
+    fn save_state(&self) {
+        if let Err(e) = self.state.borrow().save() {
+            self.status(format!("Could not save app state: {e}"));
+        }
+    }
+
+    fn root(&self) -> Option<PathBuf> {
+        self.repo.borrow().as_ref().map(|r| r.root.clone())
+    }
+
+    /// Set the master password, or change it once unlocked.
+    fn set_password(&self, password: &str, repeat: &str) {
+        let Some(root) = self.root() else { return };
+        let had_one = self.state.borrow().repo(&root).password_check.is_some();
+        if had_one && self.password.borrow().is_none() {
+            self.status("Unlock with the current master password first");
+            return;
+        }
+        if let Err(e) = metadata::check_new_password(password) {
+            self.status(format!("Error: {e}"));
+            return;
+        }
+        if password != repeat {
+            self.status("Error: the passwords differ");
+            return;
+        }
+        let check = match metadata::password_check(password) {
+            Ok(check) => check,
+            Err(e) => {
+                self.status(format!("Error: {e}"));
+                return;
+            }
+        };
+        {
+            let mut state = self.state.borrow_mut();
+            let repo_state = state.repo_mut(&root);
+            repo_state.password_check = Some(check);
+            // Backups made so far are encrypted with the old password.
+            repo_state.metadata_backups.clear();
+        }
+        self.save_state();
+        *self.password.borrow_mut() = Some(SecretString::from(password.to_owned()));
+        self.window.set_pw_new(SharedString::default());
+        self.window.set_pw_repeat(SharedString::default());
+        self.status(if had_one {
+            "Master password changed; back up again to re-encrypt the backups with it"
+        } else {
+            "Master password set"
+        });
+        self.refresh();
+    }
+
+    fn unlock(&self, password: &str) {
+        let Some(root) = self.root() else { return };
+        let Some(check) = self.state.borrow().repo(&root).password_check else {
+            return;
+        };
+        if !metadata::password_matches(&check, password) {
+            self.status("Wrong master password");
+            return;
+        }
+        *self.password.borrow_mut() = Some(SecretString::from(password.to_owned()));
+        self.window.set_pw_entry(SharedString::default());
+        self.status("Unlocked");
+        self.refresh();
+    }
+
+    /// Snapshot the metadata here, then encrypt and upload it to every
+    /// chosen remote in the background.
+    fn backup_metadata(&self) {
+        let Some(password) = self.password.borrow().clone() else {
+            self.status("Unlock with the master password first");
+            return;
+        };
+        let (remotes, snapshot, root, scratch) = {
+            let mut repo = self.repo.borrow_mut();
+            let Some(repo) = repo.as_mut() else { return };
+            let prepared = repo
+                .db
+                .metadata_remotes()
+                .and_then(|remotes| Ok((remotes, repo.metadata_snapshot()?)));
+            match prepared {
+                Ok((remotes, snapshot)) => {
+                    (remotes, snapshot, repo.root.clone(), repo.scratch_dir())
+                }
+                Err(e) => {
+                    self.status(format!("Error: {e}"));
+                    return;
+                }
+            }
+        };
+        let Some(config_path) = self.config_path() else { return };
+        if remotes.is_empty() {
+            self.status("Tick at least one remote to back up to");
+            return;
+        }
+        self.status("Encrypting metadata…");
+        self.spawn(move |tx| {
+            let sealed = match metadata::seal(&snapshot, password.expose_secret()) {
+                Ok(sealed) => sealed,
+                Err(e) => {
+                    tx.send(Msg::Status(format!("Metadata backup failed: {e}"))).ok();
+                    return;
+                }
+            };
+            let total = remotes.len();
+            let mut done = 0;
+            let configured = mbr::rclone::with_config(&config_path, || {
+                for remote in remotes {
+                    let result = metadata::upload(&remote.target, &sealed, &scratch);
+                    if result.is_ok() {
+                        done += 1;
+                    }
+                    tx.send(Msg::MetadataUploaded {
+                        root: root.clone(),
+                        remote: remote.name,
+                        db_hash: snapshot.db_hash.clone(),
+                        result,
+                    })
+                    .ok();
+                }
+                Ok(())
+            });
+            let mut text = format!("Metadata backed up to {done} of {total} remote(s)");
+            if let Err(e) = configured {
+                text += &format!("; error: {e}");
+            }
+            tx.send(Msg::Status(text)).ok();
+        });
+    }
+
+    /// Download and decrypt the backup on `remote_name` in the background;
+    /// it is restored when it arrives (see [`Msg::MetadataFetched`]).
+    fn restore_metadata(&self, remote_name: &str, password: &str) {
+        let Some(remote) = self.remote(remote_name) else { return };
+        let (root, scratch) = {
+            let mut repo = self.repo.borrow_mut();
+            let Some(repo) = repo.as_mut() else { return };
+            match repo.is_empty_folder() {
+                Ok(true) => (repo.root.clone(), repo.scratch_dir()),
+                Ok(false) => {
+                    self.status("Metadata can only be restored into a folder that tracks no files yet");
+                    return;
+                }
+                Err(e) => {
+                    self.status(format!("Error: {e}"));
+                    return;
+                }
+            }
+        };
+        let Some(config_path) = self.config_path() else { return };
+        let password = SecretString::from(password.to_owned());
+        self.status(format!("Fetching the metadata backup from '{remote_name}'…"));
+        self.spawn(move |tx| {
+            let result = mbr::rclone::with_config(&config_path, || {
+                metadata::download(&remote.target, &scratch)
+            })
+            .and_then(|sealed| metadata::unseal(&sealed, password.expose_secret()));
+            tx.send(Msg::MetadataFetched {
+                root,
+                password,
+                result,
+            })
+            .ok();
+        });
     }
 
     // ── background tasks ──
@@ -1329,6 +1797,111 @@ impl App {
                     self.status(format!("Note: {e}"));
                 }
             }
+            Msg::MetadataUploaded {
+                root,
+                remote,
+                db_hash,
+                result,
+            } => match result {
+                Ok(()) => {
+                    self.state.borrow_mut().repo_mut(&root).metadata_backups.insert(
+                        remote.clone(),
+                        BackupRecord {
+                            at: util::now(),
+                            db_hash,
+                        },
+                    );
+                    self.save_state();
+                    self.status(format!("Metadata backed up to {remote}"));
+                }
+                Err(e) => self.status(format!("Metadata backup to {remote} failed: {e}")),
+            },
+            Msg::MetadataFetched {
+                root,
+                password,
+                result,
+            } => {
+                if self.root().as_ref() != Some(&root) {
+                    return; // another folder was opened meanwhile
+                }
+                let (db, conf) = match result {
+                    Ok(plain) => plain,
+                    Err(e) => {
+                        self.status(format!("Restore failed: {e}"));
+                        return;
+                    }
+                };
+                let mut restored = false;
+                self.with_repo("restore", |repo| {
+                    let report = repo.restore_metadata(&db, &conf)?;
+                    restored = true;
+                    let mut text = format!(
+                        "Restored {} file(s) and {} remote(s); download the files from the Remotes tab",
+                        report.files, report.remotes
+                    );
+                    if !report.skipped.is_empty() {
+                        text += &format!("; {} skipped", report.skipped.len());
+                    }
+                    Ok(text)
+                });
+                if restored {
+                    if let Ok(check) = metadata::password_check(password.expose_secret()) {
+                        self.state.borrow_mut().repo_mut(&root).password_check = Some(check);
+                        self.save_state();
+                    }
+                    *self.password.borrow_mut() = Some(password);
+                    self.window.set_pw_restore(SharedString::default());
+                }
+            }
+            Msg::Dropped { size, result } => match result {
+                Ok(outcome) => {
+                    let min_copies = self
+                        .repo
+                        .borrow_mut()
+                        .as_mut()
+                        .and_then(|r| r.min_copies().ok())
+                        .unwrap_or(repo::DEFAULT_MIN_COPIES);
+                    self.with_repo("record drop", |repo| {
+                        repo.record_drop(&outcome)?;
+                        Ok(if outcome.dropped {
+                            format!(
+                                "Freed {} ({} is on {})",
+                                util::format_size(size),
+                                util::short_hash(&outcome.hash),
+                                outcome.verified.join(", ")
+                            )
+                        } else {
+                            outcome.kept_reason(min_copies)
+                        })
+                    });
+                }
+                Err(e) => self.status(format!("Could not free space: {e}")),
+            },
+            Msg::VerifiedLocal { hash, result } => match result {
+                Ok(LocalHealth::Corrupt { moved_to }) => self.status(format!(
+                    "{} is DAMAGED; moved to {}",
+                    util::short_hash(&hash),
+                    moved_to.display()
+                )),
+                Ok(_) => self.status(format!("{} verified", util::short_hash(&hash))),
+                Err(e) => self.status(format!("Verifying failed: {e}")),
+            },
+            Msg::VerifiedRemote {
+                remote,
+                hash,
+                result,
+            } => match result {
+                Ok(health) => self.with_repo("record verification", |repo| {
+                    repo.record_remote_health(&remote, &hash, &health)?;
+                    let verdict = match health {
+                        RemoteHealth::Ok => "intact",
+                        RemoteHealth::Missing => "MISSING",
+                        RemoteHealth::Corrupt => "DAMAGED (deleted there)",
+                    };
+                    Ok(format!("{} is {verdict} on {remote}", util::short_hash(&hash)))
+                }),
+                Err(e) => self.status(format!("Verifying on {remote} failed: {e}")),
+            },
             Msg::Scanned { root, result } => {
                 self.scanning.set(false);
                 let current = self.repo.borrow().as_ref().map(|r| r.root.clone());
@@ -1376,6 +1949,8 @@ impl App {
         };
         self.window
             .set_folder(repo.root.display().to_string().into());
+        let min_copies = repo.min_copies().unwrap_or(repo::DEFAULT_MIN_COPIES);
+        self.window.set_min_copies(min_copies as i32);
 
         match repo.status() {
             Ok(statuses) => {
@@ -1384,8 +1959,9 @@ impl App {
                 selection.paths.retain(|p| listed.contains(p.as_str()));
                 let rows: Vec<FileRow> = statuses
                     .iter()
-                    .map(|s| file_row(s, selection.paths.contains(&s.path)))
+                    .map(|s| file_row(s, selection.paths.contains(&s.path), min_copies))
                     .collect();
+                self.window.set_at_risk_count(rows.iter().filter(|r| r.at_risk).count() as i32);
                 // Same model, new contents: the list keeps its scroll position.
                 self.files.set_vec(rows);
                 *self.statuses.borrow_mut() = statuses;
@@ -1422,7 +1998,85 @@ impl App {
             }
             Err(e) => self.status(format!("Error listing remotes: {e}")),
         }
+
+        match repo.unreferenced_blobs() {
+            Ok(old) => {
+                let here: Vec<_> = old.iter().filter(|u| u.present_locally).collect();
+                self.window.set_old_local_count(here.len() as i32);
+                self.window.set_old_local_size(
+                    util::format_size(here.iter().map(|u| u.size).sum()).into(),
+                );
+            }
+            Err(e) => self.status(format!("Error listing old versions: {e}")),
+        }
+
+        self.refresh_metadata(repo);
         self.show_selection();
+    }
+
+    /// Rebuild the Metadata backup tab.
+    fn refresh_metadata(&self, repo: &mut Repo) {
+        let w = &self.window;
+        let state = self.state.borrow().repo(&repo.root);
+        w.set_password_set(state.password_check.is_some());
+        w.set_unlocked(self.password.borrow().is_some());
+        w.set_folder_empty(repo.is_empty_folder().unwrap_or(false));
+
+        let (remotes, chosen) = match repo.db.list_remotes().and_then(|all| {
+            let chosen: HashSet<String> =
+                repo.db.metadata_remotes()?.into_iter().map(|r| r.name).collect();
+            Ok((all, chosen))
+        }) {
+            Ok(found) => found,
+            Err(e) => {
+                self.status(format!("Error listing metadata remotes: {e}"));
+                return;
+            }
+        };
+        let current = repo.db_hash().unwrap_or_default();
+        let rows: Vec<MetadataRow> = remotes
+            .iter()
+            .map(|r| {
+                let record = state.metadata_backups.get(&r.name);
+                let up_to_date = record.is_some_and(|b| b.db_hash == current);
+                let status = match record {
+                    None => "never backed up".to_owned(),
+                    Some(b) if up_to_date => format!("up to date · {}", util::format_time(b.at)),
+                    Some(b) => format!("out of date · last {}", util::format_time(b.at)),
+                };
+                MetadataRow {
+                    name: r.name.as_str().into(),
+                    target: r.target.as_str().into(),
+                    enabled: chosen.contains(&r.name),
+                    status: status.into(),
+                    up_to_date,
+                }
+            })
+            .collect();
+        let chosen_rows: Vec<&MetadataRow> = rows.iter().filter(|r| r.enabled).collect();
+        let latest = chosen_rows
+            .iter()
+            .filter_map(|r| state.metadata_backups.get(r.name.as_str()))
+            .map(|b| b.at)
+            .max();
+        let summary = match (chosen_rows.len(), latest) {
+            (0, _) => "Metadata is not backed up anywhere yet.".to_owned(),
+            (_, None) => "Metadata has never been backed up from this computer.".to_owned(),
+            (n, Some(at)) => {
+                let fresh = chosen_rows.iter().filter(|r| r.up_to_date).count();
+                if fresh == n {
+                    format!("Metadata is backed up and up to date (last backup {}).", util::format_time(at))
+                } else {
+                    format!(
+                        "Metadata changed since the last backup ({}): {fresh} of {n} remote(s) up to date.",
+                        util::format_time(at)
+                    )
+                }
+            }
+        };
+        w.set_metadata_summary(summary.into());
+        w.set_metadata_chosen(chosen_rows.len() as i32);
+        w.set_metadata_rows(ModelRc::new(VecModel::from(rows)));
     }
 }
 
@@ -1465,7 +2119,7 @@ fn form_field(field: &Field, value: &str, placeholder: &str) -> FormField {
     }
 }
 
-fn file_row(s: &repo::FileStatus, selected: bool) -> FileRow {
+fn file_row(s: &repo::FileStatus, selected: bool, min_copies: u32) -> FileRow {
     let versions = s
         .previous_versions
         .iter()
@@ -1493,26 +2147,8 @@ fn file_row(s: &repo::FileStatus, selected: bool) -> FileRow {
         past_names: s.past_names.join(", ").into(),
         versions: versions.into(),
         selected,
-    }
-}
-
-// ── remembering the last opened folder ──
-
-fn last_folder_file() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("mbr").join("last-folder"))
-}
-
-fn load_last_folder() -> Option<PathBuf> {
-    let path = PathBuf::from(std::fs::read_to_string(last_folder_file()?).ok()?.trim());
-    path.join(repo::DB_FILE).is_file().then_some(path)
-}
-
-fn save_last_folder(dir: &std::path::Path) {
-    if let Some(file) = last_folder_file() {
-        if let Some(parent) = file.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        std::fs::write(file, dir.display().to_string()).ok();
+        copies: s.copies() as i32,
+        at_risk: s.copies() < min_copies as usize,
     }
 }
 

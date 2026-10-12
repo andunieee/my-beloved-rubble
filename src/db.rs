@@ -1,12 +1,15 @@
 //! SQLite metadata store for a rubble folder.
 //!
-//! Four tables:
+//! Six tables:
 //! - `paths`: every name the folder has ever held — which blob it pointed
 //!   to, when it was added, and (once gone or replaced) when it was removed.
 //!   A path is *active* while `removed_at` is NULL.
 //! - `blobs`: content-addressed blobs (hash → size).
 //! - `remotes`: configured rclone remotes (name → rclone target).
 //! - `blob_remotes`: which blobs are known to be stored on which remotes.
+//! - `metadata_remotes`: remotes chosen to hold encrypted backups of this
+//!   database (see [`crate::metadata`]).
+//! - `settings`: folder-wide key → value settings (e.g. `min_copies`).
 //!
 //! minisqlite has no parameter binding, so every string value is inlined
 //! through [`quote`] (integers are inlined directly, which is always safe).
@@ -96,6 +99,25 @@ impl Db {
         Ok(db)
     }
 
+    /// A throwaway database, for when the real one has to be closed.
+    pub fn open_in_memory() -> Result<Self, String> {
+        let conn = Connection::open_in_memory().map_err(|e| e.to_string())?;
+        let mut db = Self { conn };
+        db.init_schema()?;
+        Ok(db)
+    }
+
+    /// Write a consistent copy of the whole database to `dest`, which must
+    /// not exist yet.
+    pub fn snapshot_to(&mut self, dest: &Path) -> Result<(), String> {
+        let dest = dest
+            .to_str()
+            .ok_or_else(|| format!("{} is not valid UTF-8", dest.display()))?;
+        self.conn
+            .execute(&format!("VACUUM INTO {}", quote(dest)))
+            .map_err(|e| e.to_string())
+    }
+
     fn init_schema(&mut self) -> Result<(), String> {
         self.conn
             .execute(
@@ -118,6 +140,13 @@ impl Db {
                     hash TEXT NOT NULL,
                     remote TEXT NOT NULL,
                     PRIMARY KEY (hash, remote)
+                );
+                CREATE TABLE IF NOT EXISTS metadata_remotes (
+                    name TEXT PRIMARY KEY
+                );
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
                 );",
             )
             .map_err(|e| e.to_string())
@@ -190,6 +219,18 @@ impl Db {
             .map_err(|e| e.to_string())
     }
 
+    /// Forget a blob entirely: its size and every remote record. Path rows
+    /// pointing at it stay, as history.
+    pub fn forget_blob(&mut self, hash: &str) -> Result<(), String> {
+        let q = quote(hash);
+        self.conn
+            .execute(&format!(
+                "DELETE FROM blob_remotes WHERE hash = {q};
+                 DELETE FROM blobs WHERE hash = {q}"
+            ))
+            .map_err(|e| e.to_string())
+    }
+
     pub fn has_blob(&mut self, hash: &str) -> Result<bool, String> {
         let sql = format!("SELECT 1 FROM blobs WHERE hash = {}", quote(hash));
         let r = self.conn.query(&sql).map_err(|e| e.to_string())?;
@@ -238,6 +279,7 @@ impl Db {
         self.conn
             .execute(&format!(
                 "DELETE FROM blob_remotes WHERE remote = {q};
+                 DELETE FROM metadata_remotes WHERE name = {q};
                  DELETE FROM remotes WHERE name = {q}"
             ))
             .map_err(|e| e.to_string())
@@ -257,7 +299,8 @@ impl Db {
             db.conn
                 .execute(&format!(
                     "UPDATE remotes SET name = {name}, target = {target} WHERE name = {old};
-                     UPDATE blob_remotes SET remote = {name} WHERE remote = {old}"
+                     UPDATE blob_remotes SET remote = {name} WHERE remote = {old};
+                     UPDATE metadata_remotes SET name = {name} WHERE name = {old}"
                 ))
                 .map_err(|e| e.to_string())
         })
@@ -343,6 +386,61 @@ impl Db {
         let r = self.conn.query(&sql).map_err(|e| e.to_string())?;
         Ok(r.rows.iter().filter_map(|row| as_text(&row[0])).collect())
     }
+
+    // ── metadata backup targets ──
+
+    /// Choose whether remote `name` receives metadata backups.
+    pub fn set_metadata_remote(&mut self, name: &str, enabled: bool) -> Result<(), String> {
+        if enabled && self.remote(name)?.is_none() {
+            return Err(format!("no remote named '{name}'"));
+        }
+        let q = quote(name);
+        let sql = if enabled {
+            format!("INSERT INTO metadata_remotes (name) VALUES ({q}) ON CONFLICT DO NOTHING")
+        } else {
+            format!("DELETE FROM metadata_remotes WHERE name = {q}")
+        };
+        self.conn.execute(&sql).map_err(|e| e.to_string())
+    }
+
+    /// Remotes chosen to receive metadata backups.
+    pub fn metadata_remotes(&mut self) -> Result<Vec<Remote>, String> {
+        let r = self
+            .conn
+            .query(
+                "SELECT r.name, r.target FROM remotes r
+                 JOIN metadata_remotes m ON m.name = r.name ORDER BY r.name",
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(r.rows
+            .iter()
+            .filter_map(|row| {
+                Some(Remote {
+                    name: as_text(&row[0])?,
+                    target: as_text(&row[1])?,
+                })
+            })
+            .collect())
+    }
+
+    // ── settings ──
+
+    pub fn setting(&mut self, key: &str) -> Result<Option<String>, String> {
+        let sql = format!("SELECT value FROM settings WHERE key = {}", quote(key));
+        let r = self.conn.query(&sql).map_err(|e| e.to_string())?;
+        Ok(r.rows.first().and_then(|row| as_text(&row[0])))
+    }
+
+    pub fn set_setting(&mut self, key: &str, value: &str) -> Result<(), String> {
+        self.conn
+            .execute(&format!(
+                "INSERT INTO settings (key, value) VALUES ({}, {})
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                quote(key),
+                quote(value)
+            ))
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -396,6 +494,35 @@ mod tests {
         // Retargeting alone keeps the name.
         db.update_remote("b", "b", "w:").unwrap();
         assert_eq!(db.remote("b").unwrap().unwrap().target, "w:");
+    }
+
+    #[test]
+    fn metadata_remotes_follow_renames_and_removals() {
+        let mut db = db();
+        assert!(db.set_metadata_remote("nope", true).is_err());
+        db.add_remote("a", "x:").unwrap();
+        db.add_remote("b", "y:").unwrap();
+        db.set_metadata_remote("a", true).unwrap();
+        db.set_metadata_remote("a", true).unwrap();
+        db.update_remote("a", "c", "x:").unwrap();
+        let names = |db: &mut Db| -> Vec<String> {
+            db.metadata_remotes().unwrap().into_iter().map(|r| r.name).collect()
+        };
+        assert_eq!(names(&mut db), ["c"]);
+        db.set_metadata_remote("b", true).unwrap();
+        db.remove_remote("c").unwrap();
+        assert_eq!(names(&mut db), ["b"]);
+        db.set_metadata_remote("b", false).unwrap();
+        assert!(names(&mut db).is_empty());
+    }
+
+    #[test]
+    fn settings_round_trip() {
+        let mut db = db();
+        assert_eq!(db.setting("k").unwrap(), None);
+        db.set_setting("k", "1").unwrap();
+        db.set_setting("k", "2").unwrap();
+        assert_eq!(db.setting("k").unwrap().as_deref(), Some("2"));
     }
 
     #[test]

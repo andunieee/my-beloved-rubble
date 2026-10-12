@@ -327,30 +327,62 @@ pub fn blob_path(hash: &str) -> String {
 
 /// Upload one blob file to `target`.
 pub fn push_blob(target: &str, blob_file: &Path, hash: &str) -> Result<(), String> {
+    upload_file(target, blob_file, &blob_path(hash))
+}
+
+/// Download one blob from `target` into `dest`.
+pub fn fetch_blob(target: &str, hash: &str, dest: &Path) -> Result<(), String> {
+    download_file(target, &blob_path(hash), dest)
+}
+
+/// Delete one blob from `target`. A blob that is already gone is fine.
+pub fn delete_blob(target: &str, hash: &str) -> Result<(), String> {
+    delete_file(target, &blob_path(hash))
+}
+
+/// Upload the local `file` to `target` as `remote_path`, replacing it.
+pub fn upload_file(target: &str, file: &Path, remote_path: &str) -> Result<(), String> {
     call(
         "operations/copyfile",
         json!({
-            "srcFs": blob_file.parent().unwrap_or_else(|| Path::new(".")).to_string_lossy(),
-            "srcRemote": blob_file.file_name().unwrap_or_default().to_string_lossy(),
+            "srcFs": file.parent().unwrap_or_else(|| Path::new(".")).to_string_lossy(),
+            "srcRemote": file.file_name().unwrap_or_default().to_string_lossy(),
             "dstFs": target,
-            "dstRemote": blob_path(hash),
+            "dstRemote": remote_path,
         }),
     )?;
     Ok(())
 }
 
-/// Download one blob from `target` into `dest`.
-pub fn fetch_blob(target: &str, hash: &str, dest: &Path) -> Result<(), String> {
+/// Download `remote_path` from `target` into the local file `dest`.
+pub fn download_file(target: &str, remote_path: &str, dest: &Path) -> Result<(), String> {
     call(
         "operations/copyfile",
         json!({
             "srcFs": target,
-            "srcRemote": blob_path(hash),
+            "srcRemote": remote_path,
             "dstFs": dest.parent().unwrap_or_else(|| Path::new(".")).to_string_lossy(),
             "dstRemote": dest.file_name().unwrap_or_default().to_string_lossy(),
         }),
     )?;
     Ok(())
+}
+
+/// Delete `remote_path` from `target`. A file that is already gone is fine.
+pub fn delete_file(target: &str, remote_path: &str) -> Result<(), String> {
+    match call(
+        "operations/deletefile",
+        json!({"fs": target, "remote": remote_path}),
+    ) {
+        Ok(_) => Ok(()),
+        Err(e) if is_not_found(&e) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether an rclone error means "no such file or directory".
+pub fn is_not_found(error: &str) -> bool {
+    error.contains("directory not found") || error.contains("object not found")
 }
 
 /// One blob found on a remote.
@@ -427,9 +459,7 @@ pub fn stat_blob(target: &str, hash: &str) -> Result<Option<u64>, String> {
     ) {
         Ok(result) => result,
         // The shard directories of a never-pushed blob may not exist.
-        Err(e) if e.contains("directory not found") || e.contains("object not found") => {
-            return Ok(None);
-        }
+        Err(e) if is_not_found(&e) => return Ok(None),
         Err(e) => return Err(e),
     };
     Ok(result

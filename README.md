@@ -9,7 +9,10 @@ Slint GUI.
 Attach mbr to any folder (`mbr init`, or "Open Folder" in the GUI). From
 then on, whenever the folder is inspected (a scan), every regular file in
 it is moved into a hidden content-addressed store and replaced by a
-symlink, so it still opens like a normal file:
+symlink, so it still opens like a normal file. Stored blobs are read-only:
+a program that writes into a file in place gets an error instead of
+silently changing content stored under its old hash (saving a new file
+over the name works, and is recorded as a new version):
 
 ```
 folder/
@@ -17,6 +20,8 @@ folder/
     blobs/fa/2e/fa2e38…(full sha256)   the actual content
     mbr.db                            sqlite metadata
     rclone.conf                       repository-local rclone config
+    corrupt/                          blobs that failed verification
+    tmp/                              scratch space
   fruits.png -> .mbr/blobs/fa/2e/fa2e38…
 ```
 
@@ -29,6 +34,8 @@ folder/
 - **blobs** — hash → size.
 - **remotes** — named rclone targets (e.g. `backup` → `s3:bucket/mbr`).
 - **blob_remotes** — which blobs are known to live on which remotes.
+- **metadata_remotes** — remotes chosen to hold metadata backups.
+- **settings** — folder settings, such as the minimum number of copies.
 
 For each file the UIs show: size, hash, whether the content is present
 locally (the filesystem is the source of truth for that), which remotes
@@ -75,6 +82,64 @@ found is recorded as stored there. Blobs the database has never heard of
 file, dangling until the blob is downloaded. Rename or move it like any
 other file.
 
+## Keeping files safe
+
+Each file has *copies*: the local blob, if present, plus every remote that
+stores it. The folder keeps a minimum number of copies (default 2; `mbr
+config min-copies N`, or the Remotes tab); files below it are flagged as
+at risk.
+
+- **Freeing space** (`mbr drop`, "Free up space"): removes local copies,
+  but only of blobs that at least *min-copies* remotes are confirmed to
+  hold right now. Each remote is asked directly rather than trusting the
+  records, and its size must match. The file stays listed (dangling) and
+  can be downloaded again.
+- **Verifying** (`mbr fsck`, "Verify"): re-hashes local blobs; one that no
+  longer matches is moved to `.mbr/corrupt/` so it counts as missing and
+  can be downloaded again. `--remote` (or "Verify on remote") downloads a
+  remote's copies to check them; a corrupt copy is deleted there, so
+  pushing again replaces it.
+- **Old versions and deleted files** (`mbr gc`, "Clean up old versions"):
+  blobs no current file points at. `gc` drops their local copies under the
+  same minimum-copies rule; `gc --purge [--older-than DAYS]` deletes them
+  everywhere, remotes included, after confirmation. Purging also deletes
+  them from remotes shared with other folders, so only purge blobs no other
+  folder uses.
+
+## Metadata backups
+
+Remotes store blobs by hash only: the names, folders and history of the
+files live in `.mbr/mbr.db`. If the folder is lost, its remotes alone would
+come back as a heap of nameless files. So the database is backed up
+separately. It is not content-addressed like a blob, but encrypted with
+the folder's **master password** and uploaded to every remote chosen for
+it, replacing the previous backup:
+
+```
+<target>/mbr-metadata/mbr.db.age        the database
+<target>/mbr-metadata/rclone.conf.age   the rclone config, so every remote
+                                        can be reached from a new computer
+```
+
+These are [age](https://age-encryption.org) files encrypted to the password
+(scrypt), so they can also be opened without mbr: `age -d mbr.db.age >
+mbr.db`. The password can't be recovered: without it the backups are
+unreadable.
+
+To restore, attach a new, empty folder, set up one of the old remotes there,
+and restore from it (`mbr metadata restore <remote>`, or the Metadata backup
+tab). Every file reappears as a dangling symlink, the other remotes come back
+with their settings, and the content can then be downloaded.
+
+### Local state
+
+When each remote last received a backup is per-machine state, never synced:
+`<config dir>/mbr/state.json` (e.g. `~/.config/mbr/state.json`), loaded on
+every start. It also holds the last opened folder and, per folder, an
+Argon2 hash of the master password, so a mistyped password is caught
+before anything is encrypted with it. A remote whose last backup predates
+a database change shows as out of date.
+
 ## CLI
 
 ```
@@ -97,6 +162,18 @@ mbr pull <remote> [path|hash...]  download from one remote (default: all it
 mbr fetch <path|hash>...          download blobs from any remote holding them
 mbr check <remote> [path|hash...] ask a remote about specific blobs
                                   (without any: same as `remote scan`)
+mbr fsck [--remote R] [path|hash...]
+                                  verify blobs against their hashes
+mbr drop (--all | path|hash...)   remove local copies enough remotes hold
+mbr gc [--purge [--older-than DAYS] [--yes]]
+                                  drop (or delete everywhere) old versions
+                                  and deleted files
+mbr config min-copies [N]         show or set the copies to keep
+mbr metadata status               where metadata is backed up, and when
+mbr metadata add|rm <remote>...   choose the remotes for metadata backups
+mbr metadata password             set or change the master password
+mbr metadata backup               encrypt and upload the metadata
+mbr metadata restore <remote>     restore metadata into an empty folder
 ```
 
 Every command except `init` works from anywhere inside an attached folder.
@@ -105,16 +182,20 @@ prefix (≥ 6 hex chars).
 
 ## GUI
 
-`my-beloved-rubble` has two tabs.
+`my-beloved-rubble` has three tabs.
 
 **Blobs** shows the annotated file listing (green dot = present locally).
 Select files with a click, Ctrl/⌘+click (toggle), Shift+click (range),
 by dragging across rows, or Ctrl+A (all; Esc clears). The sidebar shows
 the details of a single selected file, or a summary of several, and acts
 on the selected blobs: upload them to a remote, check whether a remote
-holds them, or download the ones missing locally.
+holds them, download the ones missing locally, free up space, or verify
+them locally or on a remote. Files with fewer copies than the minimum are
+shown in red. With nothing selected, the sidebar can verify every local
+copy and clean up old versions.
 
-**Remotes** lists the remotes with Scan (and Scan all), Download all
+**Remotes** sets the minimum number of copies, and lists the remotes with
+Scan (and Scan all), Download all
 (everything recorded there that is missing here), Upload all, Edit and
 Remove. The sidebar adds remotes — an existing rclone target, or a
 guided setup: pick a backend and fill in the generated form (secrets
@@ -122,6 +203,13 @@ masked, choices as dropdowns, required fields marked); if rclone still
 needs an answer — usually OAuth — the question is shown inline. Edit
 renames or retargets a remote and, for backends mbr has a form for,
 changes its rclone settings (secrets stay hidden; blank keeps them).
+
+**Metadata backup** chooses which remotes receive metadata backups and
+shows when each was last backed up and whether that is up to date. The
+sidebar sets the master password, unlocks it for the session (it is kept
+in memory until locked, the folder changes, or the app quits), backs up,
+and changes the password. In an empty folder it also restores from a
+backup.
 
 Scans and rclone operations run in the background, backed by the
 repository-local `.mbr/rclone.conf`. The last opened folder is reopened

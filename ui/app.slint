@@ -1,4 +1,4 @@
-import { Button, LineEdit, ListView, Palette, ComboBox, ScrollView } from "std-widgets.slint";
+import { Button, CheckBox, LineEdit, ListView, Palette, ComboBox, ScrollView, SpinBox } from "std-widgets.slint";
 
 export struct FileRow {
     path: string,
@@ -12,6 +12,10 @@ export struct FileRow {
     past-names: string,
     versions: string,
     selected: bool,
+    // Copies known (local + remotes), and whether that is below the
+    // folder's minimum.
+    copies: int,
+    at-risk: bool,
 }
 
 export struct RemoteRow {
@@ -20,6 +24,17 @@ export struct RemoteRow {
     blobs: string,
     // Blobs recorded on this remote that are not present locally.
     missing-locally: int,
+}
+
+// A remote as a metadata backup destination.
+export struct MetadataRow {
+    name: string,
+    target: string,
+    // Chosen to receive metadata backups.
+    enabled: bool,
+    // "up to date · …", "out of date · …", "never backed up".
+    status: string,
+    up-to-date: bool,
 }
 
 // One input of the per-backend setup form.
@@ -160,8 +175,29 @@ export component AppWindow inherits Window {
     in-out property <[string]> remote-names: [];
     in-out property <string> status-text: "Open a folder to get started";
     in-out property <bool> busy: false;
-    // 0 = Blobs, 1 = Remotes.
+    // 0 = Blobs, 1 = Remotes, 2 = Metadata backup.
     in-out property <int> active-tab: 0;
+    // Copies of every file to keep (local + remotes).
+    in-out property <int> min-copies: 2;
+    // Files with fewer copies than that.
+    in-out property <int> at-risk-count: 0;
+    // Local copies of old versions and deleted files, e.g. "3 (1.2 MiB)".
+    in-out property <int> old-local-count: 0;
+    in-out property <string> old-local-size: "";
+
+    // ── metadata backup ──
+    in-out property <[MetadataRow]> metadata-rows: [];
+    in-out property <int> metadata-chosen: 0;
+    in-out property <string> metadata-summary: "";
+    in-out property <bool> password-set: false;
+    in-out property <bool> unlocked: false;
+    // The folder tracks nothing yet, so a backup can be restored into it.
+    in-out property <bool> folder-empty: false;
+    in-out property <string> pw-new: "";
+    in-out property <string> pw-repeat: "";
+    in-out property <string> pw-entry: "";
+    in-out property <string> pw-restore: "";
+    in-out property <int> restore-remote-index: 0;
     // Side panel width; drag the divider to change it.
     in-out property <length> sidebar-width <=> Side.width;
 
@@ -238,6 +274,20 @@ export component AppWindow inherits Window {
     callback submit-form(name: string, backend: string, values: [string]);
     callback submit-remote-setup(name: string, backend: string, state: string, answer: string);
     callback cancel-remote-setup();
+    // keeping copies safe
+    callback drop-selected();
+    callback verify-selected();
+    callback verify-selected-on(remote: string);
+    callback verify-all-local();
+    callback clean-up-old();
+    callback set-min-copies(n: int);
+    // metadata backup
+    callback toggle-metadata-remote(name: string, enabled: bool);
+    callback set-password(password: string, repeat: string);
+    callback unlock(password: string);
+    callback lock();
+    callback backup-metadata();
+    callback restore-metadata(remote: string, password: string);
 
     VerticalLayout {
         padding: 0px;
@@ -273,6 +323,11 @@ export component AppWindow inherits Window {
                         text: "Remotes (" + root.remotes.length + ")";
                         active: root.active-tab == 1;
                         clicked => { root.active-tab = 1; }
+                    }
+                    TabButton {
+                        text: "Metadata backup";
+                        active: root.active-tab == 2;
+                        clicked => { root.active-tab = 2; }
                     }
                 }
                 Text {
@@ -428,13 +483,13 @@ export component AppWindow inherits Window {
                                             : Palette.foreground.transparentize(35%);
                                     }
                                     Text {
-                                        text: file.remotes == "" ? "no remote" : file.remotes;
+                                        text: file.remotes == "" ? (file.present ? "only here" : "nowhere") : file.remotes;
                                         font-size: 12px;
                                         vertical-alignment: center;
                                         width: 140px;
                                         overflow: elide;
-                                        color: file.remotes == ""
-                                            ? #e0a94f
+                                        color: file.at-risk
+                                            ? #e05f5f
                                             : file.selected
                                                 ? Palette.accent-foreground.transparentize(20%)
                                                 : Palette.foreground.transparentize(35%);
@@ -456,11 +511,40 @@ export component AppWindow inherits Window {
                     if root.folder != "" && root.active-tab == 1: HorizontalLayout {
                         spacing: 8px;
                         Text {
+                            text: "Keep";
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+                        SpinBox {
+                            max-height: self.min-height;
+                            width: 96px;
+                            minimum: 1;
+                            maximum: 9;
+                            value: root.min-copies;
+                            enabled: !root.busy;
+                            edited(n) => { root.set-min-copies(n); }
+                        }
+                        Text {
+                            text: "copies of every file (here + remotes); freeing up space needs that many on remotes";
+                            font-size: 12px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                            color: Palette.foreground.transparentize(25%);
+                        }
+                    }
+
+                    if root.folder != "" && root.active-tab == 1: HorizontalLayout {
+                        spacing: 8px;
+                        Text {
                             text: root.remotes.length == 0
                                 ? "No remotes configured yet; add or set one up on the right."
                                 : "Scanning lists a remote fully: every blob found is recorded, and blobs never seen before appear under unnamed/.";
                             font-size: 12px;
                             wrap: word-wrap;
+                            // Wrapped text can't report its real height here;
+                            // leave room for three lines.
+                            min-height: 48px;
                             vertical-alignment: center;
                             horizontal-stretch: 1;
                             color: Palette.foreground.transparentize(40%);
@@ -549,6 +633,70 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
+
+                    // ── Metadata backup tab: where metadata goes ──
+                    if root.folder != "" && root.active-tab == 2: VerticalLayout {
+                        spacing: 6px;
+                        Text {
+                            text: root.metadata-summary;
+                            font-size: 14px;
+                            font-weight: 600;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: "Tick the remotes that should hold an encrypted copy of this folder's metadata.";
+                            font-size: 12px;
+                            overflow: elide;
+                            color: Palette.foreground.transparentize(40%);
+                        }
+                    }
+                    if root.folder != "" && root.active-tab == 2 && root.metadata-rows.length == 0: Rectangle {
+                        vertical-stretch: 1;
+                        Text {
+                            text: "No remotes configured yet; add one in the Remotes tab.";
+                            font-size: 14px;
+                            horizontal-alignment: center;
+                            color: Palette.foreground.transparentize(40%);
+                        }
+                    }
+                    if root.folder != "" && root.active-tab == 2 && root.metadata-rows.length > 0: ListView {
+                        vertical-stretch: 1;
+                        for row in root.metadata-rows: VerticalLayout {
+                            padding-bottom: 8px;
+                            Rectangle {
+                                border-width: 1px;
+                                border-color: Palette.border;
+                                border-radius: 6px;
+                                background: Palette.background.darker(0.02);
+                                height: metadata-layout.preferred-height;
+
+                                metadata-layout := HorizontalLayout {
+                                    padding: 10px;
+                                    spacing: 10px;
+                                    CheckBox {
+                                        text: row.name;
+                                        checked: row.enabled;
+                                        enabled: !root.busy;
+                                        toggled => { root.toggle-metadata-remote(row.name, self.checked); }
+                                    }
+                                    Text {
+                                        text: row.target;
+                                        font-size: 11px;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                        horizontal-stretch: 1;
+                                        color: Palette.foreground.transparentize(35%);
+                                    }
+                                    if row.enabled: Text {
+                                        text: row.status;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                        color: row.up-to-date ? #2fbf71 : #e0a94f;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -599,7 +747,40 @@ export component AppWindow inherits Window {
                             spacing: 6px;
                             SectionTitle { text: "NOTHING SELECTED"; }
                             Hint {
-                                text: "Click a file to select it. Ctrl+click (⌘+click) adds or removes one, Shift+click selects a range, dragging across rows selects them, Ctrl+A selects everything and Esc clears the selection.\n\nThe selected blobs can then be uploaded to a remote, checked on a remote, or downloaded.";
+                                text: "Click a file to select it. Ctrl+click (⌘+click) adds or removes one, Shift+click selects a range, dragging across rows selects them, Ctrl+A selects everything and Esc clears the selection.\n\nThe selected blobs can then be uploaded to a remote, checked on a remote, downloaded, verified, or removed from this computer once they are safe elsewhere.";
+                            }
+                        }
+
+                        if root.active-tab == 0 && root.selected-count == 0 && root.folder != "": VerticalLayout {
+                            spacing: 8px;
+                            Rectangle { height: 1px; background: Palette.border; }
+                            SectionTitle { text: "KEEPING FILES SAFE"; }
+                            Text {
+                                text: root.at-risk-count == 0
+                                    ? "Every file has at least " + root.min-copies + " cop" + (root.min-copies == 1 ? "y." : "ies.")
+                                    : root.at-risk-count + " file(s) have fewer than " + root.min-copies + " copies (shown in red). Upload them to more remotes.";
+                                font-size: 12px;
+                                wrap: word-wrap;
+                                width: Side.text-width;
+                                color: root.at-risk-count == 0 ? #2fbf71 : #e05f5f;
+                            }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                alignment: start;
+                                Button {
+                                    text: "Verify all local copies";
+                                    enabled: !root.busy && root.files.length > 0;
+                                    clicked => { root.verify-all-local(); }
+                                }
+                                Button {
+                                    text: root.old-local-count > 0
+                                        ? "Clean up old versions (" + root.old-local-size + ")" : "Clean up old versions";
+                                    enabled: !root.busy && root.old-local-count > 0;
+                                    clicked => { root.clean-up-old(); }
+                                }
+                            }
+                            Hint {
+                                text: "Verifying re-reads every file stored here and checks it still matches its hash; damaged copies are set aside so they can be downloaded again. Cleaning up removes this computer's copies of old versions and deleted files, but only those stored on enough remotes.";
                             }
                         }
 
@@ -625,6 +806,11 @@ width: Side.text-width;
                                 label: "remotes";
                                 value: root.files[root.detail-index].remotes == ""
                                     ? "not stored on any remote" : root.files[root.detail-index].remotes;
+                            }
+                            DetailLine {
+                                label: "copies";
+                                value: root.files[root.detail-index].copies + " of " + root.min-copies + " wanted"
+                                    + (root.files[root.detail-index].at-risk ? " — AT RISK" : "");
                             }
                             if root.files[root.detail-index].other-names != "": DetailLine {
                                 label: "also as";
@@ -715,8 +901,173 @@ width: Side.text-width;
                                     }
                                 }
                             }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Button {
+                                    text: "Free up space";
+                                    enabled: !root.busy && root.selection-local > 0;
+                                    clicked => { root.drop-selected(); }
+                                }
+                                Button {
+                                    text: "Verify";
+                                    enabled: !root.busy && root.selection-local > 0;
+                                    clicked => { root.verify-selected(); }
+                                }
+                                Button {
+                                    text: "Verify on remote";
+                                    enabled: !root.busy && root.remote-names.length > 0;
+                                    clicked => { root.verify-selected-on(root.action-remote); }
+                                }
+                            }
                             Hint {
-                                text: "Upload sends the blobs present here to the remote. Check remote asks the remote whether it holds each blob and updates the records. Download fetches the blobs missing here, trying the chosen remote first, then any other remote recorded as holding them.";
+                                text: "Upload sends the blobs present here to the remote. Check remote asks the remote whether it holds each blob and updates the records. Download fetches the blobs missing here, trying the chosen remote first, then any other remote recorded as holding them.\n\nFree up space removes the copies on this computer, but only of blobs that at least " + root.min-copies + " remote(s) are confirmed to hold right now; the files stay listed and can be downloaded again. Verify re-reads the local copies and checks their hashes; Verify on remote downloads the remote's copies to check them.";
+                            }
+                        }
+
+                        // ════ Metadata backup tab ════
+                        if root.active-tab == 2 && root.folder != "": VerticalLayout {
+                            spacing: 6px;
+                            SectionTitle { text: "WHY BACK UP METADATA"; }
+                            Hint {
+                                text: "Remotes store files only by their content hash. The names, folders and history of your files live in this folder's database, so it is backed up separately: encrypted with your master password, to the remotes ticked on the left. Without it, a lost folder comes back as a heap of nameless files.";
+                            }
+                            Rectangle { height: 1px; background: Palette.border; }
+                        }
+
+                        if root.active-tab == 2 && root.folder != "" && root.folder-empty: VerticalLayout {
+                            spacing: 6px;
+                            SectionTitle { text: "RESTORE FROM A BACKUP"; }
+                            Hint {
+                                text: "This folder tracks no files yet. To bring back a lost folder, set up one of its remotes in the Remotes tab, then restore from it here: every file reappears (as a placeholder until downloaded) and its other remotes come back too.";
+                            }
+                            if root.remote-names.length == 0: Hint {
+                                text: "No remotes configured yet.";
+                            }
+                            if root.remote-names.length > 0: VerticalLayout {
+                                spacing: 6px;
+                                ComboBox {
+                                    // Reports a far too tall preferred height in sidebar layouts.
+                                    max-height: self.min-height;
+                                    model: root.remote-names;
+                                    current-index <=> root.restore-remote-index;
+                                }
+                                LineEdit {
+                                    input-type: InputType.password;
+                                    placeholder-text: "the backup's master password";
+                                    text <=> root.pw-restore;
+                                }
+                                HorizontalLayout {
+                                    alignment: start;
+                                    Button {
+                                        text: "Restore";
+                                        enabled: !root.busy && root.pw-restore != "";
+                                        clicked => {
+                                            root.restore-metadata(
+                                                root.remote-names[clamp(root.restore-remote-index, 0, root.remote-names.length - 1)],
+                                                root.pw-restore);
+                                        }
+                                    }
+                                }
+                            }
+                            Rectangle { height: 1px; background: Palette.border; }
+                        }
+
+                        if root.active-tab == 2 && root.folder != "" && !root.password-set: VerticalLayout {
+                            spacing: 6px;
+                            SectionTitle { text: "SET A MASTER PASSWORD"; }
+                            Hint {
+                                text: "Metadata is encrypted with this password before it leaves this computer. Write it down somewhere safe: without it the backups can't be read, and nobody can recover it.";
+                            }
+                            LineEdit {
+                                input-type: InputType.password;
+                                placeholder-text: "master password";
+                                text <=> root.pw-new;
+                            }
+                            LineEdit {
+                                input-type: InputType.password;
+                                placeholder-text: "repeat it";
+                                text <=> root.pw-repeat;
+                                accepted => { root.set-password(root.pw-new, root.pw-repeat); }
+                            }
+                            HorizontalLayout {
+                                alignment: start;
+                                Button {
+                                    text: "Set password";
+                                    primary: true;
+                                    enabled: root.pw-new != "" && root.pw-repeat != "";
+                                    clicked => { root.set-password(root.pw-new, root.pw-repeat); }
+                                }
+                            }
+                        }
+
+                        if root.active-tab == 2 && root.folder != "" && root.password-set && !root.unlocked: VerticalLayout {
+                            spacing: 6px;
+                            SectionTitle { text: "UNLOCK"; }
+                            Hint {
+                                text: "Enter the master password to back up during this session. It stays in memory until you lock, switch folders or quit.";
+                            }
+                            LineEdit {
+                                input-type: InputType.password;
+                                placeholder-text: "master password";
+                                text <=> root.pw-entry;
+                                accepted => { root.unlock(root.pw-entry); }
+                            }
+                            HorizontalLayout {
+                                alignment: start;
+                                Button {
+                                    text: "Unlock";
+                                    primary: true;
+                                    enabled: root.pw-entry != "";
+                                    clicked => { root.unlock(root.pw-entry); }
+                                }
+                            }
+                        }
+
+                        if root.active-tab == 2 && root.folder != "" && root.unlocked: VerticalLayout {
+                            spacing: 6px;
+                            SectionTitle { text: "BACK UP"; }
+                            Hint {
+                                text: root.metadata-chosen == 0
+                                    ? "Tick at least one remote on the left to back up to."
+                                    : "Encrypts the database and this folder's rclone settings (so the remotes can be reached again from a new computer) and uploads them to the " + root.metadata-chosen + " ticked remote(s), replacing the previous backup.";
+                            }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                alignment: start;
+                                Button {
+                                    text: "Back up now";
+                                    primary: true;
+                                    enabled: !root.busy && root.metadata-chosen > 0;
+                                    clicked => { root.backup-metadata(); }
+                                }
+                                Button {
+                                    text: "Lock";
+                                    clicked => { root.lock(); }
+                                }
+                            }
+
+                            Rectangle { height: 1px; background: Palette.border; }
+                            SectionTitle { text: "CHANGE THE MASTER PASSWORD"; }
+                            Hint {
+                                text: "Backups already made keep the old password until they are replaced, so back up again afterwards.";
+                            }
+                            LineEdit {
+                                input-type: InputType.password;
+                                placeholder-text: "new master password";
+                                text <=> root.pw-new;
+                            }
+                            LineEdit {
+                                input-type: InputType.password;
+                                placeholder-text: "repeat it";
+                                text <=> root.pw-repeat;
+                            }
+                            HorizontalLayout {
+                                alignment: start;
+                                Button {
+                                    text: "Change password";
+                                    enabled: !root.busy && root.pw-new != "" && root.pw-repeat != "";
+                                    clicked => { root.set-password(root.pw-new, root.pw-repeat); }
+                                }
                             }
                         }
 
