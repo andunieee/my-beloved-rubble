@@ -80,24 +80,27 @@ case no browser opens.
 
 A master password must be set (`mbr config password`, or the Settings
 tab) before any remote can be added: every remote is encrypted with it.
-A remote named `drive` becomes two rclone sections, which are never shown:
+A remote named `drive` becomes three rclone sections, which are never shown:
 
 ```
-[_plain-mbr-drive]       the backend itself
-[_autocrypt-mbr-drive]   type = crypt, password = the master password
-                         remote = _plain-mbr-drive:<bucket/>mbr-<folder id>
+[_root-mbr-drive]    the backend itself, at its root
+[_plain-mbr-drive]   type = alias
+                     remote = _root-mbr-drive:<bucket/>mbr-<folder id>
+[_crypt-mbr-drive]   type = crypt, password = the master password
+                     remote = _plain-mbr-drive:
 ```
 
-and the mbr remote `drive` targets `_autocrypt-mbr-drive:`, so blobs,
-their names and the metadata backups are all encrypted. `mbr remote setup
---unencrypted` (or "Don't encrypt" in the GUI) instead makes the single
-section `_dangerouslyplain-mbr-drive`, storing in the clear. Wrapper
+and the mbr remote `drive` targets `_crypt-mbr-drive:`, so blobs and
+their names are encrypted. `mbr remote setup --unencrypted` (or "Don't
+encrypt" in the GUI) instead makes `_dangerouslyplain-mbr-drive`, an alias
+like `_plain-mbr-drive`, and stores through it in the clear. Wrapper
 backends (alias, chunker, crypt, union, …) are not offered.
 
 The folder id is 6 random bytes in hex, made once and kept in the
 database, so each folder stores in its own `mbr-<id>` directory and several
 folders can share one storage account. The only location asked is the
-bucket, container or share (or, for `local`, the folder).
+bucket, container or share (or, for `local`, the folder). Metadata backups
+go there too, next to `mbr-<id>`, through `_root-mbr-drive`.
 
 Since remotes are encrypted with it, the master password can't change
 once one exists. It is saved, with a check, in the per-machine
@@ -145,29 +148,36 @@ the folder's **master password** and uploaded to every remote chosen for
 it, replacing the previous backup:
 
 ```
-<target>/mbr-metadata/mbr.db.age        the database
-<target>/mbr-metadata/rclone.conf.age   the rclone config, so every remote
-                                        can be reached from a new computer
+<bucket or folder>/mbr-metadata-<backup id>.tar.gz.encrypted
 ```
 
-These are [age](https://age-encryption.org) files encrypted to the password
-(scrypt), so they can also be opened without mbr: `age -d mbr.db.age >
-mbr.db`. The password can't be recovered: without it the backups are
-unreadable.
+holding `mbr.db` and `rclone.conf` (so every remote can be reached from a
+new computer) in a tar.gz. The backup id is 8 bytes of an Argon2id hash
+of the master password, in hex: the backup is found again knowing only
+the password and where the remote is, and the name makes the password no
+easier to guess than the content does. It is an
+[age](https://age-encryption.org) file encrypted to the password
+(scrypt), so it can also be opened without mbr: `age -d mbr-metadata-….
+tar.gz.encrypted | tar xz`. The password can't be recovered: without it
+the backups are unreadable. Folders sharing a remote and a master
+password share the backup name too, so give them different passwords.
 
-To restore, attach a new, empty folder, set the same master password, set
-up one of the old remotes there, and restore from it (`mbr metadata
-restore <remote>`, or the Settings tab). The new folder has a new id, so
-its remote points next to the old folder's `mbr-<id>` directory: restoring
-looks in the sibling `mbr-<id>` directories too, and the new folder then
-takes on the old id, moving its remotes over. Every file reappears as a
-dangling symlink, the other remotes come back with their settings, and the
-content can then be downloaded.
+A backup is restored into a folder that isn't an mbr folder yet, instead
+of `mbr init` (`mbr restore`, or the choice the GUI offers when opening
+such a folder), from any of:
 
-Restoring into a folder already in use merges the backup in: whatever only
-the backup knows (files, older versions, remotes and what they store,
-settings) is added, and where the two disagree the folder wins. The database
-as it was before is kept in `.mbr/mbr.db.before-restore`.
+- a remote: the master password and the remote's settings, set up in a
+  throwaway rclone config, then the backup made with that password is
+  downloaded from where they point;
+- an encrypted backup file and the master password;
+- the database and rclone config as plain files (the master password is
+  set afterwards).
+
+The backup's database and rclone config become the folder's, so its
+remotes, folder id and all come back as they were. Every file reappears as
+a dangling symlink (a file already in the way is kept, and the next scan
+records it as a new version), and the content can then be downloaded.
+There is no merging into a folder in use.
 
 ### Local state
 
@@ -182,6 +192,8 @@ a database change shows as out of date.
 
 ```
 mbr init [dir]                    attach mbr to a folder
+mbr restore [dir] (--from <type> | --backup FILE | --db FILE --rclone-conf FILE)
+                                  restore a lost folder into this one
 mbr scan                          ingest new files, record removals
 mbr ls                            list tracked files with metadata
 mbr info <path|hash>              full detail for one file or blob
@@ -211,10 +223,10 @@ mbr config password               set the master password (before any remote)
 mbr metadata status               where metadata is backed up, and when
 mbr metadata add|rm <remote>...   choose the remotes for metadata backups
 mbr metadata backup               encrypt and upload the metadata
-mbr metadata restore <remote>     merge the backup on a remote into this folder
 ```
 
-Every command except `init` works from anywhere inside an attached folder.
+Every command except `init` and `restore` works from anywhere inside an
+attached folder.
 Files and blobs are addressable by path, full hash, or a unique hash
 prefix (≥ 6 hex chars).
 
@@ -246,8 +258,12 @@ hidden; blank keeps them).
 **Settings** holds the master password (set once, then saved on this
 computer) and chooses which remotes receive metadata backups, showing
 when each was last backed up and whether that is up to date. The sidebar
-sets, unlocks or changes the password and backs up. It also restores a backup from a remote: first
-thing in an empty folder, merged in otherwise.
+sets, unlocks or changes the password and backs up.
+
+Opening a folder that isn't an mbr folder yet offers to start a new one
+there or to restore a lost one into it, from a remote (the password and
+the remote's settings, in the same form as setting up a remote), a backup
+file, or the database and rclone config files.
 
 Scans and rclone operations run in the background, backed by the
 repository-local `.mbr/rclone.conf`. The last opened folder is reopened

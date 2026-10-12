@@ -7,9 +7,11 @@ nav = "getting started"
 
 ## Attaching a folder
 
-Click **Open Folder…** and pick the folder you want to keep safe, or an empty one to start from. The app creates a
-hidden `.mbr` folder inside it, where it keeps everything it needs, and reopens the same folder the next time it
-starts.
+Click **Open Folder…** and pick the folder you want to keep safe, or an empty one to start from, then **Start a new
+folder**. The app creates a hidden `.mbr` folder inside it, where it keeps everything it needs, and reopens the same
+folder the next time it starts.
+
+To bring back a folder you lost instead, pick **Restore a lost folder**: see [restoring](../metadata/#restoring-a-lost-folder).
 
 ## Adding files
 

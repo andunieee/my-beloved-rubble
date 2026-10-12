@@ -17,7 +17,8 @@ remote. The app wraps the storage in an rclone [crypt](https://rclone.org/crypt/
 scrambled file names and content.
 
 Each folder stores in its own directory on a remote, `mbr-` followed by a random code (for example
-`mbr-3f9a0c1b2e4d`), so several folders can share one storage account.
+`mbr-3f9a0c1b2e4d`), so several folders can share one storage account. [Metadata backups](../metadata/) go next to
+that directory.
 
 ## Setting up a new remote
 
@@ -32,8 +33,9 @@ Services that sign in through the browser (Google Drive, Dropbox, OneDrive, …)
 If one doesn't open, the link is shown in the app. If rclone needs anything else, it asks in a box below the form.
 
 Each folder keeps its own rclone settings in `.mbr/rclone.conf`, separate from any other rclone configuration on the
-computer. The remotes there have names starting with `_plain-mbr-`, `_autocrypt-mbr-` or `_dangerouslyplain-mbr-`;
-the app only ever shows the name you chose.
+computer. The remotes there have names starting with `_root-mbr-` (the storage itself), `_plain-mbr-` (the folder's
+directory in it), `_crypt-mbr-` (the encryption) or `_dangerouslyplain-mbr-`; the app only ever shows the name you
+chose.
 
 ## How many copies
 

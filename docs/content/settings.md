@@ -21,5 +21,5 @@ A folder whose password was set on another computer, or before passwords were sa
 ## Changing the password
 
 The password can be changed only while no remote is encrypted with it, since those remotes couldn't read what they
-already store. Metadata backups made before a change keep the old password until they are replaced, so back up again
-right after.
+already store. Metadata backups made before a change keep the old password, and a restore finds them only with it, so
+back up again right after.

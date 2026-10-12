@@ -277,47 +277,145 @@ component BackendForm inherits VerticalLayout {
     }
 }
 
-// Pick a remote and merge the metadata backup it holds into the folder.
-component RestoreForm inherits VerticalLayout {
-    in property <[string]> remote-names;
+// Pick a backend and fill in its form, then answer whatever rclone still
+// asks (OAuth sign-in, verification…). The buttons that submit the form
+// are the caller's, shown while `state` is empty.
+component SetupForm inherits VerticalLayout {
+    in property <[string]> backend-titles;
+    in property <int> backend-index;
+    // A form is shown for the picked backend.
+    in property <bool> active;
+    in property <[FormField]> fields;
+    in-out property <[string]> values;
+    // rclone's pending question, if `state` isn't empty.
+    in property <string> state;
+    in property <string> question;
+    in property <string> help;
+    in property <string> default;
+    in property <string> url;
+    in-out property <string> answer;
     in property <bool> busy;
-    // The folder is unlocked: an empty password means that one.
-    in property <bool> unlocked;
-    in-out property <int> remote-index;
-    in-out property <string> password;
-    callback restore(remote: string, password: string);
+    in property <length> text-width;
+    callback select-backend(title: string);
+    callback answer-question(state: string, answer: string);
+    callback cancel();
+    spacing: 8px;
 
-    spacing: 6px;
-    if root.remote-names.length == 0: Hint {
-        text: "No remotes configured yet.";
+    ComboBox {
+        // Reports a far too tall preferred height in sidebar layouts.
+        max-height: self.min-height;
+        model: root.backend-titles;
+        current-index: root.backend-index;
+        enabled: !root.busy && root.state == "";
+        selected(title) => { root.select-backend(title); }
     }
-    if root.remote-names.length > 0: VerticalLayout {
-        spacing: 6px;
-        ComboBox {
-            // Reports a far too tall preferred height in sidebar layouts.
-            max-height: self.min-height;
-            model: root.remote-names;
-            current-index <=> root.remote-index;
-        }
-        LineEdit {
-            input-type: InputType.password;
-            placeholder-text: root.unlocked
-                ? "the backup's master password, if different"
-                : "the backup's master password";
-            text <=> root.password;
-        }
-        HorizontalLayout {
-            alignment: start;
-            Button {
-                text: "Restore";
-                enabled: !root.busy && (root.password != "" || root.unlocked);
-                clicked => {
-                    root.restore(
-                        root.remote-names[clamp(root.remote-index, 0, root.remote-names.length - 1)],
-                        root.password);
+    if root.active && root.state == "": BackendForm {
+        fields: root.fields;
+        values <=> root.values;
+        enabled: !root.busy;
+    }
+    if root.state != "": Rectangle {
+        border-width: 1px;
+        border-color: Palette.accent-background;
+        border-radius: 6px;
+        background: Palette.background;
+        height: question-layout.preferred-height + 20px;
+
+        question-layout := VerticalLayout {
+            padding: 10px;
+            spacing: 6px;
+            Text {
+                text: root.question + (root.default == "" ? "" : " [" + root.default + "]");
+                font-size: 12px;
+                font-weight: 600;
+                wrap: word-wrap;
+                width: root.text-width - 20px;
+            }
+            Text {
+                text: root.help;
+                font-size: 11px;
+                wrap: word-wrap;
+                width: root.text-width - 20px;
+                color: Palette.foreground.transparentize(25%);
+            }
+            if root.url != "": Text {
+                text: root.url;
+                font-size: 11px;
+                wrap: word-wrap;
+                width: root.text-width - 20px;
+                color: Palette.accent-background;
+            }
+            LineEdit {
+                text <=> root.answer;
+            }
+            HorizontalLayout {
+                spacing: 6px;
+                Button {
+                    text: "Continue";
+                    enabled: !root.busy;
+                    clicked => {
+                        root.answer-question(root.state, root.answer == "" ? root.default : root.answer);
+                    }
+                }
+                Button {
+                    text: "Cancel";
+                    clicked => { root.cancel(); }
                 }
             }
         }
+    }
+}
+
+// A file picked for restoring: a button to pick it, and its path.
+component PickedFile inherits VerticalLayout {
+    in property <string> label;
+    in property <string> path;
+    in property <bool> enabled;
+    in property <length> text-width;
+    callback pick();
+    spacing: 4px;
+    Text { text: root.label; font-size: 12px; font-weight: 600; }
+    HorizontalLayout {
+        spacing: 8px;
+        Button {
+            text: "Choose…";
+            enabled: root.enabled;
+            clicked => { root.pick(); }
+        }
+        Text {
+            text: root.path == "" ? "nothing chosen" : root.path;
+            font-size: 12px;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+            color: Palette.foreground.transparentize(root.path == "" ? 50% : 20%);
+        }
+    }
+}
+
+// One way to start in a folder that isn't an mbr folder yet.
+component Choice inherits Rectangle {
+    in property <string> title;
+    in property <string> text;
+    in property <length> text-width;
+    border-width: 1px;
+    border-color: Palette.border;
+    border-radius: 8px;
+    background: Palette.background.darker(0.02);
+    height: choice-layout.preferred-height;
+
+    choice-layout := VerticalLayout {
+        padding: 14px;
+        spacing: 8px;
+        Text { text: root.title; font-size: 14px; font-weight: 700; }
+        Text {
+            text: root.text;
+            font-size: 12px;
+            wrap: word-wrap;
+            width: root.text-width - 28px;
+            color: Palette.foreground.transparentize(25%);
+        }
+        @children
     }
 }
 
@@ -354,13 +452,19 @@ export component AppWindow inherits Window {
     in-out property <bool> unlocked: false;
     // Some remote is encrypted with the master password, so it can't change.
     in-out property <bool> has-encrypted-remotes: false;
-    // The folder tracks nothing yet: restoring a backup comes first.
-    in-out property <bool> folder-empty: false;
     in-out property <string> pw-new: "";
     in-out property <string> pw-repeat: "";
     in-out property <string> pw-entry: "";
+
+    // ── a folder that isn't an mbr folder yet: start anew or restore ──
+    in-out property <string> pending-folder: "";
+    // 0 = choosing, 1 = from database files, 2 = from a backup file,
+    // 3 = from a remote.
+    in-out property <int> restore-mode: 0;
+    in-out property <string> restore-db-file: "";
+    in-out property <string> restore-conf-file: "";
+    in-out property <string> restore-backup-file: "";
     in-out property <string> pw-restore: "";
-    in-out property <int> restore-remote-index: 0;
     // Side panel width; drag the divider to change it.
     in-out property <length> sidebar-width <=> Side.width;
 
@@ -381,6 +485,7 @@ export component AppWindow inherits Window {
     // ── guided remote setup ──
     in-out property <[string]> backend-titles: [];
     in-out property <string> setup-backend: "";
+    in-out property <int> setup-backend-index: 0;
     in-out property <bool> setup-active: false;
     in-out property <[FormField]> form-fields: [];
     in-out property <[string]> form-values: [];
@@ -407,6 +512,8 @@ export component AppWindow inherits Window {
     property <string> action-remote: root.remote-names[clamp(root.action-remote-index, 0, max(0, root.remote-names.length - 1))];
 
     property <length> row-height: 40px;
+    // Width of the column the first-open screen is laid out in.
+    property <length> column-width: min(560px, main-area.width - 48px);
     property <bool> has-detail: root.detail-index >= 0 && root.detail-index < root.files.length;
 
     // ── Callbacks ──
@@ -446,7 +553,14 @@ export component AppWindow inherits Window {
     callback set-password(password: string, repeat: string);
     callback unlock(password: string);
     callback backup-metadata();
-    callback restore-metadata(remote: string, password: string);
+    // a folder that isn't an mbr folder yet
+    callback start-new();
+    // 1 = the database, 2 = the rclone config, 3 = an encrypted backup
+    callback pick-restore-file(which: int);
+    callback restore-from-files();
+    callback restore-from-backup(password: string);
+    callback restore-from-remote(backend: string, values: [string], password: string);
+    callback cancel-restore();
 
     VerticalLayout {
         padding: 0px;
@@ -519,7 +633,7 @@ export component AppWindow inherits Window {
             spacing: 0px;
 
             // ── Main area ──
-            Rectangle {
+            main-area := Rectangle {
                 horizontal-stretch: 1;
                 background: Palette.background;
 
@@ -527,7 +641,7 @@ export component AppWindow inherits Window {
                     padding: 12px;
                     spacing: 6px;
 
-                    if root.folder == "": Rectangle {
+                    if root.folder == "" && root.pending-folder == "": Rectangle {
                         vertical-stretch: 1;
                         VerticalLayout {
                             alignment: center;
@@ -547,6 +661,199 @@ export component AppWindow inherits Window {
                                     clicked => { root.open-folder(); }
                                 }
                                 Help { page: "getting-started/"; }
+                            }
+                        }
+                    }
+
+                    // ── A folder that isn't an mbr folder yet ──
+                    if root.folder == "" && root.pending-folder != "": first-scroll := ScrollView {
+                        vertical-stretch: 1;
+                        viewport-width: self.visible-width;
+                        HorizontalLayout {
+                            width: first-scroll.visible-width;
+                            alignment: center;
+                            VerticalLayout {
+                                width: root.column-width;
+                                padding-top: 16px;
+                                padding-bottom: 16px;
+                                spacing: 12px;
+
+                                Text {
+                                    text: root.pending-folder;
+                                    font-size: 16px;
+                                    font-weight: 700;
+                                    wrap: word-wrap;
+                                    width: root.column-width;
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Text {
+                                        text: "This is not an mbr folder yet.";
+                                        font-size: 13px;
+                                        vertical-alignment: center;
+                                        color: Palette.foreground.transparentize(25%);
+                                    }
+                                    Help { page: "getting-started/"; }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+
+                                if root.restore-mode == 0: Choice {
+                                    title: "Start a new mbr folder";
+                                    text: "Its files move into a hidden .mbr store and are replaced by links to it, so they keep opening as before.";
+                                    text-width: root.column-width;
+                                    HorizontalLayout {
+                                        alignment: start;
+                                        Button {
+                                            text: "Start a new folder";
+                                            primary: true;
+                                            enabled: !root.busy;
+                                            clicked => { root.start-new(); }
+                                        }
+                                    }
+                                }
+                                if root.restore-mode == 0: Choice {
+                                    title: "Restore a lost folder";
+                                    text: "Bring back an mbr folder from its metadata backup: its files, their history and its remotes. The files' content is downloaded from the remotes afterwards.";
+                                    text-width: root.column-width;
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        alignment: start;
+                                        Button {
+                                            text: "From a remote";
+                                            enabled: !root.busy;
+                                            clicked => { root.restore-mode = 3; }
+                                        }
+                                        Button {
+                                            text: "From a backup file";
+                                            enabled: !root.busy;
+                                            clicked => { root.restore-mode = 2; }
+                                        }
+                                        Button {
+                                            text: "From database files";
+                                            enabled: !root.busy;
+                                            clicked => { root.restore-mode = 1; }
+                                        }
+                                        Help { page: "metadata/#restoring-a-lost-folder"; }
+                                    }
+                                }
+
+                                // ── restoring from the database and rclone config ──
+                                if root.restore-mode == 1: VerticalLayout {
+                                    spacing: 10px;
+                                    SectionTitle { text: "RESTORE FROM DATABASE FILES"; }
+                                    PickedFile {
+                                        label: "Database (mbr.db)";
+                                        path: root.restore-db-file;
+                                        enabled: !root.busy;
+                                        text-width: root.column-width;
+                                        pick => { root.pick-restore-file(1); }
+                                    }
+                                    PickedFile {
+                                        label: "rclone config (rclone.conf)";
+                                        path: root.restore-conf-file;
+                                        enabled: !root.busy;
+                                        text-width: root.column-width;
+                                        pick => { root.pick-restore-file(2); }
+                                    }
+                                    Hint {
+                                        text: "Afterwards, set the master password the folder's remotes were made with, in the Settings tab.";
+                                        width: root.column-width;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        alignment: start;
+                                        Button {
+                                            text: "Restore";
+                                            primary: true;
+                                            enabled: !root.busy && root.restore-db-file != "" && root.restore-conf-file != "";
+                                            clicked => { root.restore-from-files(); }
+                                        }
+                                        Button {
+                                            text: "Back";
+                                            clicked => { root.cancel-restore(); }
+                                        }
+                                    }
+                                }
+
+                                // ── restoring from an encrypted backup file ──
+                                if root.restore-mode == 2: VerticalLayout {
+                                    spacing: 10px;
+                                    SectionTitle { text: "RESTORE FROM A BACKUP FILE"; }
+                                    PickedFile {
+                                        label: "Backup (mbr-metadata-….tar.gz.encrypted)";
+                                        path: root.restore-backup-file;
+                                        enabled: !root.busy;
+                                        text-width: root.column-width;
+                                        pick => { root.pick-restore-file(3); }
+                                    }
+                                    LineEdit {
+                                        input-type: InputType.password;
+                                        placeholder-text: "master password";
+                                        text <=> root.pw-restore;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        alignment: start;
+                                        Button {
+                                            text: "Restore";
+                                            primary: true;
+                                            enabled: !root.busy && root.restore-backup-file != "" && root.pw-restore != "";
+                                            clicked => { root.restore-from-backup(root.pw-restore); }
+                                        }
+                                        Button {
+                                            text: "Back";
+                                            clicked => { root.cancel-restore(); }
+                                        }
+                                    }
+                                }
+
+                                // ── restoring from a remote ──
+                                if root.restore-mode == 3: VerticalLayout {
+                                    spacing: 10px;
+                                    SectionTitle { text: "RESTORE FROM A REMOTE"; }
+                                    Hint {
+                                        text: "The backup is found with the master password and the remote's settings: fill them in as when the remote was set up.";
+                                        width: root.column-width;
+                                    }
+                                    LineEdit {
+                                        input-type: InputType.password;
+                                        placeholder-text: "master password";
+                                        text <=> root.pw-restore;
+                                        enabled: root.setup-state == "";
+                                    }
+                                    SetupForm {
+                                        backend-titles: root.backend-titles;
+                                        backend-index: root.setup-backend-index;
+                                        active: root.setup-active;
+                                        fields: root.form-fields;
+                                        values <=> root.form-values;
+                                        state: root.setup-state;
+                                        question: root.setup-question;
+                                        help: root.setup-help;
+                                        default: root.setup-default;
+                                        url: root.setup-url;
+                                        answer <=> root.setup-answer;
+                                        busy: root.busy;
+                                        text-width: root.column-width;
+                                        select-backend(title) => { root.select-backend(title); }
+                                        answer-question(state, answer) => { root.submit-remote-setup(root.setup-backend, state, answer); }
+                                        cancel => { root.cancel-remote-setup(); }
+                                    }
+                                    if root.setup-state == "": HorizontalLayout {
+                                        spacing: 6px;
+                                        alignment: start;
+                                        Button {
+                                            text: "Restore";
+                                            primary: true;
+                                            enabled: !root.busy && root.pw-restore != "" && root.setup-backend != "";
+                                            clicked => { root.restore-from-remote(root.setup-backend, root.form-values, root.pw-restore); }
+                                        }
+                                        Button {
+                                            text: "Back";
+                                            clicked => { root.cancel-restore(); }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1120,20 +1427,6 @@ width: Side.text-width;
                             Rectangle { height: 1px; background: Palette.border; }
                         }
 
-                        if root.active-tab == 2 && root.folder != "" && root.folder-empty: VerticalLayout {
-                            spacing: 6px;
-                            SectionTitle { text: "RESTORE FROM A BACKUP"; help: "metadata/#restoring-a-lost-folder"; }
-                            RestoreForm {
-                                remote-names: root.remote-names;
-                                busy: root.busy;
-                                unlocked: root.unlocked;
-                                remote-index <=> root.restore-remote-index;
-                                password <=> root.pw-restore;
-                                restore(remote, password) => { root.restore-metadata(remote, password); }
-                            }
-                            Rectangle { height: 1px; background: Palette.border; }
-                        }
-
                         if root.active-tab == 2 && root.folder != "" && root.unlocked: VerticalLayout {
                             spacing: 6px;
                             SectionTitle { text: "BACK UP METADATA"; help: "metadata/#backing-up"; }
@@ -1148,20 +1441,6 @@ width: Side.text-width;
                                     enabled: !root.busy && root.metadata-chosen > 0;
                                     clicked => { root.backup-metadata(); }
                                 }
-                            }
-                        }
-
-                        if root.active-tab == 2 && root.folder != "" && !root.folder-empty: VerticalLayout {
-                            spacing: 6px;
-                            Rectangle { height: 1px; background: Palette.border; }
-                            SectionTitle { text: "MERGE IN A BACKUP"; help: "metadata/#merging-in-a-backup"; }
-                            RestoreForm {
-                                remote-names: root.remote-names;
-                                busy: root.busy;
-                                unlocked: root.unlocked;
-                                remote-index <=> root.restore-remote-index;
-                                password <=> root.pw-restore;
-                                restore(remote, password) => { root.restore-metadata(remote, password); }
                             }
                         }
 
@@ -1258,40 +1537,36 @@ width: Side.text-width;
                                 spacing: 6px;
                                 SectionTitle { text: "SET UP A NEW REMOTE"; help: "remotes/#setting-up-a-new-remote"; }
 
-                                HorizontalLayout {
-                                    spacing: 6px;
-                                    LineEdit {
-                                        placeholder-text: "name (e.g. backup)";
-                                        text <=> root.new-remote-name;
-                                        horizontal-stretch: 1;
-                                    }
-                                    ComboBox {
-                                        // Reports a far too tall preferred height in sidebar layouts.
-                                        max-height: self.min-height;
-                                        model: root.backend-titles;
-                                        current-index: 0;
-                                        horizontal-stretch: 2;
-                                        enabled: !root.busy && root.setup-state == "";
-                                        selected(title) => { root.select-backend(title); }
-                                    }
+                                LineEdit {
+                                    placeholder-text: "name (e.g. backup)";
+                                    text <=> root.new-remote-name;
+                                    enabled: !root.busy && root.setup-state == "";
                                 }
-
-                                // the generated form
+                                SetupForm {
+                                    backend-titles: root.backend-titles;
+                                    backend-index: root.setup-backend-index;
+                                    active: root.setup-active;
+                                    fields: root.form-fields;
+                                    values <=> root.form-values;
+                                    state: root.setup-state;
+                                    question: root.setup-question;
+                                    help: root.setup-help;
+                                    default: root.setup-default;
+                                    url: root.setup-url;
+                                    answer <=> root.setup-answer;
+                                    busy: root.busy;
+                                    text-width: Side.text-width;
+                                    select-backend(title) => { root.select-backend(title); }
+                                    answer-question(state, answer) => { root.submit-remote-setup(root.setup-backend, state, answer); }
+                                    cancel => { root.cancel-remote-setup(); }
+                                }
                                 if root.setup-active && root.setup-state == "": VerticalLayout {
                                     spacing: 8px;
-
-                                    BackendForm {
-                                        fields: root.form-fields;
-                                        values <=> root.form-values;
-                                        enabled: !root.busy;
-                                    }
-
                                     CheckBox {
                                         text: "Don't encrypt (anyone with access to the remote can read your files)";
                                         checked <=> root.new-remote-plain;
                                         enabled: !root.busy;
                                     }
-
                                     HorizontalLayout {
                                         spacing: 6px;
                                         Button {
@@ -1309,62 +1584,6 @@ width: Side.text-width;
                                             text: "Cancel";
                                             enabled: !root.busy;
                                             clicked => { root.cancel-remote-setup(); }
-                                        }
-                                    }
-                                }
-
-                                // rclone question fallback (OAuth, verification…)
-                                if root.setup-state != "": Rectangle {
-                                    border-width: 1px;
-                                    border-color: Palette.accent-background;
-                                    border-radius: 6px;
-                                    background: Palette.background;
-                                    height: question-layout.preferred-height + 20px;
-
-                                    question-layout := VerticalLayout {
-                                        padding: 10px;
-                                        spacing: 6px;
-                                        Text {
-                                            text: root.setup-question + (root.setup-default == "" ? "" : " [" + root.setup-default + "]");
-                                            font-size: 12px;
-                                            font-weight: 600;
-                                            wrap: word-wrap;
-width: Side.text-width - 20px;
-                                        }
-                                        Text {
-                                            text: root.setup-help;
-                                            font-size: 11px;
-                                            wrap: word-wrap;
-width: Side.text-width - 20px;
-                                            color: Palette.foreground.transparentize(25%);
-                                        }
-                                        if root.setup-url != "": Text {
-                                            text: root.setup-url;
-                                            font-size: 11px;
-                                            wrap: word-wrap;
-width: Side.text-width - 20px;
-                                            color: Palette.accent-background;
-                                        }
-                                        LineEdit {
-                                            text <=> root.setup-answer;
-                                        }
-                                        HorizontalLayout {
-                                            spacing: 6px;
-                                            Button {
-                                                text: "Continue";
-                                                enabled: root.setup-state != "" && !root.busy;
-                                                clicked => {
-                                                    root.submit-remote-setup(
-                                                        root.setup-backend,
-                                                        root.setup-state,
-                                                        root.setup-answer == "" ? root.setup-default : root.setup-answer
-                                                    );
-                                                }
-                                            }
-                                            Button {
-                                                text: "Cancel";
-                                                clicked => { root.cancel-remote-setup(); }
-                                            }
                                         }
                                     }
                                 }

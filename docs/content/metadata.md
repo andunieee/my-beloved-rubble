@@ -14,50 +14,40 @@ Each remote shows when it was last backed up, and whether that backup is out of 
 
 ## Backing up
 
-Tick the remotes that should hold a backup, then click **Back up now**. The app encrypts the database and this
-folder's rclone settings (so the remotes can be reached again from a new computer) and uploads them to each ticked
-remote, into an `mbr-metadata` folder, replacing the previous backup there.
+Tick the remotes that should hold a backup, then click **Back up now**. The app packs the database together with this
+folder's rclone settings (so the remotes can be reached again from a new computer), encrypts them, and uploads the
+result to each ticked remote, replacing the previous backup there.
+
+The backup sits at the top of the remote, in the bucket or folder you named when setting it up, next to the folder's
+own `mbr-…` directory. It is called `mbr-metadata-` followed by a code made from the master password (for example
+`mbr-metadata-9c1e0b7a42d3f581.tar.gz.encrypted`), so it can be found again knowing only the password and where the
+remote is.
 
 Back up again after adding or changing files: the tab shows which backups are out of date.
 
-The backups are ordinary [age](https://age-encryption.org) files encrypted with the password, so they can also be
-opened without the app: `age -d mbr.db.age > mbr.db`.
+The backup is an ordinary [age](https://age-encryption.org) file encrypted with the password, holding a tar.gz, so it
+can also be opened without the app: `age -d mbr-metadata-….tar.gz.encrypted | tar xz` gives back `mbr.db` and
+`rclone.conf`.
 
 ## Restoring a lost folder
 
-1. Open a new, empty folder in the app.
-2. In the **Settings** tab, set the same master password as the old folder.
-3. In the **Remotes** tab, set up one of the remotes the old folder backed up to, with the same kind of storage and
-   the same bucket or folder.
-4. In the **Settings** tab, pick that remote under **Restore from a backup** and click **Restore**.
+Open a new folder in the app (an empty one, or one holding what you could save). Since it isn't an mbr folder yet, the
+app asks whether to start a new one there or to restore a lost one, and restores from either:
 
-The new folder finds the old one's directory on the remote and takes it over, so the remotes set up here reach what
-the old folder stored.
+- **a remote**: enter the master password and fill in the remote's settings as when it was set up: the same kind of
+  storage, account and bucket or folder. The app looks for the backup made with that password there.
+- **a backup file**: a `mbr-metadata-….tar.gz.encrypted` file you downloaded, and the master password.
+- **database files**: a copy of the old folder's `.mbr/mbr.db` and `.mbr/rclone.conf`, as they are. Afterwards, set
+  the old folder's master password in the **Settings** tab.
 
-Every file reappears with its name, history and records of where it is stored; the other remotes come back too, with
-their settings. The files' content is still on the remotes: download it from the **Remotes** tab with **Download
-all**, or only the files you need.
+Every file reappears with its name, history and records of where it is stored, and the remotes come back with their
+settings. The files' content is still on the remotes: download it from the **Remotes** tab with **Download all**, or
+only the files you need. A file already in the folder under a restored name is kept, and the next scan records it as a
+new version.
 
-## Merging in a backup
-
-A folder already in use can take in a backup too, for instance after its database was damaged and rebuilt by a scan,
-or to bring back the history of its files. Under **Merge in a backup**, pick the remote and click **Restore**; once
-password field can stay empty if the backup uses the folder's master password.
-
-Merging only ever adds what the backup knows and the folder doesn't:
-
-- files the folder lost track of reappear, ready to download if their content isn't here;
-- older versions and deleted files join the history;
-- remotes, records of what each remote stores, and settings come back.
-
-Where the two disagree, the folder wins. A file the folder knows changed or was deleted since the backup stays as it is, and
-the backup's version only joins its history. A remote with the same name but a different target keeps this folder's
-target.
-
-The database as it was before is kept in `.mbr/mbr.db.before-restore`: to undo a merge, put it back as `.mbr/mbr.db`
-while the app is closed.
+A backup is only ever restored into a folder that isn't an mbr folder yet, never merged into one in use.
 
 ## Changing the password
 
-Unlock with the current password, then enter the new one twice. Backups made before keep the old password until they
-are replaced, so back up again right after.
+Unlock with the current password, then enter the new one twice. The backup's name comes from the password, so the
+next backup is stored under a new name; the old one, still under the old password, stays until you delete it.
