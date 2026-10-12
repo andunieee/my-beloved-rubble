@@ -1,4 +1,4 @@
-import { Button, CheckBox, LineEdit, ListView, Palette, ComboBox, ScrollView, SpinBox } from "std-widgets.slint";
+import { CheckBox, LineEdit, ListView, Palette, ComboBox, ScrollView, SpinBox } from "std-widgets.slint";
 
 export struct FileRow {
     path: string,
@@ -41,7 +41,8 @@ export struct MetadataRow {
 export struct FormField {
     key: string,
     label: string,
-    help: string,
+    // Where the field is documented: a URL, or a page of mbr's docs.
+    docs: string,
     kind: int,          // 0 = text, 1 = secret, 2 = choice
     default: string,    // placeholder shown while the input is empty
     default-index: int, // preselected example for kind == 2
@@ -65,10 +66,57 @@ component Hint inherits Text {
     width: Side.text-width;
 }
 
-component SectionTitle inherits Text {
-    font-size: 11px;
-    font-weight: 700;
-    color: Palette.foreground.transparentize(35%);
+// Opens documentation in the browser: a URL, or a page of mbr's docs
+// site such as "remotes/#scanning".
+export global Docs {
+    callback open(page: string);
+}
+
+// A small "?" that opens the docs for whatever it sits next to. It takes
+// the full height of its row and centers the dot in it.
+component Help {
+    in property <string> page;
+    width: 16px;
+    min-height: 16px;
+    accessible-role: button;
+    accessible-label: "Help";
+    accessible-action-default => { Docs.open(root.page); }
+
+    Rectangle {
+        y: (parent.height - self.height) / 2;
+        height: 16px;
+        border-radius: self.height / 2;
+        background: touch.has-hover ? Palette.accent-background : Palette.foreground.transparentize(82%);
+
+        Text {
+            text: "?";
+            font-size: 10px;
+            font-weight: 700;
+            color: touch.has-hover ? Palette.accent-foreground : Palette.foreground.transparentize(30%);
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        touch := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { Docs.open(root.page); }
+        }
+    }
+}
+
+component SectionTitle inherits HorizontalLayout {
+    in property <string> text;
+    // Docs page for the "?" next to the title; none when empty.
+    in property <string> help;
+    spacing: 6px;
+    alignment: start;
+    Text {
+        text: root.text;
+        font-size: 11px;
+        font-weight: 700;
+        vertical-alignment: center;
+        color: Palette.foreground.transparentize(35%);
+    }
+    if root.help != "": Help { page: root.help; }
 }
 
 component DetailLine inherits HorizontalLayout {
@@ -86,6 +134,79 @@ component DetailLine inherits HorizontalLayout {
         font-size: 12px;
         wrap: word-wrap;
         width: Side.text-width - 66px;
+    }
+}
+
+// The std-widgets Button can't change the mouse cursor (its own touch
+// area always resets it), so buttons are drawn here, Fluent-like.
+component Button {
+    in property <string> text;
+    in property <bool> primary;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    private property <brush> text-color: !root.enabled ? Palette.foreground.transparentize(55%)
+        : root.primary ? Palette.accent-foreground : Palette.control-foreground;
+
+    min-width: max(32px, label.preferred-width + 24px);
+    min-height: max(32px, label.preferred-height + 10px);
+    preferred-width: self.min-width;
+    preferred-height: self.min-height;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    forward-focus: focus;
+    accessible-role: button;
+    accessible-enabled: root.enabled;
+    accessible-label: root.text;
+    accessible-action-default => { touch.clicked(); }
+
+    background := Rectangle {
+        border-radius: 4px;
+        border-width: 1px;
+        border-color: root.primary ? transparent : Palette.border;
+        background: root.primary
+            ? (!root.enabled ? Palette.accent-background.transparentize(60%)
+                : touch.pressed ? Palette.accent-background.darker(0.15)
+                : touch.has-hover ? Palette.accent-background.brighter(0.1)
+                : Palette.accent-background)
+            : (!root.enabled ? Palette.control-background.transparentize(50%)
+                : touch.pressed ? Palette.control-background.darker(0.1)
+                : touch.has-hover ? Palette.control-background.darker(0.05)
+                : Palette.control-background);
+        animate background { duration: 150ms; }
+    }
+
+    label := Text {
+        text: root.text;
+        color: root.text-color;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+
+    focus := FocusScope {
+        x: 0;
+        width: 0; // Do not react on clicks
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == "\n") {
+                touch.clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    if focus.has-focus && root.enabled: Rectangle {
+        border-radius: 4px;
+        border-width: 2px;
+        border-color: Palette.accent-background;
     }
 }
 
@@ -107,6 +228,7 @@ component TabButton inherits Rectangle {
         horizontal-alignment: center;
     }
     touch := TouchArea {
+        mouse-cursor: pointer;
         clicked => { root.clicked(); }
     }
 }
@@ -135,13 +257,7 @@ component BackendForm inherits VerticalLayout {
                 color: #e0a94f;
                 vertical-alignment: center;
             }
-        }
-        if field.help != "": Text {
-            text: field.help;
-            font-size: 10px;
-            wrap: word-wrap;
-            width: Side.text-width;
-            color: Palette.foreground.transparentize(40%);
+            if field.docs != "": Help { page: field.docs; }
         }
         if field.kind == 2: ComboBox {
             // Reports a far too tall preferred height in sidebar layouts.
@@ -153,7 +269,6 @@ component BackendForm inherits VerticalLayout {
         }
         if field.kind != 2: LineEdit {
             text: root.values[i];
-            input-type: field.kind == 1 ? InputType.password : InputType.text;
             enabled: root.enabled;
             placeholder-text: field.default;
             edited(t) => { root.values[i] = t; }
@@ -229,7 +344,6 @@ export component AppWindow inherits Window {
     in-out property <string> setup-answer: "";
     in-out property <string> setup-default: "";
     in-out property <string> setup-url: "";
-    in-out property <bool> setup-password: false;
 
     // ── editing an existing remote ──
     in-out property <bool> editing: false;
@@ -379,19 +493,15 @@ export component AppWindow inherits Window {
                                 horizontal-alignment: center;
                                 color: Palette.foreground.transparentize(40%);
                             }
-                            Text {
-                                text: "Open a folder to attach mbr to it.\nFiles you drop there are content-addressed into .mbr/blobs/ and symlinked back.";
-                                font-size: 12px;
-                                horizontal-alignment: center;
-                                color: Palette.foreground.transparentize(50%);
-                            }
                             HorizontalLayout {
                                 alignment: center;
+                                spacing: 8px;
                                 Button {
                                     text: "Open Folder…";
                                     primary: true;
                                     clicked => { root.open-folder(); }
                                 }
+                                Help { page: "getting-started/"; }
                             }
                         }
                     }
@@ -399,11 +509,16 @@ export component AppWindow inherits Window {
                     // ── Blobs tab: the file list ──
                     if root.folder != "" && root.active-tab == 0 && root.files.length == 0: Rectangle {
                         vertical-stretch: 1;
-                        Text {
-                            text: "No tracked files yet.\nDrop files into the folder and hit Rescan.";
-                            font-size: 14px;
-                            horizontal-alignment: center;
-                            color: Palette.foreground.transparentize(40%);
+                        HorizontalLayout {
+                            alignment: center;
+                            spacing: 8px;
+                            Text {
+                                text: "No tracked files yet.";
+                                font-size: 14px;
+                                vertical-alignment: center;
+                                color: Palette.foreground.transparentize(40%);
+                            }
+                            Help { page: "getting-started/#adding-files"; }
                         }
                     }
 
@@ -525,30 +640,25 @@ export component AppWindow inherits Window {
                             edited(n) => { root.set-min-copies(n); }
                         }
                         Text {
-                            text: "copies of every file (here + remotes); freeing up space needs that many on remotes";
+                            text: "copies of every file";
                             font-size: 12px;
                             vertical-alignment: center;
-                            overflow: elide;
-                            horizontal-stretch: 1;
-                            color: Palette.foreground.transparentize(25%);
                         }
+                        Help { page: "remotes/#how-many-copies"; }
+                        Rectangle { horizontal-stretch: 1; }
                     }
 
                     if root.folder != "" && root.active-tab == 1: HorizontalLayout {
                         spacing: 8px;
                         Text {
-                            text: root.remotes.length == 0
-                                ? "No remotes configured yet; add or set one up on the right."
-                                : "Scanning lists a remote fully: every blob found is recorded, and blobs never seen before appear under unnamed/.";
+                            text: root.remotes.length == 0 ? "No remotes configured yet." : "";
                             font-size: 12px;
-                            wrap: word-wrap;
-                            // Wrapped text can't report its real height here;
-                            // leave room for three lines.
-                            min-height: 48px;
                             vertical-alignment: center;
+                            overflow: elide;
                             horizontal-stretch: 1;
                             color: Palette.foreground.transparentize(40%);
                         }
+                        Help { page: "remotes/#scanning"; }
                         Button {
                             text: "Scan all";
                             enabled: !root.busy && root.remotes.length > 0;
@@ -635,20 +745,17 @@ export component AppWindow inherits Window {
                     }
 
                     // ── Metadata backup tab: where metadata goes ──
-                    if root.folder != "" && root.active-tab == 2: VerticalLayout {
-                        spacing: 6px;
+                    if root.folder != "" && root.active-tab == 2: HorizontalLayout {
+                        spacing: 8px;
                         Text {
                             text: root.metadata-summary;
                             font-size: 14px;
                             font-weight: 600;
+                            vertical-alignment: center;
                             overflow: elide;
                         }
-                        Text {
-                            text: "Tick the remotes that should hold an encrypted copy of this folder's metadata.";
-                            font-size: 12px;
-                            overflow: elide;
-                            color: Palette.foreground.transparentize(40%);
-                        }
+                        Help { page: "metadata/"; }
+                        Rectangle { horizontal-stretch: 1; }
                     }
                     if root.folder != "" && root.active-tab == 2 && root.metadata-rows.length == 0: Rectangle {
                         vertical-stretch: 1;
@@ -745,16 +852,13 @@ export component AppWindow inherits Window {
                         // ════ Blobs tab: the selection ════
                         if root.active-tab == 0 && root.selected-count == 0: VerticalLayout {
                             spacing: 6px;
-                            SectionTitle { text: "NOTHING SELECTED"; }
-                            Hint {
-                                text: "Click a file to select it. Ctrl+click (⌘+click) adds or removes one, Shift+click selects a range, dragging across rows selects them, Ctrl+A selects everything and Esc clears the selection.\n\nThe selected blobs can then be uploaded to a remote, checked on a remote, downloaded, verified, or removed from this computer once they are safe elsewhere.";
-                            }
+                            SectionTitle { text: "NOTHING SELECTED"; help: "files/#selecting-files"; }
                         }
 
                         if root.active-tab == 0 && root.selected-count == 0 && root.folder != "": VerticalLayout {
                             spacing: 8px;
                             Rectangle { height: 1px; background: Palette.border; }
-                            SectionTitle { text: "KEEPING FILES SAFE"; }
+                            SectionTitle { text: "KEEPING FILES SAFE"; help: "files/#keeping-files-safe"; }
                             Text {
                                 text: root.at-risk-count == 0
                                     ? "Every file has at least " + root.min-copies + " cop" + (root.min-copies == 1 ? "y." : "ies.")
@@ -778,9 +882,6 @@ export component AppWindow inherits Window {
                                     enabled: !root.busy && root.old-local-count > 0;
                                     clicked => { root.clean-up-old(); }
                                 }
-                            }
-                            Hint {
-                                text: "Verifying re-reads every file stored here and checks it still matches its hash; damaged copies are set aside so they can be downloaded again. Cleaning up removes this computer's copies of old versions and deleted files, but only those stored on enough remotes.";
                             }
                         }
 
@@ -857,6 +958,7 @@ width: Side.text-width;
                             Rectangle { height: 1px; background: Palette.border; }
                             SectionTitle {
                                 text: root.selected-count == 1 ? "THIS BLOB" : "THE SELECTED BLOBS";
+                                help: "files/#working-with-selected-files";
                             }
 
                             if root.remote-names.length == 0: Hint {
@@ -919,27 +1021,12 @@ width: Side.text-width;
                                     clicked => { root.verify-selected-on(root.action-remote); }
                                 }
                             }
-                            Hint {
-                                text: "Upload sends the blobs present here to the remote. Check remote asks the remote whether it holds each blob and updates the records. Download fetches the blobs missing here, trying the chosen remote first, then any other remote recorded as holding them.\n\nFree up space removes the copies on this computer, but only of blobs that at least " + root.min-copies + " remote(s) are confirmed to hold right now; the files stay listed and can be downloaded again. Verify re-reads the local copies and checks their hashes; Verify on remote downloads the remote's copies to check them.";
-                            }
                         }
 
                         // ════ Metadata backup tab ════
-                        if root.active-tab == 2 && root.folder != "": VerticalLayout {
-                            spacing: 6px;
-                            SectionTitle { text: "WHY BACK UP METADATA"; }
-                            Hint {
-                                text: "Remotes store files only by their content hash. The names, folders and history of your files live in this folder's database, so it is backed up separately: encrypted with your master password, to the remotes ticked on the left. Without it, a lost folder comes back as a heap of nameless files.";
-                            }
-                            Rectangle { height: 1px; background: Palette.border; }
-                        }
-
                         if root.active-tab == 2 && root.folder != "" && root.folder-empty: VerticalLayout {
                             spacing: 6px;
-                            SectionTitle { text: "RESTORE FROM A BACKUP"; }
-                            Hint {
-                                text: "This folder tracks no files yet. To bring back a lost folder, set up one of its remotes in the Remotes tab, then restore from it here: every file reappears (as a placeholder until downloaded) and its other remotes come back too.";
-                            }
+                            SectionTitle { text: "RESTORE FROM A BACKUP"; help: "metadata/#restoring-a-lost-folder"; }
                             if root.remote-names.length == 0: Hint {
                                 text: "No remotes configured yet.";
                             }
@@ -974,10 +1061,7 @@ width: Side.text-width;
 
                         if root.active-tab == 2 && root.folder != "" && !root.password-set: VerticalLayout {
                             spacing: 6px;
-                            SectionTitle { text: "SET A MASTER PASSWORD"; }
-                            Hint {
-                                text: "Metadata is encrypted with this password before it leaves this computer. Write it down somewhere safe: without it the backups can't be read, and nobody can recover it.";
-                            }
+                            SectionTitle { text: "SET A MASTER PASSWORD"; help: "metadata/#the-master-password"; }
                             LineEdit {
                                 input-type: InputType.password;
                                 placeholder-text: "master password";
@@ -1002,10 +1086,7 @@ width: Side.text-width;
 
                         if root.active-tab == 2 && root.folder != "" && root.password-set && !root.unlocked: VerticalLayout {
                             spacing: 6px;
-                            SectionTitle { text: "UNLOCK"; }
-                            Hint {
-                                text: "Enter the master password to back up during this session. It stays in memory until you lock, switch folders or quit.";
-                            }
+                            SectionTitle { text: "UNLOCK"; help: "metadata/#unlocking"; }
                             LineEdit {
                                 input-type: InputType.password;
                                 placeholder-text: "master password";
@@ -1025,11 +1106,9 @@ width: Side.text-width;
 
                         if root.active-tab == 2 && root.folder != "" && root.unlocked: VerticalLayout {
                             spacing: 6px;
-                            SectionTitle { text: "BACK UP"; }
-                            Hint {
-                                text: root.metadata-chosen == 0
-                                    ? "Tick at least one remote on the left to back up to."
-                                    : "Encrypts the database and this folder's rclone settings (so the remotes can be reached again from a new computer) and uploads them to the " + root.metadata-chosen + " ticked remote(s), replacing the previous backup.";
+                            SectionTitle { text: "BACK UP"; help: "metadata/#backing-up"; }
+                            if root.metadata-chosen == 0: Hint {
+                                text: "Tick at least one remote on the left to back up to.";
                             }
                             HorizontalLayout {
                                 spacing: 6px;
@@ -1047,10 +1126,7 @@ width: Side.text-width;
                             }
 
                             Rectangle { height: 1px; background: Palette.border; }
-                            SectionTitle { text: "CHANGE THE MASTER PASSWORD"; }
-                            Hint {
-                                text: "Backups already made keep the old password until they are replaced, so back up again afterwards.";
-                            }
+                            SectionTitle { text: "CHANGE THE MASTER PASSWORD"; help: "metadata/#changing-the-password"; }
                             LineEdit {
                                 input-type: InputType.password;
                                 placeholder-text: "new master password";
@@ -1074,7 +1150,7 @@ width: Side.text-width;
                         // ════ Remotes tab: edit a remote ════
                         if root.active-tab == 1 && root.editing: VerticalLayout {
                             spacing: 8px;
-                            SectionTitle { text: "EDIT REMOTE “" + root.edit-original + "”"; }
+                            SectionTitle { text: "EDIT REMOTE “" + root.edit-original + "”"; help: "remotes/#editing-a-remote"; }
 
                             Text { text: "Name"; font-size: 12px; font-weight: 600; }
                             LineEdit {
@@ -1082,7 +1158,6 @@ width: Side.text-width;
                                 enabled: !root.busy;
                             }
                             Text { text: "Target"; font-size: 12px; font-weight: 600; }
-                            Hint { text: "The rclone location where blobs live, e.g. backup:bucket/mbr. Changing it does not move any blobs; scan the remote afterwards."; }
                             LineEdit {
                                 text <=> root.edit-target;
                                 enabled: !root.busy;
@@ -1092,7 +1167,6 @@ width: Side.text-width;
                             if root.edit-fields.length > 0: VerticalLayout {
                                 spacing: 8px;
                                 SectionTitle { text: "RCLONE SETTINGS OF “" + root.edit-section + "”"; }
-                                Hint { text: "Secrets are never shown; leave them blank to keep them. Emptied fields keep their current value."; }
                                 BackendForm {
                                     fields: root.edit-fields;
                                     values <=> root.edit-values;
@@ -1122,7 +1196,7 @@ width: Side.text-width;
                             // ── add an existing target directly ──
                             VerticalLayout {
                                 spacing: 4px;
-                                SectionTitle { text: "ADD EXISTING TARGET"; }
+                                SectionTitle { text: "ADD EXISTING TARGET"; help: "remotes/#adding-an-existing-target"; }
                                 HorizontalLayout {
                                     spacing: 6px;
                                     LineEdit {
@@ -1150,7 +1224,7 @@ width: Side.text-width;
                             // ── guided setup for a new remote ──
                             VerticalLayout {
                                 spacing: 6px;
-                                SectionTitle { text: "SET UP A NEW REMOTE"; }
+                                SectionTitle { text: "SET UP A NEW REMOTE"; help: "remotes/#setting-up-a-new-remote"; }
 
                                 HorizontalLayout {
                                     spacing: 6px;
@@ -1235,7 +1309,6 @@ width: Side.text-width - 20px;
                                         }
                                         LineEdit {
                                             text <=> root.setup-answer;
-                                            input-type: root.setup-password ? InputType.password : InputType.text;
                                         }
                                         HorizontalLayout {
                                             spacing: 6px;
